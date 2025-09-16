@@ -47,6 +47,7 @@ from einops import rearrange
 from omegaconf import OmegaConf
 from packaging import version
 from PIL import Image
+from decord import VideoReader
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullOptimStateDictConfig, FullStateDictConfig, ShardedStateDictConfig, ShardedOptimStateDictConfig)
 from torch.utils.data import RandomSampler
@@ -55,6 +56,10 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 from transformers.utils import ContextManagers
+# Add torch profiler imports for memory monitoring
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
+import torch.cuda
+from contextlib import nullcontext
 
 import datasets
 
@@ -68,12 +73,12 @@ from videox_fun.data.bucket_sampler import (ASPECT_RATIO_512,
                                            ASPECT_RATIO_RANDOM_CROP_PROB,
                                            AspectRatioBatchImageVideoSampler,
                                            RandomSampler, get_closest_ratio)
-from videox_fun.data.dataset_image_video import (ImageVideoDataset,
+from videox_fun.data.dataset_image_video import (ImageVideoRefDataset,
                                                 ImageVideoSampler,
                                                 get_random_mask)
 from videox_fun.models import (AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel,
-                              Wan2_2Transformer3DModel)
-from videox_fun.pipeline import Wan2_2I2VPipeline, Wan2_2Pipeline
+                              Wan2_2RefTransformer3DModel)
+from videox_fun.pipeline import Wan2_2MultiRefPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
 
@@ -162,30 +167,89 @@ check_min_version("0.18.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, accelerator, weight_dtype, global_step):
+    
     try:
         logger.info("Running validation... ")
         
-        transformer3d_val = accelerator.unwrap_model(transformer3d)
+        # Set validation dimensions
+        if args.validation_size is not None:
+            val_height, val_width, val_frames = args.validation_size
+            logger.info(f"Using custom validation size: {val_height}x{val_width}, {val_frames} frames")
+        else:
+            val_height = val_width = args.video_sample_size
+            val_frames = args.video_sample_n_frames
+            logger.info(f"Using default validation size: {val_height}x{val_width}, {val_frames} frames")
+        
+        # Load validation reference if provided
+        validation_ref = None
+        if args.validation_ref_path is not None:
+            
+            ref_path = args.validation_ref_path
+            logger.info(f"Loading validation reference from: {ref_path}")
+            
+            # Check if ref is image or video by extension
+            ref_ext = ref_path.lower().split('.')[-1]
+            if ref_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
+                # Load as image
+                ref_image = Image.open(ref_path).convert('RGB')
+                # Transform to match model input
+                transform = transforms.Compose([
+                    transforms.Resize(min(val_height, val_width)),
+                    transforms.CenterCrop((val_height, val_width)),
+                    transforms.ToTensor(),
+                ])
+                validation_ref = transform(ref_image).unsqueeze(0).unsqueeze(0)  # [1, 1, C, H, W]
+                logger.info(f"Loaded reference image with shape: {validation_ref.shape}")
+                
+                # Save validation reference image as gif (single frame)
+                os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+                validation_ref_for_save = validation_ref.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W] for save_videos_grid
+                save_videos_grid(validation_ref_for_save, os.path.join(args.output_dir, f"validation/step-{global_step}/ref.gif"), fps=24)
+            else:
+                # Load as video
+                try:
+                    vr = VideoReader(ref_path)
+                    # Use all frames from the reference video
+                    max_ref_frames = len(vr)  # Use all frames
+                    ref_frames = vr.get_batch(list(range(max_ref_frames))).asnumpy()
+                    
+                    # Transform frames
+                    transform = transforms.Compose([
+                        transforms.ToPILImage(),
+                        transforms.Resize(min(val_height, val_width)),
+                        transforms.CenterCrop((val_height, val_width)),
+                        transforms.ToTensor(),
+                    ])
+                    
+                    ref_tensor_list = []
+                    for frame in ref_frames:
+                        ref_tensor_list.append(transform(frame))
+                    
+                    validation_ref = torch.stack(ref_tensor_list).unsqueeze(0)  # [1, F, C, H, W]
+                    validation_ref = validation_ref.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W]
+                    logger.info(f"Loaded reference video with shape: {validation_ref.shape}")
+                    
+                    # Save validation reference as gif
+                    os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+                    # save_videos_grid expects torch.Tensor input
+                    save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/ref.gif"), fps=24)
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
+                    validation_ref = None
+        
         scheduler = FlowMatchEulerDiscreteScheduler(
             **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
         )
+        transformer3d_val = accelerator.unwrap_model(transformer3d)
+        pipeline = Wan2_2MultiRefPipeline(
+            vae=accelerator.unwrap_model(vae).to(weight_dtype), 
+            text_encoder=accelerator.unwrap_model(text_encoder),
+            tokenizer=tokenizer,
+            transformer=transformer3d_val,
+            scheduler=scheduler,
+        )
 
-        if args.train_mode != "normal":
-            pipeline = Wan2_2I2VPipeline(
-                vae=accelerator.unwrap_model(vae).to(weight_dtype), 
-                text_encoder=accelerator.unwrap_model(text_encoder),
-                tokenizer=tokenizer,
-                transformer=transformer3d_val,
-                scheduler=scheduler,
-            )
-        else:
-            pipeline = Wan2_2Pipeline(
-                vae=accelerator.unwrap_model(vae).to(weight_dtype), 
-                text_encoder=accelerator.unwrap_model(text_encoder),
-                tokenizer=tokenizer,
-                transformer=transformer3d_val,
-                scheduler=scheduler,
-            )
         pipeline = pipeline.to(accelerator.device)
 
         if args.seed is None:
@@ -196,64 +260,21 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
         images = []
         for i in range(len(args.validation_prompts)):
             with torch.no_grad():
-                if args.train_mode != "normal":
-                    with torch.autocast("cuda", dtype=weight_dtype):
-                        video_length = int((args.video_sample_n_frames - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if args.video_sample_n_frames != 1 else 1
-                        input_video, input_video_mask, _ = get_image_to_video_latent(None, None, video_length=video_length, sample_size=[args.video_sample_size, args.video_sample_size])
-                        sample = pipeline(
-                            args.validation_prompts[i],
-                            num_frames = video_length,
-                            negative_prompt = "bad detailed",
-                            height      = args.video_sample_size,
-                            width       = args.video_sample_size,
-                            guidance_scale = 6.0,
-                            generator   = generator,
-
-                            video        = input_video,
-                            mask_video   = input_video_mask,
-                        ).videos
-                        os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
-                        save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-{i}.gif"))
-
-                        video_length = 1
-                        input_video, input_video_mask, _ = get_image_to_video_latent(None, None, video_length=video_length, sample_size=[args.video_sample_size, args.video_sample_size])
-                        sample = pipeline(
-                            args.validation_prompts[i],
-                            num_frames = video_length,
-                            negative_prompt = "bad detailed",
-                            height      = args.video_sample_size,
-                            width       = args.video_sample_size,
-                            guidance_scale = 6.0,
-                            generator   = generator, 
-
-                            video        = input_video,
-                            mask_video   = input_video_mask,
-                        ).videos
-                        os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
-                        save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-image-{i}.gif"))
-                else:
-                    with torch.autocast("cuda", dtype=weight_dtype):
-                        sample = pipeline(
-                            args.validation_prompts[i],
-                            num_frames = args.video_sample_n_frames,
-                            negative_prompt = "bad detailed",
-                            height      = args.video_sample_size,
-                            width       = args.video_sample_size,
-                            generator   = generator
-                        ).videos
-                        os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
-                        save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-{i}.gif"))
-
-                        sample = pipeline(
-                            args.validation_prompts[i], 
-                            num_frames = 1,
-                            negative_prompt = "bad detailed",
-                            height      = args.video_sample_size,
-                            width       = args.video_sample_size,
-                            generator   = generator
-                        ).videos
-                        os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
-                        save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-image-{i}.gif"))
+                os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+                
+                # Generate with reference if provided
+                if validation_ref is not None:
+                    ref_video_input = validation_ref.to(device=accelerator.device, dtype=weight_dtype)
+                    sample_with_ref = pipeline(
+                        args.validation_prompts[i],
+                        num_frames = val_frames,
+                        negative_prompt = "bad detailed", 
+                        height      = val_height,
+                        width       = val_width,
+                        generator   = generator,
+                        ref_video   = ref_video_input
+                    ).videos
+                    save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=24)
 
         del pipeline
         gc.collect()
@@ -337,6 +358,19 @@ def parse_args():
         default=None,
         nargs="+",
         help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
+    )
+    parser.add_argument(
+        "--validation_ref_path",
+        type=str,
+        default=None,
+        help=("Path to reference image or video used for validation. If not provided, will use generated first frame."),
+    )
+    parser.add_argument(
+        "--validation_size",
+        nargs=3,
+        type=int,
+        default=None,
+        help=("Validation size as [height, width, frames]. If not provided, will use args.video_sample_size and args.video_sample_n_frames."),
     )
     parser.add_argument(
         "--output_dir",
@@ -727,6 +761,36 @@ def parse_args():
         default=1.29,
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
     )
+    # Add profiler arguments
+    parser.add_argument(
+        "--enable_profiler", 
+        action="store_true", 
+        help="Enable torch profiler for memory and performance monitoring."
+    )
+    parser.add_argument(
+        "--profiler_schedule_wait",
+        type=int,
+        default=1,
+        help="Number of steps to wait before profiling starts."
+    )
+    parser.add_argument(
+        "--profiler_schedule_warmup",
+        type=int,
+        default=1,
+        help="Number of warmup steps for profiling."
+    )
+    parser.add_argument(
+        "--profiler_schedule_active",
+        type=int,
+        default=3,
+        help="Number of active profiling steps."
+    )
+    parser.add_argument(
+        "--profiler_schedule_repeat",
+        type=int,
+        default=2,
+        help="Number of profiling cycles to repeat."
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -847,6 +911,10 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
+    
+    if accelerator.is_main_process:
+        print(f"Mixed precision mode: {accelerator.mixed_precision}")
+        print(f"Weight dtype: {weight_dtype}")
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = FlowMatchEulerDiscreteScheduler(
@@ -882,7 +950,7 @@ def main():
         text_encoder = WanT5EncoderModel.from_pretrained(
             os.path.join(args.pretrained_model_name_or_path, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder')),
             additional_kwargs=OmegaConf.to_container(config['text_encoder_kwargs']),
-            low_cpu_mem_usage=True,
+            low_cpu_mem_usage=False,
             torch_dtype=weight_dtype,
         )
         text_encoder = text_encoder.eval()
@@ -902,9 +970,13 @@ def main():
         sub_path = config['transformer_additional_kwargs'].get('transformer_low_noise_model_subpath', 'transformer')
     else:
         sub_path = config['transformer_additional_kwargs'].get('transformer_high_noise_model_subpath', 'transformer')
-    transformer3d = Wan2_2Transformer3DModel.from_pretrained(
+    
+    # Use RefTransformer3DModel for ref training (no additional weights needed)
+    transformer_additional_kwargs = OmegaConf.to_container(config['transformer_additional_kwargs'])
+    
+    transformer3d = Wan2_2RefTransformer3DModel.from_pretrained(
         os.path.join(args.pretrained_model_name_or_path, sub_path),
-        transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
+        transformer_additional_kwargs=transformer_additional_kwargs,
     ).to(weight_dtype)
 
     # Freeze vae and text_encoder and set transformer3d to trainable
@@ -923,7 +995,11 @@ def main():
 
         m, u = transformer3d.load_state_dict(state_dict, strict=False)
         print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-        assert len(u) == 0
+        
+        # RefTransformer3DModel uses the same weights as the base model, no additional parameters
+        if len(u) > 0:
+            print(f"Warning: unexpected keys: {u}")
+            assert len(u) == 0
 
     if args.vae_path is not None:
         print(f"From checkpoint: {args.vae_path}")
@@ -942,6 +1018,9 @@ def main():
     # For 3D Patch: trainable_modules = ['ff.net', 'pos_embed', 'attn2', 'proj_out', 'timepositionalencoding', 'h_position', 'w_position']
     # For 2D Patch: trainable_modules = ['ff.net', 'attn2', 'timepositionalencoding', 'h_position', 'w_position']
     transformer3d.train()
+    
+    # RefTransformer3DModel uses existing patch_embedding, no additional weights to train
+    
     if accelerator.is_main_process:
         accelerator.print(
             f"Trainable modules '{args.trainable_modules}'."
@@ -957,12 +1036,12 @@ def main():
         if zero_stage == 3:
             raise NotImplementedError("FSDP does not support EMA.")
 
-        ema_transformer3d = Wan2_2Transformer3DModel.from_pretrained(
-            os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
-            transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
+        ema_transformer3d = Wan2_2RefTransformer3DModel.from_pretrained(
+            os.path.join(args.pretrained_model_name_or_path, sub_path),
+            transformer_additional_kwargs=transformer_additional_kwargs,
         ).to(weight_dtype)
 
-        ema_transformer3d = EMAModel(ema_transformer3d.parameters(), model_cls=Wan2_2Transformer3DModel, model_config=ema_transformer3d.config)
+        ema_transformer3d = EMAModel(ema_transformer3d.parameters(), model_cls=Wan2_2RefTransformer3DModel, model_config=ema_transformer3d.config)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -1019,12 +1098,12 @@ def main():
             def load_model_hook(models, input_dir):
                 if args.use_ema:
                     ema_path = os.path.join(input_dir, "transformer_ema")
-                    _, ema_kwargs = Wan2_2Transformer3DModel.load_config(ema_path, return_unused_kwargs=True)
-                    load_model = Wan2_2Transformer3DModel.from_pretrained(
+                    _, ema_kwargs = Wan2_2RefTransformer3DModel.load_config(ema_path, return_unused_kwargs=True)
+                    load_model = Wan2_2RefTransformer3DModel.from_pretrained(
                         input_dir, subfolder="transformer_ema",
-                        transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs'])
+                        transformer_additional_kwargs=transformer_additional_kwargs
                     )
-                    load_model = EMAModel(load_model.parameters(), model_cls=Wan2_2Transformer3DModel, model_config=load_model.config)
+                    load_model = EMAModel(load_model.parameters(), model_cls=Wan2_2RefTransformer3DModel, model_config=load_model.config)
                     load_model.load_state_dict(ema_kwargs)
 
                     ema_transformer3d.load_state_dict(load_model.state_dict())
@@ -1036,7 +1115,7 @@ def main():
                     model = models.pop()
 
                     # load diffusers style into model
-                    load_model = Wan2_2Transformer3DModel.from_pretrained(
+                    load_model = Wan2_2RefTransformer3DModel.from_pretrained(
                         input_dir, subfolder="transformer"
                     )
                     model.register_to_config(**load_model.config)
@@ -1145,7 +1224,7 @@ def main():
         args.random_hw_adapt = False
 
     # Get the dataset
-    train_dataset = ImageVideoDataset(
+    train_dataset = ImageVideoRefDataset(
         args.train_data_meta, args.train_data_dir,
         video_sample_size=args.video_sample_size, video_sample_stride=args.video_sample_stride, video_sample_n_frames=args.video_sample_n_frames, 
         video_repeat=args.video_repeat, 
@@ -1187,6 +1266,8 @@ def main():
             new_examples["target_token_length"] = target_token_length
             new_examples["pixel_values"] = []
             new_examples["text"]         = []
+            # Used in Ref mode
+            new_examples["ref_pixel_values"] = []
             # Used in Inpaint mode 
             if args.train_mode != "normal":
                 new_examples["mask_pixel_values"] = []
@@ -1297,6 +1378,11 @@ def main():
                     ])
                 new_examples["pixel_values"].append(transform(pixel_values))
                 new_examples["text"].append(example["text"])
+                
+                # Process ref_pixel_values
+                ref_pixel_values = torch.from_numpy(example["ref_pixel_values"]).permute(0, 3, 1, 2).contiguous()
+                ref_pixel_values = ref_pixel_values / 255.
+                new_examples["ref_pixel_values"].append(transform(ref_pixel_values))
 
                 batch_video_length = int(min(batch_video_length, len(pixel_values)))
 
@@ -1320,6 +1406,33 @@ def main():
 
             # Limit the number of frames to the same
             new_examples["pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["pixel_values"]])
+            
+            # Handle ref_pixel_values with different frame counts by cycling shorter ones
+            if len(new_examples["ref_pixel_values"]) > 0:
+                # Find the maximum number of frames in ref_pixel_values
+                max_ref_frames = max(ref.size(0) for ref in new_examples["ref_pixel_values"])
+                
+                # Cycle shorter ref sequences to match the longest one
+                aligned_ref_pixel_values = []
+                for ref in new_examples["ref_pixel_values"]:
+                    ref_frames = ref.size(0)
+                    if ref_frames < max_ref_frames:
+                        # Calculate how many times to repeat + remainder
+                        repeat_times = max_ref_frames // ref_frames
+                        remainder = max_ref_frames % ref_frames
+                        
+                        # Create cycled sequence: repeat full cycles + partial cycle for remainder
+                        if remainder > 0:
+                            cycled_ref = torch.cat([ref.repeat(repeat_times, 1, 1, 1), ref[:remainder]], dim=0)
+                        else:
+                            cycled_ref = ref.repeat(repeat_times, 1, 1, 1)
+                    else:
+                        cycled_ref = ref
+                    aligned_ref_pixel_values.append(cycled_ref)
+                
+                new_examples["ref_pixel_values"] = torch.stack(aligned_ref_pixel_values)
+            else:
+                new_examples["ref_pixel_values"] = torch.stack(new_examples["ref_pixel_values"])
             if args.train_mode != "normal":
                 new_examples["mask_pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["mask_pixel_values"]])
                 new_examples["mask"] = torch.stack([example[:batch_video_length] for example in new_examples["mask"]])
@@ -1410,6 +1523,7 @@ def main():
         tracker_config.pop("trainable_modules")
         tracker_config.pop("trainable_modules_low_learning_rate")
         tracker_config.pop("fix_sample_size")
+        tracker_config.pop("validation_size")
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
 
     # Function for unwrapping if model was compiled with `torch.compile`.
@@ -1501,150 +1615,238 @@ def main():
 
     idx_sampling = DiscreteSampling(train_sampling_steps, start_num_idx=start_num_idx, uniform_sampling=args.uniform_sampling)
 
-    for epoch in range(first_epoch, args.num_train_epochs):
-        train_loss = 0.0
-        batch_sampler.sampler.generator = torch.Generator().manual_seed(args.seed + epoch)
-        for step, batch in enumerate(train_dataloader):
-            # Data batch sanity check
-            if epoch == first_epoch and step == 0:
-                pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
-                pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
-                os.makedirs(os.path.join(args.output_dir, "sanity_check"), exist_ok=True)
-                for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
-                    pixel_value = pixel_value[None, ...]
-                    gif_name = '-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_step}-{idx}'
-                    save_videos_grid(pixel_value, f"{args.output_dir}/sanity_check/{gif_name[:10]}.gif", rescale=True)
-                if args.train_mode != "normal":
-                    clip_pixel_values, mask_pixel_values, texts = batch['clip_pixel_values'].cpu(), batch['mask_pixel_values'].cpu(), batch['text']
-                    mask_pixel_values = rearrange(mask_pixel_values, "b f c h w -> b c f h w")
-                    for idx, (clip_pixel_value, pixel_value, text) in enumerate(zip(clip_pixel_values, mask_pixel_values, texts)):
-                        pixel_value = pixel_value[None, ...]
-                        Image.fromarray(np.uint8(clip_pixel_value)).save(f"{args.output_dir}/sanity_check/clip_{gif_name[:10] if not text == '' else f'{global_step}-{idx}'}.png")
-                        save_videos_grid(pixel_value, f"{args.output_dir}/sanity_check/mask_{gif_name[:10] if not text == '' else f'{global_step}-{idx}'}.gif", rescale=True)
-
-            with accelerator.accumulate(transformer3d):
-                # Convert images to latent space
-                pixel_values = batch["pixel_values"].to(weight_dtype)
-
-                # Increase the batch size when the length of the latent sequence of the current sample is small
-                if args.auto_tile_batch_size and args.training_with_video_token_length and zero_stage != 3:
-                    if args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 16 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                        pixel_values = torch.tile(pixel_values, (4, 1, 1, 1, 1))
-                        if args.enable_text_encoder_in_dataloader:
-                            batch['encoder_hidden_states'] = torch.tile(batch['encoder_hidden_states'], (4, 1, 1))
-                            batch['encoder_attention_mask'] = torch.tile(batch['encoder_attention_mask'], (4, 1))
-                        else:
-                            batch['text'] = batch['text'] * 4
-                    elif args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 4 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                        pixel_values = torch.tile(pixel_values, (2, 1, 1, 1, 1))
-                        if args.enable_text_encoder_in_dataloader:
-                            batch['encoder_hidden_states'] = torch.tile(batch['encoder_hidden_states'], (2, 1, 1))
-                            batch['encoder_attention_mask'] = torch.tile(batch['encoder_attention_mask'], (2, 1))
-                        else:
-                            batch['text'] = batch['text'] * 2
+    # Setup profiler if enabled
+    profiler = None
+    if args.enable_profiler and accelerator.is_main_process:
+        def trace_handler(prof):
+            """Handle profiler trace output to tensorboard"""
+            # Export trace for tensorboard
+            prof.export_chrome_trace(os.path.join(logging_dir, f"trace_{prof.step_num}.json"))
+            
+            # Log memory stats to tensorboard 
+            if torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+                memory_cached = torch.cuda.memory_cached() / 1024**3       # GB
                 
-                if args.train_mode != "normal":
-                    mask_pixel_values = batch["mask_pixel_values"].to(weight_dtype)
-                    mask = batch["mask"].to(weight_dtype)
+                writer.add_scalar('profiler/memory_allocated_gb', memory_allocated, prof.step_num)
+                writer.add_scalar('profiler/memory_reserved_gb', memory_reserved, prof.step_num)
+                writer.add_scalar('profiler/memory_cached_gb', memory_cached, prof.step_num)
+                
+                print(f"Step {prof.step_num}: GPU Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB, Cached: {memory_cached:.2f}GB")
+        
+        profiler_schedule = schedule(
+            wait=args.profiler_schedule_wait,
+            warmup=args.profiler_schedule_warmup,
+            active=args.profiler_schedule_active,
+            repeat=args.profiler_schedule_repeat
+        )
+        
+        profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=profiler_schedule,
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+        
+        print(f"Profiler enabled with schedule: wait={args.profiler_schedule_wait}, warmup={args.profiler_schedule_warmup}, active={args.profiler_schedule_active}, repeat={args.profiler_schedule_repeat}")
+    
+    # Create a conditional context manager for profiler recording
+    def conditional_record_function(name):
+        """Return record_function context if profiler is enabled, otherwise return a no-op context"""
+        if args.enable_profiler:
+            return record_function(name)
+        else:
+            from contextlib import nullcontext
+            return nullcontext()
+    
+    def log_memory_usage(step_name, global_step):
+        """Log current memory usage to tensorboard"""
+        if args.enable_profiler and torch.cuda.is_available() and accelerator.is_main_process:
+            memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+            max_memory_allocated = torch.cuda.max_memory_allocated() / 1024**3  # GB
+            
+            writer.add_scalar(f'memory/{step_name}_allocated_gb', memory_allocated, global_step)
+            writer.add_scalar(f'memory/{step_name}_reserved_gb', memory_reserved, global_step)
+            writer.add_scalar(f'memory/{step_name}_max_allocated_gb', max_memory_allocated, global_step)
+
+    # Use profiler as context manager if enabled
+    profiler_context = profiler if profiler is not None else nullcontext()
+    
+    with profiler_context:
+        for epoch in range(first_epoch, args.num_train_epochs):
+            train_loss = 0.0
+            batch_sampler.sampler.generator = torch.Generator().manual_seed(args.seed + epoch)
+            
+            for step, batch in enumerate(train_dataloader):
+                # Log memory at start of step
+                log_memory_usage("step_start", global_step)
+                
+                # Data batch sanity check
+                if epoch == first_epoch and step == 0:
+                    pixel_values, ref_pixel_values, texts = batch['pixel_values'].cpu(), batch['ref_pixel_values'].cpu(), batch['text']
+                    pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
+                    ref_pixel_values = rearrange(ref_pixel_values, "b f c h w -> b c f h w")
+                    os.makedirs(os.path.join(args.output_dir, "sanity_check"), exist_ok=True)
+                    for idx, (pixel_value, ref_pixel_value, text) in enumerate(zip(pixel_values, ref_pixel_values, texts)):
+                        pixel_value = pixel_value[None, ...]
+                        ref_pixel_value = ref_pixel_value[None, ...]
+                        gif_name = '-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_step}-{idx}'
+                        save_videos_grid(pixel_value, f"{args.output_dir}/sanity_check/[{gif_name[:10]}].gif", rescale=True)
+                        save_videos_grid(ref_pixel_value, f"{args.output_dir}/sanity_check/[{gif_name[:10]}]_ref.gif", rescale=True)
+                    if args.train_mode != "normal":
+                        clip_pixel_values, mask_pixel_values, texts = batch['clip_pixel_values'].cpu(), batch['mask_pixel_values'].cpu(), batch['text']
+                        mask_pixel_values = rearrange(mask_pixel_values, "b f c h w -> b c f h w")
+                        for idx, (clip_pixel_value, pixel_value, text) in enumerate(zip(clip_pixel_values, mask_pixel_values, texts)):
+                            pixel_value = pixel_value[None, ...]
+                            Image.fromarray(np.uint8(clip_pixel_value)).save(f"{args.output_dir}/sanity_check/clip_[{gif_name[:10] if not text == '' else f'{global_step}-{idx}'}].png")
+                            save_videos_grid(pixel_value, f"{args.output_dir}/sanity_check/mask_[{gif_name[:10] if not text == '' else f'{global_step}-{idx}'}].gif", rescale=True)
+
+                with accelerator.accumulate(transformer3d):
+                    # Convert images to latent space
+                    pixel_values = batch["pixel_values"].to(weight_dtype)
+                    ref_pixel_values = batch["ref_pixel_values"].to(weight_dtype)
+                    
+                    # Log memory after data loading
+                    log_memory_usage("data_loaded", global_step)
+
                     # Increase the batch size when the length of the latent sequence of the current sample is small
                     if args.auto_tile_batch_size and args.training_with_video_token_length and zero_stage != 3:
                         if args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 16 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                            mask_pixel_values = torch.tile(mask_pixel_values, (4, 1, 1, 1, 1))
-                            mask = torch.tile(mask, (4, 1, 1, 1, 1))
+                            pixel_values = torch.tile(pixel_values, (4, 1, 1, 1, 1))
+                            ref_pixel_values = torch.tile(ref_pixel_values, (4, 1, 1, 1, 1))
+                            if args.enable_text_encoder_in_dataloader:
+                                batch['encoder_hidden_states'] = torch.tile(batch['encoder_hidden_states'], (4, 1, 1))
+                                batch['encoder_attention_mask'] = torch.tile(batch['encoder_attention_mask'], (4, 1))
+                            else:
+                                batch['text'] = batch['text'] * 4
                         elif args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 4 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                            mask_pixel_values = torch.tile(mask_pixel_values, (2, 1, 1, 1, 1))
-                            mask = torch.tile(mask, (2, 1, 1, 1, 1))
-
-                if args.random_frame_crop:
-                    def _create_special_list(length):
-                        if length == 1:
-                            return [1.0]
-                        if length >= 2:
-                            last_element = 0.90
-                            remaining_sum = 1.0 - last_element
-                            other_elements_value = remaining_sum / (length - 1)
-                            special_list = [other_elements_value] * (length - 1) + [last_element]
-                            return special_list
-                    select_frames = [_tmp for _tmp in list(range(sample_n_frames_bucket_interval + 1, args.video_sample_n_frames + sample_n_frames_bucket_interval, sample_n_frames_bucket_interval))]
-                    select_frames_prob = np.array(_create_special_list(len(select_frames)))
+                            pixel_values = torch.tile(pixel_values, (2, 1, 1, 1, 1))
+                            ref_pixel_values = torch.tile(ref_pixel_values, (2, 1, 1, 1, 1))
+                            if args.enable_text_encoder_in_dataloader:
+                                batch['encoder_hidden_states'] = torch.tile(batch['encoder_hidden_states'], (2, 1, 1))
+                                batch['encoder_attention_mask'] = torch.tile(batch['encoder_attention_mask'], (2, 1))
+                            else:
+                                batch['text'] = batch['text'] * 2
                     
-                    if len(select_frames) != 0:
-                        if rng is None:
-                            temp_n_frames = np.random.choice(select_frames, p = select_frames_prob)
-                        else:
-                            temp_n_frames = rng.choice(select_frames, p = select_frames_prob)
-                    else:
-                        temp_n_frames = 1
-
-                    # Magvae needs the number of frames to be 4n + 1.
-                    temp_n_frames = (temp_n_frames - 1) // sample_n_frames_bucket_interval + 1
-
-                    pixel_values = pixel_values[:, :temp_n_frames, :, :]
-
                     if args.train_mode != "normal":
-                        mask_pixel_values = mask_pixel_values[:, :temp_n_frames, :, :]
-                        mask = mask[:, :temp_n_frames, :, :]
-                    
-                # Keep all node same token length to accelerate the traning when resolution grows.
-                if args.keep_all_node_same_token_length:
-                    if args.token_sample_size > 256:
-                        numbers_list = list(range(256, args.token_sample_size + 1, 128))
+                        mask_pixel_values = batch["mask_pixel_values"].to(weight_dtype)
+                        mask = batch["mask"].to(weight_dtype)
+                        # Increase the batch size when the length of the latent sequence of the current sample is small
+                        if args.auto_tile_batch_size and args.training_with_video_token_length and zero_stage != 3:
+                            if args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 16 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
+                                mask_pixel_values = torch.tile(mask_pixel_values, (4, 1, 1, 1, 1))
+                                mask = torch.tile(mask, (4, 1, 1, 1, 1))
+                            elif args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 4 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
+                                mask_pixel_values = torch.tile(mask_pixel_values, (2, 1, 1, 1, 1))
+                                mask = torch.tile(mask, (2, 1, 1, 1, 1))
 
-                        if numbers_list[-1] != args.token_sample_size:
-                            numbers_list.append(args.token_sample_size)
-                    else:
-                        numbers_list = [256]
-                    numbers_list = [_number * _number * args.video_sample_n_frames for _number in  numbers_list]
-            
-                    actual_token_length = index_rng.choice(numbers_list)
-                    actual_video_length = (min(
-                            actual_token_length / pixel_values.size()[-1] / pixel_values.size()[-2], args.video_sample_n_frames
-                    ) - 1) // sample_n_frames_bucket_interval * sample_n_frames_bucket_interval + 1
-                    actual_video_length = int(max(actual_video_length, 1))
-
-                    # Magvae needs the number of frames to be 4n + 1.
-                    actual_video_length = (actual_video_length - 1) // sample_n_frames_bucket_interval + 1
-
-                    pixel_values = pixel_values[:, :actual_video_length, :, :]
-                    if args.train_mode != "normal":
-                        mask_pixel_values = mask_pixel_values[:, :actual_video_length, :, :]
-                        mask = mask[:, :actual_video_length, :, :]
-
-                # Make the inpaint latents to be zeros.
-                if args.train_mode != "normal":
-                    t2v_flag = [(_mask == 1).all() for _mask in mask]
-                    new_t2v_flag = []
-                    for _mask in t2v_flag:
-                        if _mask and np.random.rand() < 0.90:
-                            new_t2v_flag.append(0)
+                    if args.random_frame_crop:
+                        def _create_special_list(length):
+                            if length == 1:
+                                return [1.0]
+                            if length >= 2:
+                                last_element = 0.90
+                                remaining_sum = 1.0 - last_element
+                                other_elements_value = remaining_sum / (length - 1)
+                                special_list = [other_elements_value] * (length - 1) + [last_element]
+                                return special_list
+                        select_frames = [_tmp for _tmp in list(range(sample_n_frames_bucket_interval + 1, args.video_sample_n_frames + sample_n_frames_bucket_interval, sample_n_frames_bucket_interval))]
+                        select_frames_prob = np.array(_create_special_list(len(select_frames)))
+                        
+                        if len(select_frames) != 0:
+                            if rng is None:
+                                temp_n_frames = np.random.choice(select_frames, p = select_frames_prob)
+                            else:
+                                temp_n_frames = rng.choice(select_frames, p = select_frames_prob)
                         else:
-                            new_t2v_flag.append(1)
-                    t2v_flag = torch.from_numpy(np.array(new_t2v_flag)).to(accelerator.device, dtype=weight_dtype)
+                            temp_n_frames = 1
 
-                if args.low_vram:
-                    torch.cuda.empty_cache()
-                    vae.to(accelerator.device)
-                    if not args.enable_text_encoder_in_dataloader:
-                        text_encoder.to("cpu")
+                        # Magvae needs the number of frames to be 4n + 1.
+                        temp_n_frames = (temp_n_frames - 1) // sample_n_frames_bucket_interval + 1
 
-                with torch.no_grad():
-                    # This way is quicker when batch grows up
-                    def _batch_encode_vae(pixel_values):
-                        pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
-                        bs = args.vae_mini_batch
-                        new_pixel_values = []
-                        for i in range(0, pixel_values.shape[0], bs):
-                            pixel_values_bs = pixel_values[i : i + bs]
-                            pixel_values_bs = vae.encode(pixel_values_bs)[0]
-                            pixel_values_bs = pixel_values_bs.sample()
-                            new_pixel_values.append(pixel_values_bs)
-                        return torch.cat(new_pixel_values, dim = 0)
-                    if vae_stream_1 is not None:
-                        vae_stream_1.wait_stream(torch.cuda.current_stream())
-                        with torch.cuda.stream(vae_stream_1):
-                            latents = _batch_encode_vae(pixel_values)
-                    else:
-                        latents = _batch_encode_vae(pixel_values)
+                        pixel_values = pixel_values[:, :temp_n_frames, :, :]
+                        # Note: ref_pixel_values may have different frame count, don't crop it here
+
+                        if args.train_mode != "normal":
+                            mask_pixel_values = mask_pixel_values[:, :temp_n_frames, :, :]
+                            mask = mask[:, :temp_n_frames, :, :]
+                        
+                    # Keep all node same token length to accelerate the traning when resolution grows.
+                    if args.keep_all_node_same_token_length:
+                        if args.token_sample_size > 256:
+                            numbers_list = list(range(256, args.token_sample_size + 1, 128))
+
+                            if numbers_list[-1] != args.token_sample_size:
+                                numbers_list.append(args.token_sample_size)
+                        else:
+                            numbers_list = [256]
+                        numbers_list = [_number * _number * args.video_sample_n_frames for _number in  numbers_list]
+                
+                        actual_token_length = index_rng.choice(numbers_list)
+                        actual_video_length = (min(
+                                actual_token_length / pixel_values.size()[-1] / pixel_values.size()[-2], args.video_sample_n_frames
+                        ) - 1) // sample_n_frames_bucket_interval * sample_n_frames_bucket_interval + 1
+                        actual_video_length = int(max(actual_video_length, 1))
+
+                        # Magvae needs the number of frames to be 4n + 1.
+                        actual_video_length = (actual_video_length - 1) // sample_n_frames_bucket_interval + 1
+
+                        pixel_values = pixel_values[:, :actual_video_length, :, :]
+                        # Note: ref_pixel_values may have different frame count, don't crop it here
+                        if args.train_mode != "normal":
+                            mask_pixel_values = mask_pixel_values[:, :actual_video_length, :, :]
+                            mask = mask[:, :actual_video_length, :, :]
+
+                    # Make the inpaint latents to be zeros.
+                    if args.train_mode != "normal":
+                        t2v_flag = [(_mask == 1).all() for _mask in mask]
+                        new_t2v_flag = []
+                        for _mask in t2v_flag:
+                            if _mask and np.random.rand() < 0.90:
+                                new_t2v_flag.append(0)
+                            else:
+                                new_t2v_flag.append(1)
+                        t2v_flag = torch.from_numpy(np.array(new_t2v_flag)).to(accelerator.device, dtype=weight_dtype)
+
+                    if args.low_vram:
+                        torch.cuda.empty_cache()
+                        vae.to(accelerator.device)
+                        if not args.enable_text_encoder_in_dataloader:
+                            text_encoder.to("cpu")
+
+                    with torch.no_grad():
+                        # This way is quicker when batch grows up
+                        def _batch_encode_vae(pixel_values):
+                            pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
+                            bs = args.vae_mini_batch
+                            new_pixel_values = []
+                            for i in range(0, pixel_values.shape[0], bs):
+                                pixel_values_bs = pixel_values[i : i + bs]
+                                pixel_values_bs = vae.encode(pixel_values_bs)[0]
+                                pixel_values_bs = pixel_values_bs.sample()
+                                new_pixel_values.append(pixel_values_bs)
+                            return torch.cat(new_pixel_values, dim = 0)
+                        
+                        # Encode main latents
+                        with conditional_record_function("vae_encode_main"):
+                            if vae_stream_1 is not None:
+                                vae_stream_1.wait_stream(torch.cuda.current_stream())
+                                with torch.cuda.stream(vae_stream_1):
+                                    latents = _batch_encode_vae(pixel_values)
+                            else:
+                                latents = _batch_encode_vae(pixel_values)
+                        
+                        log_memory_usage("vae_encode_main", global_step)
+                        
+                        # Encode ref latents
+                        with conditional_record_function("vae_encode_ref"):
+                            ref_latents = _batch_encode_vae(ref_pixel_values)
+                        
+                        log_memory_usage("vae_encode_ref", global_step)
 
                     if args.train_mode != "normal":
                         mask = rearrange(mask, "b f c h w -> b c f h w")
@@ -1673,283 +1875,329 @@ def main():
                         else:
                             inpaint_latents = mask_latents
                                                     
-                # wait for latents = vae.encode(pixel_values) to complete
-                if vae_stream_1 is not None:
-                    torch.cuda.current_stream().wait_stream(vae_stream_1)
-
-                if args.low_vram:
-                    vae.to('cpu')
-                    torch.cuda.empty_cache()
-                    if not args.enable_text_encoder_in_dataloader:
-                        text_encoder.to(accelerator.device)
-
-                if args.enable_text_encoder_in_dataloader:
-                    prompt_embeds = batch['encoder_hidden_states'].to(device=latents.device)
-                else:
-                    with torch.no_grad():
-                        prompt_ids = tokenizer(
-                            batch['text'], 
-                            padding="max_length", 
-                            max_length=args.tokenizer_max_length, 
-                            truncation=True, 
-                            add_special_tokens=True, 
-                            return_tensors="pt"
-                        )
-                        text_input_ids = prompt_ids.input_ids
-                        prompt_attention_mask = prompt_ids.attention_mask
-
-                        seq_lens = prompt_attention_mask.gt(0).sum(dim=1).long()
-                        prompt_embeds = text_encoder(text_input_ids.to(latents.device), attention_mask=prompt_attention_mask.to(latents.device))[0]
-                        prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
-
-                if args.low_vram and not args.enable_text_encoder_in_dataloader:
-                    text_encoder.to('cpu')
-                    torch.cuda.empty_cache()
-
-                bsz, channel, num_frames, height, width = latents.size()
-                noise = torch.randn(latents.size(), device=latents.device, generator=torch_rng, dtype=weight_dtype)
-
-                if not args.uniform_sampling:
-                    u = compute_density_for_timestep_sampling(
-                        weighting_scheme=args.weighting_scheme,
-                        batch_size=bsz,
-                        logit_mean=args.logit_mean,
-                        logit_std=args.logit_std,
-                        mode_scale=args.mode_scale,
-                    )
-                    indices = (u * noise_scheduler.config.num_train_timesteps).long()
-                else:
-                    # Sample a random timestep for each image
-                    # timesteps = generate_timestep_with_lognorm(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
-                    # timesteps = torch.randint(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
-                    indices = idx_sampling(bsz, generator=torch_rng, device=latents.device)
-                    indices = indices.long().cpu()
-                timesteps = noise_scheduler.timesteps[indices].to(device=latents.device)
-
-                def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
-                    sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
-                    schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
-                    timesteps = timesteps.to(accelerator.device)
-                    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-
-                    sigma = sigmas[step_indices].flatten()
-                    while len(sigma.shape) < n_dim:
-                        sigma = sigma.unsqueeze(-1)
-                    return sigma
-
-                # Add noise according to flow matching.
-                # zt = (1 - texp) * x + texp * z1
-                sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
-                noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
-
-                # Add noise
-                target = noise - latents
-                
-                target_shape = (vae.latent_channels, num_frames, width, height)
-                seq_len = math.ceil(
-                    (target_shape[2] * target_shape[3]) /
-                    (accelerator.unwrap_model(transformer3d).config.patch_size[1] * accelerator.unwrap_model(transformer3d).config.patch_size[2]) *
-                    target_shape[1]
-                )
-
-                if args.train_mode == "ti2v":
-                    if rng is None:
-                        t2v_in_ti2v = np.random.choice([0, 1], p = [0.50, 0.50])
+                    # wait for latents = vae.encode(pixel_values) to complete
+                    if vae_stream_1 is not None:
+                        torch.cuda.current_stream().wait_stream(vae_stream_1)
+                    
+                    # Process ref latents as full_ref
+                    # ref_latents shape: [B, C, F, H, W]
+                    # RefTransformer3DModel can handle both single frame [B, C, H, W] and multi-frame [B, C, F, H, W]
+                    if ref_latents.size(2) == 1:
+                        # Single frame case: squeeze out the frame dimension
+                        full_ref = ref_latents.squeeze(2)  # [B, C, H, W]
                     else:
-                        t2v_in_ti2v = rng.choice([0, 1], p = [0.50, 0.50])
+                        # Multi-frame case: keep all frames
+                        full_ref = ref_latents  # [B, C, F, H, W]
 
-                    mask_bs = mask.size()[0]
-                    if t2v_in_ti2v:
-                        noisy_latents = (1 - mask) * inpaint_latents + mask * noisy_latents
-                        
-                        temp_ts = (mask[:, 0, :, ::2, ::2] * timesteps[:, None, None, None]).flatten(1)
-                        timesteps = torch.cat([temp_ts, temp_ts.new_ones(mask_bs, seq_len - temp_ts.size(1)) * timesteps[:, None,]], dim = 1)
+                    if args.low_vram:
+                        vae.to('cpu')
+                        torch.cuda.empty_cache()
+                        if not args.enable_text_encoder_in_dataloader:
+                            text_encoder.to(accelerator.device)
+
+                    if args.enable_text_encoder_in_dataloader:
+                        prompt_embeds = batch['encoder_hidden_states'].to(device=latents.device)
                     else:
-                        timesteps = mask.new_ones(mask_bs, seq_len) * timesteps[:, None,]
-
-                # Predict the noise residual
-                with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
-                    noise_pred = transformer3d(
-                        x=noisy_latents,
-                        context=prompt_embeds,
-                        t=timesteps,
-                        seq_len=seq_len,
-                        y=inpaint_latents if args.train_mode != "normal" and args.train_mode != "ti2v" else None,
-                    )
-                
-                def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
-                    noise_pred = noise_pred.float()
-                    target = target.float()
-                    diff = noise_pred - target
-                    mse_loss = F.mse_loss(noise_pred, target, reduction='none')
-                    mask = (diff.abs() <= threshold).float()
-                    masked_loss = mse_loss * mask
-                    if weighting is not None:
-                        masked_loss = masked_loss * weighting
-                    final_loss = masked_loss.mean()
-                    return final_loss
-                
-                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
-                loss = custom_mse_loss(noise_pred.float(), target.float(), weighting.float())
-                loss = loss.mean()
-
-                if args.motion_sub_loss and noise_pred.size()[1] > 2:
-                    gt_sub_noise = noise_pred[:, :, 1:].float() - noise_pred[:, :, :-1].float()
-                    pre_sub_noise = target[:, :, 1:].float() - target[:, :, :-1].float()
-                    sub_loss = F.mse_loss(gt_sub_noise, pre_sub_noise, reduction="mean")
-                    loss = loss * (1 - args.motion_sub_loss_ratio) + sub_loss * args.motion_sub_loss_ratio
-
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
-
-                # Backpropagate
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    if not args.use_deepspeed and not args.use_fsdp:
-                        trainable_params_grads = [p.grad for p in trainable_params if p.grad is not None]
-                        trainable_params_total_norm = torch.norm(torch.stack([torch.norm(g.detach(), 2) for g in trainable_params_grads]), 2)
-                        max_grad_norm = linear_decay(args.max_grad_norm * args.initial_grad_norm_ratio, args.max_grad_norm, args.abnormal_norm_clip_start, global_step)
-                        if trainable_params_total_norm / max_grad_norm > 5 and global_step > args.abnormal_norm_clip_start:
-                            actual_max_grad_norm = max_grad_norm / min((trainable_params_total_norm / max_grad_norm), 10)
-                        else:
-                            actual_max_grad_norm = max_grad_norm
-                    else:
-                        actual_max_grad_norm = args.max_grad_norm
-
-                    if not args.use_deepspeed and not args.use_fsdp and args.report_model_info and accelerator.is_main_process:
-                        if trainable_params_total_norm > 1 and global_step > args.abnormal_norm_clip_start:
-                            for name, param in transformer3d.named_parameters():
-                                if param.requires_grad:
-                                    writer.add_scalar(f'gradients/before_clip_norm/{name}', param.grad.norm(), global_step=global_step)
-
-                    norm_sum = accelerator.clip_grad_norm_(trainable_params, actual_max_grad_norm)
-                    if not args.use_deepspeed and not args.use_fsdp and args.report_model_info and accelerator.is_main_process:
-                        writer.add_scalar(f'gradients/norm_sum', norm_sum, global_step=global_step)
-                        writer.add_scalar(f'gradients/actual_max_grad_norm', actual_max_grad_norm, global_step=global_step)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-
-                if args.use_ema:
-                    ema_transformer3d.step(transformer3d.parameters())
-                progress_bar.update(1)
-                global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
-                train_loss = 0.0
-
-                if global_step % args.checkpointing_steps == 0:
-                    if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                        with torch.no_grad():
+                            with conditional_record_function("text_encode"):
+                                prompt_ids = tokenizer(
+                                    batch['text'], 
+                                    padding="max_length", 
+                                    max_length=args.tokenizer_max_length, 
+                                    truncation=True, 
+                                    add_special_tokens=True, 
+                                    return_tensors="pt"
                                 )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                                text_input_ids = prompt_ids.input_ids
+                                prompt_attention_mask = prompt_ids.attention_mask
 
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
+                                seq_lens = prompt_attention_mask.gt(0).sum(dim=1).long()
+                                prompt_embeds = text_encoder(text_input_ids.to(latents.device), attention_mask=prompt_attention_mask.to(latents.device))[0]
+                                prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
+                        
+                        log_memory_usage("text_encode", global_step)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                    if args.low_vram and not args.enable_text_encoder_in_dataloader:
+                        text_encoder.to('cpu')
+                        torch.cuda.empty_cache()
 
-                if accelerator.is_main_process:
-                    if args.validation_prompts is not None and global_step % args.validation_steps == 0:
-                        try:
-                            if args.use_ema:
-                                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                                ema_transformer3d.store(transformer3d.parameters())
-                                ema_transformer3d.copy_to(transformer3d.parameters())
-                            log_validation(
-                                vae,
-                                text_encoder,
-                                tokenizer,
-                                transformer3d,
-                                args,
-                                config,
-                                accelerator,
-                                weight_dtype,
-                                global_step,
-                            )
-                            if args.use_ema:
-                                # Switch back to the original transformer3d parameters.
-                                ema_transformer3d.restore(transformer3d.parameters())
-                        except Exception as e:
-                            logger.error(f"Validation failed: {e}")
-                            if args.use_ema:
-                                # Make sure to restore EMA parameters even if validation fails
-                                try:
-                                    ema_transformer3d.restore(transformer3d.parameters())
-                                except:
-                                    logger.error("Failed to restore EMA parameters after validation failure")
-                            # Continue training despite validation failure
-                            logger.info("Continuing training despite validation failure")
+                    bsz, channel, num_frames, height, width = latents.size()
+                    noise = torch.randn(latents.size(), device=latents.device, generator=torch_rng, dtype=weight_dtype)
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+                    if not args.uniform_sampling:
+                        u = compute_density_for_timestep_sampling(
+                            weighting_scheme=args.weighting_scheme,
+                            batch_size=bsz,
+                            logit_mean=args.logit_mean,
+                            logit_std=args.logit_std,
+                            mode_scale=args.mode_scale,
+                        )
+                        indices = (u * noise_scheduler.config.num_train_timesteps).long()
+                    else:
+                        # Sample a random timestep for each image
+                        # timesteps = generate_timestep_with_lognorm(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
+                        # timesteps = torch.randint(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
+                        indices = idx_sampling(bsz, generator=torch_rng, device=latents.device)
+                        indices = indices.long().cpu()
+                    timesteps = noise_scheduler.timesteps[indices].to(device=latents.device)
 
-            if global_step >= args.max_train_steps:
-                break
+                    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+                        sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
+                        schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
+                        timesteps = timesteps.to(accelerator.device)
+                        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
 
-        if accelerator.is_main_process:
-            if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
-                try:
-                    if args.use_ema:
-                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                        ema_transformer3d.store(transformer3d.parameters())
-                        ema_transformer3d.copy_to(transformer3d.parameters())
-                    log_validation(
-                        vae,
-                        text_encoder,
-                        tokenizer,
-                        transformer3d,
-                        args,
-                        config,
-                        accelerator,
-                        weight_dtype,
-                        global_step,
+                        sigma = sigmas[step_indices].flatten()
+                        while len(sigma.shape) < n_dim:
+                            sigma = sigma.unsqueeze(-1)
+                        return sigma
+
+                    # Add noise according to flow matching.
+                    # zt = (1 - texp) * x + texp * z1
+                    sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
+                    noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+
+                    # Add noise
+                    target = noise - latents
+                    
+                    target_shape = (vae.latent_channels, num_frames, width, height)
+                    seq_len = math.ceil(
+                        (target_shape[2] * target_shape[3]) /
+                        (accelerator.unwrap_model(transformer3d).config.patch_size[1] * accelerator.unwrap_model(transformer3d).config.patch_size[2]) *
+                        target_shape[1]
                     )
-                    if args.use_ema:
-                        # Switch back to the original transformer3d parameters.
-                        ema_transformer3d.restore(transformer3d.parameters())
-                except Exception as e:
-                    logger.error(f"Epoch validation failed: {e}")
-                    if args.use_ema:
-                        # Make sure to restore EMA parameters even if validation fails
-                        try:
-                            ema_transformer3d.restore(transformer3d.parameters())
-                        except:
-                            logger.error("Failed to restore EMA parameters after epoch validation failure")
-                    # Continue training despite validation failure
-                    logger.info("Continuing training despite epoch validation failure")
 
-    # Create the pipeline using the trained modules and save it.
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        transformer3d = unwrap_model(transformer3d)
-        if args.use_ema:
+                    if args.train_mode == "ti2v":
+                        if rng is None:
+                            t2v_in_ti2v = np.random.choice([0, 1], p = [0.50, 0.50])
+                        else:
+                            t2v_in_ti2v = rng.choice([0, 1], p = [0.50, 0.50])
+
+                        mask_bs = mask.size()[0]
+                        if t2v_in_ti2v:
+                            noisy_latents = (1 - mask) * inpaint_latents + mask * noisy_latents
+                            
+                            temp_ts = (mask[:, 0, :, ::2, ::2] * timesteps[:, None, None, None]).flatten(1)
+                            timesteps = torch.cat([temp_ts, temp_ts.new_ones(mask_bs, seq_len - temp_ts.size(1)) * timesteps[:, None,]], dim = 1)
+                        else:
+                            timesteps = mask.new_ones(mask_bs, seq_len) * timesteps[:, None,]
+
+                    # Predict the noise residual
+                    if args.train_mode != "normal" and args.train_mode != "ti2v":
+                        # For inpainting modes, use inpaint_latents as y
+                        with conditional_record_function("transformer_forward_inpaint"):
+                            noise_pred = transformer3d(
+                                x=noisy_latents,
+                                context=prompt_embeds,
+                                t=timesteps,
+                                seq_len=seq_len,
+                                y=inpaint_latents,
+                            )
+                    else:
+                        # For normal/ti2v mode, use full_ref
+                        with conditional_record_function("transformer_forward_ref"):
+                            noise_pred = transformer3d(
+                                x=noisy_latents,
+                                context=prompt_embeds,
+                                t=timesteps,
+                                seq_len=seq_len,
+                                full_ref=full_ref,
+                            )
+                    
+                    log_memory_usage("transformer_forward", global_step)
+
+                    def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
+                        noise_pred = noise_pred.float()
+                        target = target.float()
+                        diff = noise_pred - target
+                        mse_loss = F.mse_loss(noise_pred, target, reduction='none')
+                        mask = (diff.abs() <= threshold).float()
+                        masked_loss = mse_loss * mask
+                        if weighting is not None:
+                            masked_loss = masked_loss * weighting
+                        final_loss = masked_loss.mean()
+                        return final_loss
+                    
+                    weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+                    
+                    with conditional_record_function("loss_computation"):
+                        loss = custom_mse_loss(noise_pred.float(), target.float(), weighting.float())
+                        loss = loss.mean()
+
+                        if args.motion_sub_loss and noise_pred.size()[1] > 2:
+                            gt_sub_noise = noise_pred[:, :, 1:].float() - noise_pred[:, :, :-1].float()
+                            pre_sub_noise = target[:, :, 1:].float() - target[:, :, :-1].float()
+                            sub_loss = F.mse_loss(gt_sub_noise, pre_sub_noise, reduction="mean")
+                            loss = loss * (1 - args.motion_sub_loss_ratio) + sub_loss * args.motion_sub_loss_ratio
+                    
+                    log_memory_usage("loss_computation", global_step)
+
+                    # Gather the losses across all processes for logging (if we use distributed training).
+                    avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                    train_loss += avg_loss.item() / args.gradient_accumulation_steps
+
+                    # Backpropagate
+                    with conditional_record_function("backward_pass"):
+                        accelerator.backward(loss)
+                    
+                    log_memory_usage("backward_pass", global_step)
+
+                    if accelerator.sync_gradients:
+                        if not args.use_deepspeed and not args.use_fsdp:
+                            trainable_params_grads = [p.grad for p in trainable_params if p.grad is not None]
+                            trainable_params_total_norm = torch.norm(torch.stack([torch.norm(g.detach(), 2) for g in trainable_params_grads]), 2)
+                            max_grad_norm = linear_decay(args.max_grad_norm * args.initial_grad_norm_ratio, args.max_grad_norm, args.abnormal_norm_clip_start, global_step)
+                            if trainable_params_total_norm / max_grad_norm > 5 and global_step > args.abnormal_norm_clip_start:
+                                actual_max_grad_norm = max_grad_norm / min((trainable_params_total_norm / max_grad_norm), 10)
+                            else:
+                                actual_max_grad_norm = max_grad_norm
+                        else:
+                            actual_max_grad_norm = args.max_grad_norm
+
+                        if not args.use_deepspeed and not args.use_fsdp and args.report_model_info and accelerator.is_main_process:
+                            if trainable_params_total_norm > 1 and global_step > args.abnormal_norm_clip_start:
+                                for name, param in transformer3d.named_parameters():
+                                    if param.requires_grad:
+                                        writer.add_scalar(f'gradients/before_clip_norm/{name}', param.grad.norm(), global_step=global_step)
+
+                        norm_sum = accelerator.clip_grad_norm_(trainable_params, actual_max_grad_norm)
+                        if not args.use_deepspeed and not args.use_fsdp and args.report_model_info and accelerator.is_main_process:
+                            writer.add_scalar(f'gradients/norm_sum', norm_sum, global_step=global_step)
+                            writer.add_scalar(f'gradients/actual_max_grad_norm', actual_max_grad_norm, global_step=global_step)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+
+                    if args.use_ema:
+                        ema_transformer3d.step(transformer3d.parameters())
+                    progress_bar.update(1)
+                    global_step += 1
+                    accelerator.log({"train_loss": train_loss}, step=global_step)
+                    train_loss = 0.0
+
+                    if global_step % args.checkpointing_steps == 0:
+                        if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
+                            # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                            if args.checkpoints_total_limit is not None:
+                                checkpoints = os.listdir(args.output_dir)
+                                checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                                checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                                # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                                if len(checkpoints) >= args.checkpoints_total_limit:
+                                    num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                    removing_checkpoints = checkpoints[0:num_to_remove]
+
+                                    logger.info(
+                                        f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                    )
+                                    logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                    for removing_checkpoint in removing_checkpoints:
+                                        removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                        shutil.rmtree(removing_checkpoint)
+
+                            save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                            accelerator.save_state(save_path)
+                            logger.info(f"Saved state to {save_path}")
+
+                    if accelerator.is_main_process:
+                        if args.validation_prompts is not None and global_step % args.validation_steps == 0:
+                            try:
+                                if args.use_ema:
+                                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                                    ema_transformer3d.store(transformer3d.parameters())
+                                    ema_transformer3d.copy_to(transformer3d.parameters())
+                                log_validation(
+                                    vae,
+                                    text_encoder,
+                                    tokenizer,
+                                    transformer3d,
+                                    args,
+                                    config,
+                                    accelerator,
+                                    weight_dtype,
+                                    global_step,
+                                )
+                                if args.use_ema:
+                                    # Switch back to the original transformer3d parameters.
+                                    ema_transformer3d.restore(transformer3d.parameters())
+                            except Exception as e:
+                                logger.error(f"Validation failed: {e}")
+                                if args.use_ema:
+                                    # Make sure to restore EMA parameters even if validation fails
+                                    try:
+                                        ema_transformer3d.restore(transformer3d.parameters())
+                                    except:
+                                        logger.error("Failed to restore EMA parameters after validation failure")
+                                # Continue training despite validation failure
+                                logger.info("Continuing training despite validation failure")
+
+                logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+                
+                # Log memory at end of step
+                log_memory_usage("step_end", global_step)
+                
+                # Step profiler if enabled
+                if profiler is not None:
+                    profiler.step()
+
+                if global_step >= args.max_train_steps:
+                    break
+
+            if accelerator.is_main_process:
+                if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
+                    try:
+                        if args.use_ema:
+                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                            ema_transformer3d.store(transformer3d.parameters())
+                            ema_transformer3d.copy_to(transformer3d.parameters())
+                        log_validation(
+                            vae,
+                            text_encoder,
+                            tokenizer,
+                            transformer3d,
+                            args,
+                            config,
+                            accelerator,
+                            weight_dtype,
+                            global_step,
+                        )
+                        if args.use_ema:
+                            # Switch back to the original transformer3d parameters.
+                            ema_transformer3d.restore(transformer3d.parameters())
+                    except Exception as e:
+                        logger.error(f"Epoch validation failed: {e}")
+                        if args.use_ema:
+                            # Make sure to restore EMA parameters even if validation fails
+                            try:
+                                ema_transformer3d.restore(transformer3d.parameters())
+                            except:
+                                logger.error("Failed to restore EMA parameters after epoch validation failure")
+                        # Continue training despite validation failure
+                        logger.info("Continuing training despite epoch validation failure")
+
+        # Create the pipeline using the trained modules and save it.
+        accelerator.wait_for_everyone()
+        
+        # Profiler will be automatically stopped by context manager
+        if profiler is not None and accelerator.is_main_process:
+            print("Profiler finished. Trace files saved to:", logging_dir)
+        
+        if args.use_ema and accelerator.is_main_process:
+            transformer3d = unwrap_model(transformer3d)
             ema_transformer3d.copy_to(transformer3d.parameters())
 
-    if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
-        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-        accelerator.save_state(save_path)
-        logger.info(f"Saved state to {save_path}")
+        if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
+            save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+            accelerator.save_state(save_path)
+            logger.info(f"Saved state to {save_path}")
 
-    accelerator.end_training()
+        accelerator.end_training()
 
 
 if __name__ == "__main__":

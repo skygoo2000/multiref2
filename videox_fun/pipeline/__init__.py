@@ -6,6 +6,7 @@ from .pipeline_wan2_2 import Wan2_2Pipeline
 from .pipeline_wan2_2_fun_control import Wan2_2FunControlPipeline
 from .pipeline_wan2_2_fun_inpaint import Wan2_2FunInpaintPipeline
 from .pipeline_wan2_2_ti2v import Wan2_2TI2VPipeline
+from .pipeline_wan2_2_multiref import Wan2_2MultiRefPipeline
 from .pipeline_wan_fun_control import WanFunControlPipeline
 from .pipeline_wan_fun_inpaint import WanFunInpaintPipeline
 from .pipeline_wan_phantom import WanFunPhantomPipeline

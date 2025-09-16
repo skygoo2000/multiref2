@@ -19,8 +19,14 @@ def convert_metadata_to_train_format(input_file, output_file):
     
     # 转换数据格式
     train_data = []
+    skipped_count = 0
     
     for item in metadata:
+        # 检查fg_video_path是否为空，如果为空则跳过
+        if not item.get("fg_video_path") or item["fg_video_path"].strip() == "":
+            skipped_count += 1
+            continue
+            
         # 创建新的训练数据条目
         train_item = {
             "file_path": item["video_path"],
@@ -36,6 +42,8 @@ def convert_metadata_to_train_format(input_file, output_file):
         json.dump(train_data, f, ensure_ascii=False, indent=2)
     
     print(f"转换完成！已保存 {len(train_data)} 个条目到 {output_file}")
+    if skipped_count > 0:
+        print(f"跳过了 {skipped_count} 个ref为空的样本")
     
     # 显示一个示例
     if train_data:

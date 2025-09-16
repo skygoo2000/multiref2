@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
+import torch.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders.single_file_model import FromOriginalModelMixin
@@ -41,7 +41,7 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-@amp.autocast(enabled=False)
+@amp.autocast('cuda',enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -53,7 +53,7 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 # modified from https://github.com/thu-ml/RIFLEx/blob/main/riflex_utils.py
-@amp.autocast(enabled=False)
+@amp.autocast('cuda',enabled=False)
 def get_1d_rotary_pos_embed_riflex(
     pos: Union[np.ndarray, int],
     dim: int,
@@ -132,7 +132,7 @@ def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
     return (crop_top, crop_left), (crop_top + resize_height, crop_left + resize_width)
 
 
-@amp.autocast(enabled=False)
+@amp.autocast('cuda',enabled=False)
 @torch.compiler.disable()
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
@@ -853,7 +853,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         ])
 
         # time embeddings
-        with amp.autocast(dtype=torch.float32):
+        with amp.autocast('cuda',dtype=torch.float32):
             if t.dim() != 1:
                 if t.size(1) < seq_len:
                     pad_size = seq_len - t.size(1)
@@ -1328,3 +1328,305 @@ class Wan2_2Transformer3DModel(WanTransformer3DModel):
         
         if hasattr(self, "img_emb"):
             del self.img_emb
+
+class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
+    r"""
+    Wan 2.2 diffusion backbone with multi-frame reference support.
+    Uses the same patch_embedding for both main input and reference, no additional weights.
+    """
+    
+    @classmethod
+    def from_pretrained(
+        cls, pretrained_model_path, subfolder=None, transformer_additional_kwargs={},
+        low_cpu_mem_usage=False, torch_dtype=torch.bfloat16
+    ):
+        """
+        Override from_pretrained to ensure compatibility when loading from 
+        Wan2_2Transformer3DModel checkpoints.
+        """
+        # Call the parent's from_pretrained method, which will create the correct class instance
+        return super().from_pretrained(
+            pretrained_model_path=pretrained_model_path,
+            subfolder=subfolder,
+            transformer_additional_kwargs=transformer_additional_kwargs,
+            low_cpu_mem_usage=low_cpu_mem_usage,
+            torch_dtype=torch_dtype
+        )
+    
+    def forward(
+        self,
+        x,
+        t,
+        context,
+        seq_len,
+        clip_fea=None,
+        y=None,
+        y_camera=None,
+        full_ref=None,
+        subject_ref=None,
+        cond_flag=True,
+    ):
+        r"""
+        Forward pass with multi-frame reference support.
+        
+        Args:
+            full_ref (Tensor, *optional*):
+                Reference video/image tensor. Can be:
+                - [B, C, H, W] for single frame reference
+                - [B, C, F, H, W] for multi-frame reference
+                Uses the same patch_embedding as main input x.
+        """
+        # Handle multi-frame full_ref using the same patch_embedding as x
+        ref_frames = 0
+        if full_ref is not None:
+            if full_ref.dim() == 4:
+                # Single frame case: [B, C, H, W] -> [B, C, 1, H, W]
+                full_ref = full_ref.unsqueeze(2)
+                ref_frames = 1
+            else:
+                # Multi-frame case: [B, C, F, H, W]
+                ref_frames = full_ref.size(2)
+            
+            # Use the same patch_embedding as x (no additional weights)
+            full_ref = self.patch_embedding(full_ref)
+        
+        # Call parent forward with preprocessing
+        device = self.patch_embedding.weight.device
+        dtype = x.dtype
+        if self.freqs.device != device and torch.device(type="meta") != device:
+            self.freqs = self.freqs.to(device)
+
+        if y is not None:
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+        # embeddings
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        # add control adapter
+        if self.control_adapter is not None and y_camera is not None:
+            y_camera = self.control_adapter(y_camera)
+            x = [u + v for u, v in zip(x, y_camera)]
+
+        grid_sizes = torch.stack(
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+        
+        # concatenate to x sequences
+        if full_ref is not None:
+            full_ref = full_ref.flatten(2).transpose(1, 2)  # [B, tokens, dim]
+            # Update grid_sizes to account for ref frames
+            grid_sizes = torch.stack([torch.tensor([u[0] + ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+            seq_len += full_ref.size(1)
+            # Concatenate ref tokens to the end of each sequence
+            x = [torch.concat([u, _full_ref.unsqueeze(0)], dim=1) for _full_ref, u in zip(full_ref, x)]
+            # Extend timesteps with t=0 for full_ref tokens
+            if t.dim() != 1 and t.size(1) < seq_len:
+                pad_size = seq_len - t.size(1)
+                # Use t=0 for full_ref tokens instead of last_elements
+                zero_timesteps = t.new_zeros(t.size(0), pad_size)
+                t = torch.cat([t, zero_timesteps], dim=1)
+
+        # if subject_ref is not None:
+        #     subject_ref_frames = subject_ref.size(2)
+        #     subject_ref = self.patch_embedding(subject_ref).flatten(2).transpose(1, 2)
+        #     grid_sizes = torch.stack([torch.tensor([u[0] + subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+        #     seq_len += subject_ref.size(1)
+        #     x = [torch.concat([u, _subject_ref.unsqueeze(0)], dim=1) for _subject_ref, u in zip(subject_ref, x)]
+        #     if t.dim() != 1 and t.size(1) < seq_len:
+        #         pad_size = seq_len - t.size(1)
+        #         last_elements = t[:, -1].unsqueeze(1)
+        #         padding = last_elements.repeat(1, pad_size)
+        #         t = torch.cat([t, padding], dim=1)
+        
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        if self.sp_world_size > 1:
+            seq_len = int(math.ceil(seq_len / self.sp_world_size)) * self.sp_world_size
+        assert seq_lens.max() <= seq_len
+        x = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                      dim=1) for u in x
+        ])
+
+        # time embeddings
+        with amp.autocast('cuda',dtype=torch.float32):
+            if t.dim() != 1:
+                if t.size(1) < seq_len:
+                    pad_size = seq_len - t.size(1)
+                    last_elements = t[:, -1].unsqueeze(1)
+                    padding = last_elements.repeat(1, pad_size)
+                    t = torch.cat([t, padding], dim=1)
+                bt = t.size(0)
+                ft = t.flatten()
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim,
+                                            ft).unflatten(0, (bt, seq_len)).float())
+                e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+            else:
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim, t).float())
+                e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+
+        # context
+        context_lens = None
+        context = self.text_embedding(
+            torch.stack([
+                torch.cat(
+                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]))
+
+        if clip_fea is not None:
+            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context = torch.concat([context_clip, context], dim=1)
+
+        # Context Parallel
+        if self.sp_world_size > 1:
+            x = torch.chunk(x, self.sp_world_size, dim=1)[self.sp_world_rank]
+            if t.dim() != 1:
+                e0 = torch.chunk(e0, self.sp_world_size, dim=1)[self.sp_world_rank]
+                e = torch.chunk(e, self.sp_world_size, dim=1)[self.sp_world_rank]
+        
+        # TeaCache
+        if self.teacache is not None:
+            if cond_flag:
+                if t.dim() != 1:
+                    modulated_inp = e0[:, -1, :]
+                else:
+                    modulated_inp = e0
+                skip_flag = self.teacache.cnt < self.teacache.num_skip_start_steps
+                if skip_flag:
+                    self.should_calc = True
+                    self.teacache.accumulated_rel_l1_distance = 0
+                else:
+                    if cond_flag:
+                        rel_l1_distance = self.teacache.compute_rel_l1_distance(self.teacache.previous_modulated_input, modulated_inp)
+                        self.teacache.accumulated_rel_l1_distance += self.teacache.rescale_func(rel_l1_distance)
+                    if self.teacache.accumulated_rel_l1_distance < self.teacache.rel_l1_thresh:
+                        self.should_calc = False
+                    else:
+                        self.should_calc = True
+                        self.teacache.accumulated_rel_l1_distance = 0
+                self.teacache.previous_modulated_input = modulated_inp
+                self.teacache.should_calc = self.should_calc
+            else:
+                self.should_calc = self.teacache.should_calc
+        
+        # TeaCache
+        if self.teacache is not None:
+            if not self.should_calc:
+                previous_residual = self.teacache.previous_residual_cond if cond_flag else self.teacache.previous_residual_uncond
+                x = x + previous_residual.to(x.device)[-x.size()[0]:,]
+            else:
+                ori_x = x.clone().cpu() if self.teacache.offload else x.clone()
+
+                for block in self.blocks:
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+
+                        def create_custom_forward(module):
+                            def custom_forward(*inputs):
+                                return module(*inputs)
+
+                            return custom_forward
+                        ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x,
+                            e0,
+                            seq_lens,
+                            grid_sizes,
+                            self.freqs,
+                            context,
+                            context_lens,
+                            dtype,
+                            t,
+                            **ckpt_kwargs,
+                        )
+                    else:
+                        # arguments
+                        kwargs = dict(
+                            e=e0,
+                            seq_lens=seq_lens,
+                            grid_sizes=grid_sizes,
+                            freqs=self.freqs,
+                            context=context,
+                            context_lens=context_lens,
+                            dtype=dtype,
+                            t=t  
+                        )
+                        x = block(x, **kwargs)
+                    
+                if cond_flag:
+                    self.teacache.previous_residual_cond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
+                else:
+                    self.teacache.previous_residual_uncond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
+        else:
+            for block in self.blocks:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+
+                        return custom_forward
+                    ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        x,
+                        e0,
+                        seq_lens,
+                        grid_sizes,
+                        self.freqs,
+                        context,
+                        context_lens,
+                        dtype,
+                        t,
+                        **ckpt_kwargs,
+                    )
+                else:
+                    # arguments
+                    kwargs = dict(
+                        e=e0,
+                        seq_lens=seq_lens,
+                        grid_sizes=grid_sizes,
+                        freqs=self.freqs,
+                        context=context,
+                        context_lens=context_lens,
+                        dtype=dtype,
+                        t=t  
+                    )
+                    x = block(x, **kwargs)
+
+        # head
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+
+                return custom_forward
+            ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+            x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.head), x, e, **ckpt_kwargs)
+        else:
+            x = self.head(x, e)
+
+        if self.sp_world_size > 1:
+            x = self.all_gather(x, dim=1)
+
+        # Remove ref tokens from output
+        if full_ref is not None:
+            full_ref_length = full_ref.size(1)
+            x = x[:, :-full_ref_length]  # Remove from end since full_ref is now concatenated at the end
+            grid_sizes = torch.stack([torch.tensor([u[0] - ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+
+        # if subject_ref is not None:
+        #     subject_ref_length = subject_ref.size(1)
+        #     x = x[:, :-subject_ref_length]
+        #     grid_sizes = torch.stack([torch.tensor([u[0] - subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+
+        # unpatchify
+        x = self.unpatchify(x, grid_sizes)
+        x = torch.stack(x)
+        if self.teacache is not None and cond_flag:
+            self.teacache.cnt += 1
+            if self.teacache.cnt == self.teacache.num_steps:
+                self.teacache.reset()
+        return x

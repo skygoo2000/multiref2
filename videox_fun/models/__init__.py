@@ -19,7 +19,7 @@ from .qwenimage_vae import AutoencoderKLQwenImage
 from .wan_audio_encoder import WanAudioEncoder
 from .wan_image_encoder import CLIPModel
 from .wan_text_encoder import WanT5EncoderModel
-from .wan_transformer3d import (Wan2_2Transformer3DModel, WanRMSNorm,
+from .wan_transformer3d import (Wan2_2RefTransformer3DModel, Wan2_2Transformer3DModel, WanRMSNorm,
                                 WanSelfAttention, WanTransformer3DModel)
 from .wan_transformer3d_s2v import Wan2_2Transformer3DModel_S2V
 from .wan_vae import AutoencoderKLWan, AutoencoderKLWan_
