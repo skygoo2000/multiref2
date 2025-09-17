@@ -182,6 +182,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
         
         # Load validation reference if provided
         validation_ref = None
+        is_ref_image = False
         if args.validation_ref_path is not None:
             
             ref_path = args.validation_ref_path
@@ -190,6 +191,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
             # Check if ref is image or video by extension
             ref_ext = ref_path.lower().split('.')[-1]
             if ref_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
+                is_ref_image = True
                 # Load as image
                 ref_image = Image.open(ref_path).convert('RGB')
                 # Transform to match model input
@@ -203,8 +205,8 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                 
                 # Save validation reference image as gif (single frame)
                 os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
-                validation_ref_for_save = validation_ref.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W] for save_videos_grid
-                save_videos_grid(validation_ref_for_save, os.path.join(args.output_dir, f"validation/step-{global_step}/ref.gif"), fps=24)
+                validation_ref = validation_ref.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W] for save_videos_grid
+                save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/ref.gif"), fps=24)
             else:
                 # Load as video
                 try:
@@ -275,6 +277,27 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                         ref_video   = ref_video_input
                     ).videos
                     save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=24)
+
+                    if i == 0: # Log only the first prompt's result
+                        log_dict = {}
+                        
+                        log_sample = sample_with_ref.clone().detach().clamp(0, 1) * 255
+                        log_sample = log_sample.permute(0, 2, 1, 3, 4).to(torch.uint8)
+                        
+                        log_ref = validation_ref.clone().detach() * 255
+                        if not is_ref_image: # Video ref: (B, C, T, H, W) -> (B, T, C, H, W)
+                            log_ref = log_ref.permute(0, 2, 1, 3, 4)
+                        log_ref = log_ref.to(torch.uint8)
+
+                        if args.report_to == "wandb":
+                            # Wandb requires (T, C, H, W)
+                            log_dict["validation/sample_with_ref"] = wandb.Video(log_sample[0].cpu(), fps=8, format="gif")
+                            log_dict["validation/validation_ref"] = wandb.Video(log_ref[0].cpu(), fps=8, format="gif")
+                        else: # Tensorboard
+                            log_dict["validation/sample_with_ref"] = log_sample
+                            log_dict["validation/validation_ref"] = log_ref
+                        
+                        accelerator.log(log_dict, step=global_step)
 
         del pipeline
         gc.collect()
@@ -1619,21 +1642,10 @@ def main():
     profiler = None
     if args.enable_profiler and accelerator.is_main_process:
         def trace_handler(prof):
-            """Handle profiler trace output to tensorboard"""
-            # Export trace for tensorboard
-            prof.export_chrome_trace(os.path.join(logging_dir, f"trace_{prof.step_num}.json"))
-            
-            # Log memory stats to tensorboard 
-            if torch.cuda.is_available():
-                memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
-                memory_cached = torch.cuda.memory_cached() / 1024**3       # GB
-                
-                writer.add_scalar('profiler/memory_allocated_gb', memory_allocated, prof.step_num)
-                writer.add_scalar('profiler/memory_reserved_gb', memory_reserved, prof.step_num)
-                writer.add_scalar('profiler/memory_cached_gb', memory_cached, prof.step_num)
-                
-                print(f"Step {prof.step_num}: GPU Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB, Cached: {memory_cached:.2f}GB")
+            """Handle profiler trace output for timing analysis."""
+            trace_path = os.path.join(logging_dir, f"trace_step_{prof.step_num}.json")
+            prof.export_chrome_trace(trace_path)
+            logger.info(f"Profiler trace for step {prof.step_num} saved to {trace_path}")
         
         profiler_schedule = schedule(
             wait=args.profiler_schedule_wait,
@@ -1647,7 +1659,7 @@ def main():
             schedule=profiler_schedule,
             on_trace_ready=trace_handler,
             record_shapes=True,
-            profile_memory=True,
+            profile_memory=False,
             with_stack=True
         )
         
@@ -1669,9 +1681,11 @@ def main():
             memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
             max_memory_allocated = torch.cuda.max_memory_allocated() / 1024**3  # GB
             
-            writer.add_scalar(f'memory/{step_name}_allocated_gb', memory_allocated, global_step)
-            writer.add_scalar(f'memory/{step_name}_reserved_gb', memory_reserved, global_step)
-            writer.add_scalar(f'memory/{step_name}_max_allocated_gb', max_memory_allocated, global_step)
+            accelerator.log({
+                f'memory/allocated/{step_name}_gb': memory_allocated,
+                f'memory/reserved/{step_name}_gb': memory_reserved,
+                f'memory/max_allocated/{step_name}_gb': max_memory_allocated
+            }, step=global_step)
 
     # Use profiler as context manager if enabled
     profiler_context = profiler if profiler is not None else nullcontext()
@@ -1683,7 +1697,7 @@ def main():
             
             for step, batch in enumerate(train_dataloader):
                 # Log memory at start of step
-                log_memory_usage("step_start", global_step)
+                log_memory_usage("1_step_start", global_step)
                 
                 # Data batch sanity check
                 if epoch == first_epoch and step == 0:
@@ -1711,7 +1725,7 @@ def main():
                     ref_pixel_values = batch["ref_pixel_values"].to(weight_dtype)
                     
                     # Log memory after data loading
-                    log_memory_usage("data_loaded", global_step)
+                    log_memory_usage("2_data_loaded", global_step)
 
                     # Increase the batch size when the length of the latent sequence of the current sample is small
                     if args.auto_tile_batch_size and args.training_with_video_token_length and zero_stage != 3:
@@ -1840,13 +1854,13 @@ def main():
                             else:
                                 latents = _batch_encode_vae(pixel_values)
                         
-                        log_memory_usage("vae_encode_main", global_step)
+                        log_memory_usage("3_vae_encode_main", global_step)
                         
                         # Encode ref latents
                         with conditional_record_function("vae_encode_ref"):
                             ref_latents = _batch_encode_vae(ref_pixel_values)
                         
-                        log_memory_usage("vae_encode_ref", global_step)
+                        log_memory_usage("4_vae_encode_ref", global_step)
 
                     if args.train_mode != "normal":
                         mask = rearrange(mask, "b f c h w -> b c f h w")
@@ -2004,7 +2018,7 @@ def main():
                                 full_ref=full_ref,
                             )
                     
-                    log_memory_usage("transformer_forward", global_step)
+                    log_memory_usage("5_transformer_forward", global_step)
 
                     def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
                         noise_pred = noise_pred.float()
@@ -2030,7 +2044,7 @@ def main():
                             sub_loss = F.mse_loss(gt_sub_noise, pre_sub_noise, reduction="mean")
                             loss = loss * (1 - args.motion_sub_loss_ratio) + sub_loss * args.motion_sub_loss_ratio
                     
-                    log_memory_usage("loss_computation", global_step)
+                    log_memory_usage("6_loss_computation", global_step)
 
                     # Gather the losses across all processes for logging (if we use distributed training).
                     avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -2040,7 +2054,7 @@ def main():
                     with conditional_record_function("backward_pass"):
                         accelerator.backward(loss)
                     
-                    log_memory_usage("backward_pass", global_step)
+                    log_memory_usage("7_backward_pass", global_step)
 
                     if accelerator.sync_gradients:
                         if not args.use_deepspeed and not args.use_fsdp:
@@ -2075,7 +2089,13 @@ def main():
                         ema_transformer3d.step(transformer3d.parameters())
                     progress_bar.update(1)
                     global_step += 1
-                    accelerator.log({"train_loss": train_loss}, step=global_step)
+                    
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    accelerator.log({
+                        "train/loss": train_loss, 
+                        "train/learning_rate": current_lr
+                    }, step=global_step)
+                    
                     train_loss = 0.0
 
                     if global_step % args.checkpointing_steps == 0:
@@ -2104,7 +2124,7 @@ def main():
                             accelerator.save_state(save_path)
                             logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompts is not None and global_step % args.validation_steps == 0 and not args.use_fsdp:
+                    if args.validation_prompts is not None and (global_step % args.validation_steps == 0 or global_step == 1) and not args.use_fsdp:
     
                         if accelerator.is_main_process:
                             logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")
@@ -2148,7 +2168,7 @@ def main():
                 progress_bar.set_postfix(**logs)
                 
                 # Log memory at end of step
-                log_memory_usage("step_end", global_step)
+                log_memory_usage("8_step_end", global_step)
                 
                 # Step profiler if enabled
                 if profiler is not None:
@@ -2156,6 +2176,10 @@ def main():
 
                 if global_step >= args.max_train_steps:
                     break
+
+            if global_step >= args.max_train_steps:
+                logger.info(f"Rank {accelerator.process_index} reached max_train_steps: {args.max_train_steps}")
+                break
         
         logger.info(f"Rank {accelerator.process_index} waiting for validation")
         accelerator.wait_for_everyone()

@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=train5b         
 #SBATCH --nodes=1
-#SBATCH --gpus=1
+#SBATCH --gpus=4
 #SBATCH --time=48:00:00          # total run time limit (HH:MM:SS)
-#SBATCH --partition=normal
+#SBATCH --partition=preempt
 #SBATCH --account=liuyuan
 
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.2-TI2V-5B"
-export DATASET_NAME="datasets/synworld10/"
-export DATASET_META_NAME="datasets/synworld10/train.json"
+export DATASET_NAME="datasets/synworld12/"
+export DATASET_META_NAME="$DATASET_NAME/train.json"
 
 export NCCL_DEBUG=WARN
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -20,15 +20,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export NCCL_IB_TIMEOUT=300
 # export NCCL_IB_RETRY_CNT=10
 
-LEARNING_RATE=1e-04
+LEARNING_RATE=2e-05
 BATCH_SIZE=1
-EPOCHS=2000
+MAX_TRAIN_STEPS=6000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-DATASET_SUFFIX=$(echo "$DATASET_META_NAME" | sed 's|.*/\([^/]*\)/[^/]*$|\1|')
-OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_${DATASET_SUFFIX}_${EPOCHS}ep_ref-t0_afterconcat"
+OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_overfit_${MAX_TRAIN_STEPS}steps_lr${LEARNING_RATE}_ref-t0_afterconcat"
 
 VALIDATION_STEPS=200
 VALIDATION_EPOCHS=99999
@@ -36,10 +35,9 @@ VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a m
 VALIDATION_REF_PATH="datasets/synworld10/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
 VALIDATION_SIZE="480 832 121"  # height width frames
 
-module load slurm "nvhpc-hpcx-cuda12/23.11"
 
 source /project/liuyuan/zekai/miniconda3/etc/profile.d/conda.sh
-conda activate sam
+conda activate ref
 
 cd /project/liuyuan/zekai/code/multiref2
 
@@ -64,8 +62,8 @@ accelerate launch --mixed_precision="bf16" scripts/wan2.2/train_ref.py \
   --video_sample_n_frames=121 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=1 \
-  --dataloader_num_workers=4 \
-  --num_train_epochs=$EPOCHS \
+  --dataloader_num_workers=8 \
+  --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
   --checkpoints_total_limit=5 \
   --validation_steps=$VALIDATION_STEPS \
@@ -91,10 +89,12 @@ accelerate launch --mixed_precision="bf16" scripts/wan2.2/train_ref.py \
   --train_mode="ti2v" \
   --trainable_modules "." \
   --report_model_info \
+  --report_to="wandb" \
+  --tracker_project_name="multiref-ti2v-5b" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
   --low_vram \
-  --gradient_accumulation_steps=4 \
+  # --gradient_accumulation_steps=4 \
   # --enable_profiler
 
 
