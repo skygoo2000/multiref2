@@ -1,25 +1,25 @@
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.2-TI2V-5B"
-export DATASET_NAME="datasets/synworld10/"
-export DATASET_META_NAME="datasets/synworld10/train.json"
+export DATASET_NAME="datasets/synworld12/"
+export DATASET_META_NAME="$DATASET_NAME/train.json"
 # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
 # export NCCL_IB_DISABLE=1
 # export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=INFO
+export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
+
 
 LEARNING_RATE=1e-04
 BATCH_SIZE=1
-EPOCHS=400
-CHECKPOINTING_STEPS=200
+EPOCHS=2500
+CHECKPOINTING_STEPS=500
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-DATASET_SUFFIX=$(echo "$DATASET_META_NAME" | sed 's|.*/\([^/]*\)/[^/]*$|\1|')
-OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_${DATASET_SUFFIX}_${EPOCHS}ep_[ref-t0]_afterconcat"
+OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_overfit_${EPOCHS}ep_[ref-t0]_afterconcat"
 
 VALIDATION_STEPS=200
-VALIDATION_EPOCHS=99999
 VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
-VALIDATION_REF_PATH="datasets/synworld10/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
+VALIDATION_REF_PATH="$DATASET_NAME/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
 VALIDATION_SIZE="480 832 121"  # height width frames
 
 ## normal
@@ -34,7 +34,7 @@ VALIDATION_SIZE="480 832 121"  # height width frames
 ## deepspeed zero2
 # accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.2/train_ref.py \
 
-accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "SHARD_GRAD_OP" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False scripts/wan2.2/train_ref.py \
+accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "FULL_SHARD" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False scripts/wan2.2/train_ref.py \
   --config_path="config/wan2.2/wan_civitai_5b.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
@@ -46,12 +46,11 @@ accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TR
   --video_sample_n_frames=121 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=1 \
-  --dataloader_num_workers=4 \
+  --dataloader_num_workers=8 \
   --num_train_epochs=$EPOCHS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
-  --checkpoints_total_limit=5 \
+  --checkpoints_total_limit=10 \
   --validation_steps=$VALIDATION_STEPS \
-  --validation_epochs=$VALIDATION_EPOCHS \
   --validation_prompts "$VALIDATION_PROMPTS" \
   --validation_ref_path $VALIDATION_REF_PATH \
   --validation_size $VALIDATION_SIZE \
@@ -74,6 +73,6 @@ accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TR
   --trainable_modules "." \
   --report_model_info \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
-  --low_vram \
   --gradient_checkpointing \
+  --low_vram \
   # --gradient_accumulation_steps=4 \

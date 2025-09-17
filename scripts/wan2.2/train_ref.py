@@ -168,9 +168,9 @@ logger = get_logger(__name__, log_level="INFO")
 
 def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, accelerator, weight_dtype, global_step):
     
+    logger.info("Running validation... ")
+
     try:
-        logger.info("Running validation... ")
-        
         # Set validation dimensions
         if args.validation_size is not None:
             val_height, val_width, val_frames = args.validation_size
@@ -559,7 +559,7 @@ def parse_args():
         "--validation_epochs",
         type=int,
         default=5,
-        help="Run validation every X epochs.",
+        help="(abandoned) Run validation every X epochs.",
     )
     parser.add_argument(
         "--validation_steps",
@@ -1183,8 +1183,8 @@ def main():
                 in_already.append(name)
                 high_lr_flag = True
                 trainable_params_optim[0]['params'].append(param)
-                if accelerator.is_main_process:
-                    print(f"Set {name} to lr : {args.learning_rate}")
+                # if accelerator.is_main_process:
+                #     print(f"Set {name} to lr : {args.learning_rate}")
                 break
         if high_lr_flag:
             continue
@@ -1192,8 +1192,8 @@ def main():
             if trainable_module_name in name:
                 in_already.append(name)
                 trainable_params_optim[1]['params'].append(param)
-                if accelerator.is_main_process:
-                    print(f"Set {name} to lr : {args.learning_rate / 2}")
+                # if accelerator.is_main_process:
+                #     print(f"Set {name} to lr : {args.learning_rate / 2}")
                 break
 
     if args.use_came:
@@ -2104,13 +2104,16 @@ def main():
                             accelerator.save_state(save_path)
                             logger.info(f"Saved state to {save_path}")
 
-                    if accelerator.is_main_process:
-                        if args.validation_prompts is not None and global_step % args.validation_steps == 0:
+                    if args.validation_prompts is not None and global_step % args.validation_steps == 0 and not args.use_fsdp:
+    
+                        if accelerator.is_main_process:
+                            logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")
                             try:
                                 if args.use_ema:
                                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                                     ema_transformer3d.store(transformer3d.parameters())
                                     ema_transformer3d.copy_to(transformer3d.parameters())
+                                
                                 log_validation(
                                     vae,
                                     text_encoder,
@@ -2122,9 +2125,11 @@ def main():
                                     weight_dtype,
                                     global_step,
                                 )
+
                                 if args.use_ema:
                                     # Switch back to the original transformer3d parameters.
                                     ema_transformer3d.restore(transformer3d.parameters())
+                            
                             except Exception as e:
                                 logger.error(f"Validation failed: {e}")
                                 if args.use_ema:
@@ -2135,6 +2140,9 @@ def main():
                                         logger.error("Failed to restore EMA parameters after validation failure")
                                 # Continue training despite validation failure
                                 logger.info("Continuing training despite validation failure")
+
+                        logger.info(f"[Rank {accelerator.process_index}] Syncing after validation step...")
+                        accelerator.wait_for_everyone()
 
                 logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
@@ -2148,40 +2156,8 @@ def main():
 
                 if global_step >= args.max_train_steps:
                     break
-
-            if accelerator.is_main_process:
-                if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
-                    try:
-                        if args.use_ema:
-                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                            ema_transformer3d.store(transformer3d.parameters())
-                            ema_transformer3d.copy_to(transformer3d.parameters())
-                        log_validation(
-                            vae,
-                            text_encoder,
-                            tokenizer,
-                            transformer3d,
-                            args,
-                            config,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
-                        )
-                        if args.use_ema:
-                            # Switch back to the original transformer3d parameters.
-                            ema_transformer3d.restore(transformer3d.parameters())
-                    except Exception as e:
-                        logger.error(f"Epoch validation failed: {e}")
-                        if args.use_ema:
-                            # Make sure to restore EMA parameters even if validation fails
-                            try:
-                                ema_transformer3d.restore(transformer3d.parameters())
-                            except:
-                                logger.error("Failed to restore EMA parameters after epoch validation failure")
-                        # Continue training despite validation failure
-                        logger.info("Continuing training despite epoch validation failure")
-
-        # Create the pipeline using the trained modules and save it.
+        
+        logger.info(f"Rank {accelerator.process_index} waiting for validation")
         accelerator.wait_for_everyone()
         
         # Profiler will be automatically stopped by context manager
