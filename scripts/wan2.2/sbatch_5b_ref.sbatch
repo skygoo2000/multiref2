@@ -72,7 +72,7 @@ accelerate launch --mixed_precision="bf16" scripts/wan2.2/train_ref.py \
   --validation_ref_path $VALIDATION_REF_PATH \
   --validation_size $VALIDATION_SIZE \
   --learning_rate=$LEARNING_RATE \
-  --lr_scheduler="cosine_with_restarts" \
+  --lr_scheduler="constant_with_warmup" \
   --lr_warmup_steps=100 \
   --seed=42 \
   --output_dir=$OUTPUT_DIR \
@@ -87,7 +87,7 @@ accelerate launch --mixed_precision="bf16" scripts/wan2.2/train_ref.py \
   --uniform_sampling \
   --boundary_type="full" \
   --train_mode="ti2v" \
-  --trainable_modules "." \
+  --trainable_modules "self_attn" \
   --report_model_info \
   --report_to="wandb" \
   --tracker_project_name="multiref-ti2v-5b" \

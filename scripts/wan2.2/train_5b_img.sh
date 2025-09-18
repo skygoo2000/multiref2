@@ -1,6 +1,6 @@
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.2-TI2V-5B"
-export DATASET_NAME="datasets/synworld12/"
-export DATASET_META_NAME="$DATASET_NAME/train.json"
+export DATASET_NAME="datasets/synworldimg53k/"
+export DATASET_META_NAME="$DATASET_NAME/train24.json"
 # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
 # export NCCL_IB_DISABLE=1
 # export NCCL_P2P_DISABLE=1
@@ -8,18 +8,18 @@ export NCCL_DEBUG=WARN
 # export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=1
-MAX_TRAIN_STEPS=1200
+BATCH_SIZE=2
+MAX_TRAIN_STEPS=3000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_overfit_${MAX_TRAIN_STEPS}steps_lr${LEARNING_RATE}_ref-t0_afterconcat"
+OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-t0_afterconcat_selfattn"
 
 VALIDATION_STEPS=200
-VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
-VALIDATION_REF_PATH="$DATASET_NAME/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
-VALIDATION_SIZE="480 832 121"  # height width frames
+VALIDATION_PROMPTS="On a sunlit porch, the Pine-Sol Multi-Surface Cleaner sits atop an outdoor table surrounded by lush greenery. The camera angle is a close-up, focusing on the detailed textures and bright label of the bottle. The morning light is clean and crisp, highlighting the dew on nearby leaves. In the background, hints of a garden with colorful flowers can be seen, complemented by the soft chirping of birds, suggesting a tranquil, nature-infused environment."
+VALIDATION_REF_PATH="$DATASET_NAME/ref/00000000.mp4"
+VALIDATION_SIZE="512 512 1"  # height width frames
 
 ## normal
 # accelerate launch --mixed_precision="bf16" scripts/wan2.2/train_ref.py \
@@ -48,7 +48,7 @@ accelerate launch --mixed_precision="bf16" scripts/wan2.2/train_ref.py \
   --dataloader_num_workers=8 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
-  --checkpoints_total_limit=10 \
+  --checkpoints_total_limit=3 \
   --validation_steps=$VALIDATION_STEPS \
   --validation_prompts "$VALIDATION_PROMPTS" \
   --validation_ref_path $VALIDATION_REF_PATH \
@@ -75,6 +75,6 @@ accelerate launch --mixed_precision="bf16" scripts/wan2.2/train_ref.py \
   --tracker_project_name="multiref-ti2v-5b" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
-  --low_vram \
+  # --low_vram \
   # --gradient_accumulation_steps=2 \
   # --enable_profiler

@@ -276,7 +276,12 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                         generator   = generator,
                         ref_video   = ref_video_input
                     ).videos
-                    save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=24)
+
+                    # save as gif if single frame, otherwise save as mp4
+                    if sample_with_ref.shape[2] == 1:
+                        save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.gif"), fps=24)
+                    else:
+                        save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=24)
 
                     if i == 0: # Log only the first prompt's result
                         log_dict = {}
@@ -1041,18 +1046,20 @@ def main():
     # For 3D Patch: trainable_modules = ['ff.net', 'pos_embed', 'attn2', 'proj_out', 'timepositionalencoding', 'h_position', 'w_position']
     # For 2D Patch: trainable_modules = ['ff.net', 'attn2', 'timepositionalencoding', 'h_position', 'w_position']
     transformer3d.train()
-    
-    # RefTransformer3DModel uses existing patch_embedding, no additional weights to train
-    
-    if accelerator.is_main_process:
-        accelerator.print(
-            f"Trainable modules '{args.trainable_modules}'."
-        )
+        
     for name, param in transformer3d.named_parameters():
         for trainable_module_name in args.trainable_modules + args.trainable_modules_low_learning_rate:
             if trainable_module_name in name:
                 param.requires_grad = True
                 break
+
+    # RefTransformer3DModel uses existing patch_embedding, no additional weights to train
+    if accelerator.is_main_process:
+        accelerator.print(f"### Trainable modules '{args.trainable_modules}'.")
+        trainable_params_count = sum(p.numel() for p in transformer3d.parameters() if p.requires_grad)
+        total_params_count = sum(p.numel() for p in transformer3d.parameters())
+        accelerator.print(f"### Trainable Parameters: {trainable_params_count / 1e6:.6f} M")
+        accelerator.print(f"### Trainable Ratio: {trainable_params_count / total_params_count * 100:.2f}%")
 
     # Create EMA for the transformer3d.
     if args.use_ema:
@@ -1547,7 +1554,10 @@ def main():
         tracker_config.pop("trainable_modules_low_learning_rate")
         tracker_config.pop("fix_sample_size")
         tracker_config.pop("validation_size")
-        accelerator.init_trackers(args.tracker_project_name, tracker_config)
+        if args.report_to == "wandb":
+            accelerator.init_trackers(args.tracker_project_name, tracker_config, init_kwargs={"wandb": {"name": os.path.basename(args.output_dir.rstrip("/"))}})
+        else:
+            accelerator.init_trackers(args.tracker_project_name, tracker_config)
 
     # Function for unwrapping if model was compiled with `torch.compile`.
     def unwrap_model(model):
@@ -2118,7 +2128,12 @@ def main():
 
                                     for removing_checkpoint in removing_checkpoints:
                                         removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                        shutil.rmtree(removing_checkpoint)
+                                        try:
+                                            shutil.rmtree(removing_checkpoint)
+                                        except (OSError, FileNotFoundError) as e:
+                                            logger.warning(f"Failed to remove checkpoint {removing_checkpoint}: {e}")
+                                            # Continue with the next checkpoint
+                                            continue
 
                             save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                             accelerator.save_state(save_path)
@@ -2145,6 +2160,7 @@ def main():
                                     weight_dtype,
                                     global_step,
                                 )
+                                transformer3d.train()
 
                                 if args.use_ema:
                                     # Switch back to the original transformer3d parameters.
