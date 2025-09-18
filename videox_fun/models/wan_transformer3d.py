@@ -1419,12 +1419,17 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
             seq_len += full_ref.size(1)
             # Concatenate ref tokens to the end of each sequence
             x = [torch.concat([u, _full_ref.unsqueeze(0)], dim=1) for _full_ref, u in zip(full_ref, x)]
-            # Extend timesteps with t=0 for full_ref tokens
             if t.dim() != 1 and t.size(1) < seq_len:
                 pad_size = seq_len - t.size(1)
-                # Use t=0 for full_ref tokens instead of last_elements
-                zero_timesteps = t.new_zeros(t.size(0), pad_size)
-                t = torch.cat([t, zero_timesteps], dim=1)
+                last_elements = t[:, -1].unsqueeze(1)
+                padding = last_elements.repeat(1, pad_size)
+                t = torch.cat([t, padding], dim=1)
+            #### Use t=0 for full_ref tokens instead of last_elements ####
+            # if t.dim() != 1 and t.size(1) < seq_len:
+            #     pad_size = seq_len - t.size(1)
+            #     # Use t=0 for full_ref tokens instead of last_elements
+            #     zero_timesteps = t.new_zeros(t.size(0), pad_size)
+            #     t = torch.cat([t, zero_timesteps], dim=1)
 
         # if subject_ref is not None:
         #     subject_ref_frames = subject_ref.size(2)

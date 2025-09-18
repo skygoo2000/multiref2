@@ -5,24 +5,21 @@ export DATASET_META_NAME="$DATASET_NAME/train.json"
 # export NCCL_IB_DISABLE=1
 # export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
-# export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 LEARNING_RATE=2e-05
 BATCH_SIZE=1
-MAX_TRAIN_STEPS=1200
+MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_overfit_${MAX_TRAIN_STEPS}steps_lr${LEARNING_RATE}_ref-t0_afterconcat"
+OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_overfit_${MAX_TRAIN_STEPS}steps_lr${LEARNING_RATE}_ref-noisy_afterconcat_selfattn"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
 VALIDATION_REF_PATH="$DATASET_NAME/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
 VALIDATION_SIZE="480 832 121"  # height width frames
-
-## normal
-# accelerate launch --mixed_precision="bf16" scripts/wan2.2/train_ref.py \
 
 ## fsdp stage2
 # accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "SHARD_GRAD_OP" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False scripts/wan2.2/train_ref.py \
@@ -33,7 +30,7 @@ VALIDATION_SIZE="480 832 121"  # height width frames
 ## deepspeed zero2
 # accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.2/train_ref.py \
 
-accelerate launch --mixed_precision="bf16" scripts/wan2.2/train_ref.py \
+accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.2/train_ref.py \
   --config_path="config/wan2.2/wan_civitai_5b.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \

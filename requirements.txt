@@ -28,3 +28,4 @@ transformers>=4.46.2
 librosa
 moviepy
 ninja
+deepspeed==0.17.0

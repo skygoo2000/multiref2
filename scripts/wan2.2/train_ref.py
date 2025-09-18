@@ -1575,6 +1575,12 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
+    logger.info("***** Model Info *****")
+    logger.info(f"  Total Parameters = {sum(p.numel() for p in transformer3d.parameters())}")
+    logger.info(f"  Trainable modules = {args.trainable_modules}")
+    logger.info(f"  Trainable Parameters = {sum(p.numel() for p in transformer3d.parameters() if p.requires_grad)}")
+
     global_step = 0
     first_epoch = 0
 
@@ -2009,7 +2015,7 @@ def main():
                     # Predict the noise residual
                     if args.train_mode != "normal" and args.train_mode != "ti2v":
                         # For inpainting modes, use inpaint_latents as y
-                        with conditional_record_function("transformer_forward_inpaint"):
+                        with conditional_record_function("transformer_forward_inpaint"), torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
                             noise_pred = transformer3d(
                                 x=noisy_latents,
                                 context=prompt_embeds,
@@ -2019,7 +2025,7 @@ def main():
                             )
                     else:
                         # For normal/ti2v mode, use full_ref
-                        with conditional_record_function("transformer_forward_ref"):
+                        with conditional_record_function("transformer_forward_ref"), torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
                             noise_pred = transformer3d(
                                 x=noisy_latents,
                                 context=prompt_embeds,
