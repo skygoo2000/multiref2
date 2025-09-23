@@ -204,9 +204,9 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                 logger.info(f"Loaded reference image with shape: {validation_ref.shape}")
                 
                 # Save validation reference image as gif (single frame)
-                os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+                os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
                 validation_ref = validation_ref.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W] for save_videos_grid
-                save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/ref.gif"), fps=24)
+                save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
             else:
                 # Load as video
                 try:
@@ -234,7 +234,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     # Save validation reference as gif
                     os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
                     # save_videos_grid expects torch.Tensor input
-                    save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/ref.gif"), fps=24)
+                    save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
                     
                 except Exception as e:
                     logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
@@ -283,24 +283,64 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     else:
                         save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=24)
 
+                    # frame mismatch
+                    ref_frames = validation_ref.shape[2]
+                    sample_frames = sample_with_ref.shape[2]
+                    
+                    if ref_frames != sample_frames:
+                        if sample_frames < ref_frames:
+                            # Repeat last frame to match reference length
+                            last_frame = sample_with_ref[:, :, -1:, :, :] 
+                            repeat_count = ref_frames - sample_frames
+                            repeated_frames = last_frame.repeat(1, 1, repeat_count, 1, 1)
+                            sample_with_ref = torch.cat([sample_with_ref, repeated_frames], dim=2)
+                        else:
+                            # Repeat last frame to match sample length
+                            last_frame = validation_ref[:, :, -1:, :, :] 
+                            repeat_count = sample_frames - ref_frames
+                            repeated_frames = last_frame.repeat(1, 1, repeat_count, 1, 1)
+                            validation_ref = torch.cat([validation_ref, repeated_frames], dim=2)
+                    
+                    # spatial mismatch
+                    ref_h, ref_w = validation_ref.shape[3], validation_ref.shape[4]
+                    sample_h, sample_w = sample_with_ref.shape[3], sample_with_ref.shape[4]
+                    
+                    if ref_h != sample_h or ref_w != sample_w:
+                        # Keep ratio resize + center crop
+                        scale = max(ref_h / sample_h, ref_w / sample_w)
+                        new_h, new_w = int(sample_h * scale), int(sample_w * scale)
+                        
+                        # Resize
+                        sample_resized = F.interpolate(
+                            sample_with_ref.view(-1, sample_with_ref.shape[1], sample_h, sample_w),
+                            size=(new_h, new_w), mode='bilinear', align_corners=False
+                        )
+                        sample_resized = sample_resized.view(sample_with_ref.shape[0], sample_with_ref.shape[1], ref_frames, new_h, new_w)
+                        
+                        # Center crop to match ref size
+                        start_h = max(0, (new_h - ref_h) // 2)
+                        start_w = max(0, (new_w - ref_w) // 2)
+                        end_h = start_h + ref_h
+                        end_w = start_w + ref_w
+                        sample_with_ref = sample_resized[:, :, :, start_h:end_h, start_w:end_w]
+                    
+                    comparison_video = torch.cat([validation_ref, sample_with_ref], dim=0)  # [2, C, F, H, W]
+                    if comparison_video.shape[2] == 1:
+                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.gif"), fps=1)
+                    else:
+                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=24)
+
                     if i == 0: # Log only the first prompt's result
                         log_dict = {}
                         
-                        log_sample = sample_with_ref.clone().detach().clamp(0, 1) * 255
-                        log_sample = log_sample.permute(0, 2, 1, 3, 4).to(torch.uint8)
-                        
-                        log_ref = validation_ref.clone().detach() * 255
-                        if not is_ref_image: # Video ref: (B, C, T, H, W) -> (B, T, C, H, W)
-                            log_ref = log_ref.permute(0, 2, 1, 3, 4)
-                        log_ref = log_ref.to(torch.uint8)
+                        # Prepare comparison for logging
+                        log_comparison = comparison_video.clone().detach().clamp(0, 1) * 255
+                        log_comparison = log_comparison.permute(0, 2, 1, 3, 4).to(torch.uint8)  # [2, F, C, H, W]
 
                         if args.report_to == "wandb":
-                            # Wandb requires (T, C, H, W)
-                            log_dict["validation/sample_with_ref"] = wandb.Video(log_sample[0].cpu(), fps=8, format="gif")
-                            log_dict["validation/validation_ref"] = wandb.Video(log_ref[0].cpu(), fps=8, format="gif")
+                            log_dict["validation/comparison"] = wandb.Video(log_comparison.cpu(), fps=24, format="gif")
                         else: # Tensorboard
-                            log_dict["validation/sample_with_ref"] = log_sample
-                            log_dict["validation/validation_ref"] = log_ref
+                            log_dict["validation/comparison"] = log_comparison
                         
                         accelerator.log(log_dict, step=global_step)
 
@@ -2150,6 +2190,30 @@ def main():
                         if accelerator.is_main_process:
                             logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")
                             try:
+
+                                # test vae encode and decode
+                                if global_step <= 1:
+                                    vae_decoder = vae.eval()
+                                    gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
+                                    gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
+                                    gt = (pixel_values / 2 + 0.5).clamp(0, 1).cpu().float() 
+                                    # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
+                                    comparison = torch.cat([gt.permute(0,2,1,3,4).cpu().float(), gt_decoded], dim=3)
+                                    save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=24)
+
+                                    # Prepare comparison for logging
+                                    log_vae_comparison = comparison.clone().detach().clamp(0, 1) * 255
+                                    log_vae_comparison = log_vae_comparison.permute(0, 2, 1, 3, 4).to(torch.uint8)  # [2, F, C, H, W]
+
+                                    log_dict = {}
+
+                                    if args.report_to == "wandb":
+                                        log_dict["validation/comparison"] = wandb.Video(log_vae_comparison.cpu(), fps=24, format="gif")
+                                    else: # Tensorboard
+                                        log_dict["validation/comparison"] = log_vae_comparison
+                                    
+                                    accelerator.log(log_dict, step=global_step)
+
                                 if args.use_ema:
                                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                                     ema_transformer3d.store(transformer3d.parameters())

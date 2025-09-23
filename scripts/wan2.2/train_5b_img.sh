@@ -5,24 +5,21 @@ export DATASET_META_NAME="$DATASET_NAME/train24.json"
 # export NCCL_IB_DISABLE=1
 # export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
-export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
+# export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=1
-MAX_TRAIN_STEPS=5000
+BATCH_SIZE=2
+MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_img24_lr${LEARNING_RATE}_ref-t0_afterconcat_selfattn"
+OUTPUT_DIR="ckpts/0918_${MODEL_SUFFIX}_img24_lr${LEARNING_RATE}_ref-noisy_afterconcat_selfattn"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="On a sunlit porch, the Pine-Sol Multi-Surface Cleaner sits atop an outdoor table surrounded by lush greenery. The camera angle is a close-up, focusing on the detailed textures and bright label of the bottle. The morning light is clean and crisp, highlighting the dew on nearby leaves. In the background, hints of a garden with colorful flowers can be seen, complemented by the soft chirping of birds, suggesting a tranquil, nature-infused environment."
 VALIDATION_REF_PATH="$DATASET_NAME/ref/00000000.mp4"
 VALIDATION_SIZE="512 512 1"  # height width frames
-
-## fsdp stage2
-# accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "SHARD_GRAD_OP" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False scripts/wan2.2/train_ref.py \
 
 ## fsdp stage3
 # accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "FULL_SHARD" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False scripts/wan2.2/train_ref.py \
@@ -69,9 +66,9 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --trainable_modules "self_attn" \
   --report_model_info \
   --report_to="wandb" \
-  --tracker_project_name="multiref-img-4090" \
+  --tracker_project_name="multiref-img" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
-  --low_vram \
+  # --low_vram \
   # --gradient_accumulation_steps=2 \
   # --enable_profiler

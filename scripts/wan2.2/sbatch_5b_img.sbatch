@@ -1,13 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=train5b         
-#SBATCH --nodes=1
-#SBATCH --gpus=4
-#SBATCH --time=48:00:00          # total run time limit (HH:MM:SS)
+#SBATCH --job-name=img5b-8gpu
+#SBATCH --nodes=1                  
+#SBATCH --ntasks-per-node=1         
+#SBATCH --gpus-per-node=8           
+#SBATCH --time=48:00:00
 #SBATCH --partition=preempt
 #SBATCH --account=liuyuan
 
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.2-TI2V-5B"
-export DATASET_NAME="datasets/synworld12/"
+export DATASET_NAME="datasets/synworldimg53k/"
 export DATASET_META_NAME="$DATASET_NAME/train.json"
 
 export NCCL_DEBUG=WARN
@@ -21,18 +22,18 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export NCCL_IB_RETRY_CNT=10
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=1
-MAX_TRAIN_STEPS=6000
+BATCH_SIZE=3
+MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_overfit_${MAX_TRAIN_STEPS}steps_lr${LEARNING_RATE}_ref-t0_afterconcat"
+OUTPUT_DIR="ckpts/0922_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-noisy_afterconcat_selfattn"
 
 VALIDATION_STEPS=200
-VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
-VALIDATION_REF_PATH="datasets/synworld10/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
-VALIDATION_SIZE="480 832 121"  # height width frames
+VALIDATION_PROMPTS="On a sunlit porch, the Pine-Sol Multi-Surface Cleaner sits atop an outdoor table surrounded by lush greenery. The camera angle is a close-up, focusing on the detailed textures and bright label of the bottle. The morning light is clean and crisp, highlighting the dew on nearby leaves. In the background, hints of a garden with colorful flowers can be seen, complemented by the soft chirping of birds, suggesting a tranquil, nature-infused environment."
+VALIDATION_REF_PATH="$DATASET_NAME/ref/00000000.mp4"
+VALIDATION_SIZE="512 512 1"  # height width frames
 
 
 source /project/liuyuan/zekai/miniconda3/etc/profile.d/conda.sh
@@ -82,12 +83,12 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --trainable_modules "self_attn" \
   --report_model_info \
   --report_to="wandb" \
-  --tracker_project_name="multiref-ti2v-5b" \
+  --tracker_project_name="multiref-img-8gpu" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
-  --low_vram \
-  # --gradient_accumulation_steps=4 \
+  # --low_vram \
+  # --gradient_accumulation_steps=2 \
   # --enable_profiler
 
 
-# sbatch --wait -o train_5b.out scripts/wan2.2/sbatch_5b_ref.sbatch
+# sbatch --wait -o train_5b_img_8gpu.out scripts/wan2.2/sbatch_5b_img.sbatch
