@@ -207,6 +207,9 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                 os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
                 validation_ref = validation_ref.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W] for save_videos_grid
                 save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+
+                if args.report_to == "wandb":
+                    wandb.log({"validation/ref": wandb.Image(validation_ref.cpu())})
             else:
                 # Load as video
                 try:
@@ -235,6 +238,9 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
                     # save_videos_grid expects torch.Tensor input
                     save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+
+                    if args.report_to == "wandb":
+                        log_dict["validation/ref"] = wandb.Video(validation_ref.cpu(), fps=24, format="gif")
                     
                 except Exception as e:
                     logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
@@ -325,10 +331,11 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                         sample_with_ref = sample_resized[:, :, :, start_h:end_h, start_w:end_w]
                     
                     comparison_video = torch.cat([validation_ref, sample_with_ref], dim=0)  # [2, C, F, H, W]
+                    caption = f"{args.validation_prompts[i].split('.')[0]}..."
                     if comparison_video.shape[2] == 1:
-                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.gif"), fps=1)
+                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.gif"), fps=1, caption=caption)
                     else:
-                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=24)
+                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=24, caption=caption)
 
                     if i == 0: # Log only the first prompt's result
                         log_dict = {}
@@ -2194,7 +2201,14 @@ def main():
                                 # test vae encode and decode
                                 if global_step <= 1:
                                     vae_decoder = vae.eval()
+                                    # Ensure VAE is on the same device as latents for decoding
+                                    if args.low_vram:
+                                        vae_decoder.to(accelerator.device)
                                     gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
+                                    # Move VAE back to CPU if low_vram mode is enabled
+                                    if args.low_vram:
+                                        vae_decoder.to('cpu')
+                                        torch.cuda.empty_cache()
                                     gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
                                     gt = (pixel_values / 2 + 0.5).clamp(0, 1).cpu().float() 
                                     # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
@@ -2208,9 +2222,9 @@ def main():
                                     log_dict = {}
 
                                     if args.report_to == "wandb":
-                                        log_dict["validation/comparison"] = wandb.Video(log_vae_comparison.cpu(), fps=24, format="gif")
+                                        log_dict["validation/vae_decoded"] = wandb.Video(log_vae_comparison.cpu(), fps=24, format="gif")
                                     else: # Tensorboard
-                                        log_dict["validation/comparison"] = log_vae_comparison
+                                        log_dict["validation/vae_decoded"] = log_vae_comparison
                                     
                                     accelerator.log(log_dict, step=global_step)
 

@@ -164,11 +164,77 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).to(x.dtype)
 
 
+@amp.autocast('cuda',enabled=False)
+@torch.compiler.disable()
+def rope_apply_with_ref(x, grid_sizes, ref_grid_sizes, freqs):
+    """
+    Apply RoPE to a tensor x which is a concatenation of a reference part and a main part.
+    The reference part is given negative positional offsets and placed at the beginning.
+
+    Args:
+        x (Tensor): Input tensor, shape [B, L, num_heads, C / num_heads]. (ref + main)
+        grid_sizes (Tensor): Shape [B, 3], grid sizes (F, H, W) for the main part.
+        ref_grid_sizes (Tensor): Shape [B, 3], grid sizes (rF, rH, rW) for the reference part.
+        freqs (Tensor): RoPE frequencies.
+    """
+    n, c = x.size(2), x.size(3) // 2
+
+    # split freqs for F, H, W dimensions
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    output = []
+    for i, (main_grid, ref_grid) in enumerate(zip(grid_sizes.tolist(), ref_grid_sizes.tolist())):
+        f, h, w = main_grid
+        rf, rh, rw = ref_grid
+        
+        main_seq_len = f * h * w
+        ref_seq_len = rf * rh * rw
+        seq_len = ref_seq_len + main_seq_len
+
+
+        freqs_f_ref = torch.conj(freqs[0][:rf]).flip(0).to(device=freqs[0].device, dtype=freqs[0].dtype)
+        freqs_h_ref = torch.conj(freqs[1][:rh]).flip(0).to(device=freqs[1].device, dtype=freqs[1].dtype)
+        freqs_w_ref = torch.conj(freqs[2][:rw]).flip(0).to(device=freqs[2].device, dtype=freqs[2].dtype)
+
+        freqs_ref_i = torch.cat([
+            freqs_f_ref.view(rf, 1, 1, -1).expand(rf, rh, rw, -1),
+            freqs_h_ref.view(1, rh, 1, -1).expand(rf, rh, rw, -1),
+            freqs_w_ref.view(1, 1, rw, -1).expand(rf, rh, rw, -1)
+        ], dim=-1).reshape(ref_seq_len, 1, -1)
+
+        freqs_main_i = torch.cat([
+            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(main_seq_len, 1, -1)
+        
+        freqs_i = torch.cat([freqs_ref_i, freqs_main_i], dim=0)
+
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float32).reshape(
+            seq_len, n, -1, 2))
+        
+        # apply rotary embedding
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        
+        if seq_len < x.size(1):
+            x_i = torch.cat([x_i, x[i, seq_len:]])
+
+        # append to collection
+        output.append(x_i)
+        
+    return torch.stack(output).to(x.dtype)
+
+
 def rope_apply_qk(q, k, grid_sizes, freqs):
     q = rope_apply(q, grid_sizes, freqs)
     k = rope_apply(k, grid_sizes, freqs)
     return q, k
 
+
+def rope_apply_qk_with_ref(q, k, grid_sizes, ref_grid_sizes, freqs):
+    q = rope_apply_with_ref(q, grid_sizes, ref_grid_sizes, freqs)
+    k = rope_apply_with_ref(k, grid_sizes, ref_grid_sizes, freqs)
+    return q, k
 
 class WanRMSNorm(nn.Module):
 
@@ -247,6 +313,51 @@ class WanSelfAttention(nn.Module):
         q, k, v = qkv_fn(x)
 
         q, k = rope_apply_qk(q, k, grid_sizes, freqs)
+
+        x = attention(
+            q.to(dtype), 
+            k.to(dtype), 
+            v=v.to(dtype),
+            k_lens=seq_lens,
+            window_size=self.window_size)
+        x = x.to(dtype)
+
+        # output
+        x = x.flatten(2)
+        x = self.o(x)
+        return x
+
+
+class WanSelfAttentionWithRef(WanSelfAttention):
+    """
+    WanSelfAttention with support for reference frames using negative RoPE positions.
+    """
+    
+    def forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16, t=0, ref_grid_sizes=None):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, num_heads, C / num_heads] - concatenated main + ref
+            seq_lens(Tensor): Shape [B] - total sequence lengths including ref
+            grid_sizes(Tensor): Shape [B, 3], grid sizes (F, H, W) for the main part
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            ref_grid_sizes(Tensor): Shape [B, 3], grid sizes (rF, rH, rW) for the reference part
+        """
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+        # query, key, value function
+        def qkv_fn(x):
+            q = self.norm_q(self.q(x.to(dtype))).view(b, s, n, d)
+            k = self.norm_k(self.k(x.to(dtype))).view(b, s, n, d)
+            v = self.v(x.to(dtype)).view(b, s, n, d)
+            return q, k, v
+
+        q, k, v = qkv_fn(x)
+
+        # Apply RoPE with reference support if ref_grid_sizes is provided
+        if ref_grid_sizes is not None:
+            q, k = rope_apply_qk_with_ref(q, k, grid_sizes, ref_grid_sizes, freqs)
+        else:
+            q, k = rope_apply_qk(q, k, grid_sizes, freqs)
 
         x = attention(
             q.to(dtype), 
@@ -449,6 +560,77 @@ class WanAttentionBlock(nn.Module):
         temp_x = temp_x.to(dtype)
 
         y = self.self_attn(temp_x, seq_lens, grid_sizes, freqs, dtype, t=t)
+        x = x + y * e[2]
+
+        # cross-attention & ffn function
+        def cross_attn_ffn(x, context, context_lens, e):
+            # cross-attention
+            x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype, t=t)
+
+            # ffn function
+            temp_x = self.norm2(x) * (1 + e[4]) + e[3]
+            temp_x = temp_x.to(dtype)
+            
+            y = self.ffn(temp_x)
+            x = x + y * e[5]
+            return x
+
+        x = cross_attn_ffn(x, context, context_lens, e)
+        return x
+
+
+class WanAttentionBlockWithRef(WanAttentionBlock):
+    """
+    WanAttentionBlock with support for reference frames.
+    """
+    
+    def __init__(self,
+                 cross_attn_type,
+                 dim,
+                 ffn_dim,
+                 num_heads,
+                 window_size=(-1, -1),
+                 qk_norm=True,
+                 cross_attn_norm=False,
+                 eps=1e-6):
+        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
+        
+        # Replace self_attn with the ref-aware version
+        self.self_attn = WanSelfAttentionWithRef(dim, num_heads, window_size, qk_norm, eps)
+
+    def forward(
+        self,
+        x,
+        e,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        context,
+        context_lens,
+        dtype=torch.bfloat16,
+        t=0,
+        ref_grid_sizes=None,
+    ):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, C]
+            e(Tensor): Shape [B, 6, C]
+            seq_lens(Tensor): Shape [B], length of each sequence in batch
+            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            ref_grid_sizes(Tensor): Shape [B, 3], grid sizes (rF, rH, rW) for the reference part
+        """
+        if e.dim() > 3:
+            e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
+            e = [e.squeeze(2) for e in e]
+        else:        
+            e = (self.modulation + e).chunk(6, dim=1)
+
+        # self-attention
+        temp_x = self.norm1(x) * (1 + e[1]) + e[0]
+        temp_x = temp_x.to(dtype)
+
+        y = self.self_attn(temp_x, seq_lens, grid_sizes, freqs, dtype, t=t, ref_grid_sizes=ref_grid_sizes)
         x = x + y * e[2]
 
         # cross-attention & ffn function
@@ -1335,6 +1517,68 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
     Uses the same patch_embedding for both main input and reference, no additional weights.
     """
     
+    def __init__(
+        self,
+        model_type='t2v',
+        patch_size=(1, 2, 2),
+        text_len=512,
+        in_dim=16,
+        dim=2048,
+        ffn_dim=8192,
+        freq_dim=256,
+        text_dim=4096,
+        out_dim=16,
+        num_heads=16,
+        num_layers=32,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=True,
+        eps=1e-6,
+        in_channels=16,
+        hidden_size=2048,
+        add_control_adapter=False,
+        in_dim_control_adapter=24,
+        downscale_factor_control_adapter=8,
+        add_ref_conv=False,
+        in_dim_ref_conv=16,
+    ):
+        # Call parent's __init__
+        super().__init__(
+            model_type=model_type,
+            patch_size=patch_size,
+            text_len=text_len,
+            in_dim=in_dim,
+            dim=dim,
+            ffn_dim=ffn_dim,
+            freq_dim=freq_dim,
+            text_dim=text_dim,
+            out_dim=out_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            window_size=window_size,
+            qk_norm=qk_norm,
+            cross_attn_norm=cross_attn_norm,
+            eps=eps,
+            in_channels=in_channels,
+            hidden_size=hidden_size,
+            add_control_adapter=add_control_adapter,
+            in_dim_control_adapter=in_dim_control_adapter,
+            downscale_factor_control_adapter=downscale_factor_control_adapter,
+            add_ref_conv=add_ref_conv,
+            in_dim_ref_conv=in_dim_ref_conv,
+        )
+        
+        # Replace blocks with ref-aware versions
+        cross_attn_type = "cross_attn"
+        self.blocks = nn.ModuleList([
+            WanAttentionBlockWithRef(cross_attn_type, dim, ffn_dim, num_heads,
+                              window_size, qk_norm, cross_attn_norm, eps)
+            for _ in range(num_layers)
+        ])
+        for layer_idx, block in enumerate(self.blocks):
+            block.self_attn.layer_idx = layer_idx
+            block.self_attn.num_layers = self.num_layers
+    
     @classmethod
     def from_pretrained(
         cls, pretrained_model_path, subfolder=None, transformer_additional_kwargs={},
@@ -1378,6 +1622,7 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
         """
         # Handle multi-frame full_ref using the same patch_embedding as x
         ref_frames = 0
+        ref_grid_sizes = None
         if full_ref is not None:
             if full_ref.dim() == 4:
                 # Single frame case: [B, C, H, W] -> [B, C, 1, H, W]
@@ -1406,42 +1651,50 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
             y_camera = self.control_adapter(y_camera)
             x = [u + v for u, v in zip(x, y_camera)]
 
+        # Get original grid sizes for main content
         grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]).to(device)
+        
+        # Store original grid sizes for main content (without ref)
+        original_grid_sizes = grid_sizes.clone()
 
         x = [u.flatten(2).transpose(1, 2) for u in x]
         
-        # concatenate to x sequences
+        # concatenate full_ref to x sequences
         if full_ref is not None:
             full_ref = full_ref.flatten(2).transpose(1, 2)  # [B, tokens, dim]
-            # Update grid_sizes to account for ref frames
-            grid_sizes = torch.stack([torch.tensor([u[0] + ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+            
+            # Calculate ref_grid_sizes from full_ref shape
+            ref_grid_sizes = torch.stack([
+                torch.tensor([ref_frames, original_grid_sizes[i][1], original_grid_sizes[i][2]], dtype=torch.long) 
+                for i in range(len(x))
+            ]).to(device=device, dtype=torch.long)
+            
+            # Update grid_sizes to account for ref frames (total frames = ref + main)
+            grid_sizes = torch.stack([torch.tensor([ref_frames + u[0], u[1], u[2]]) for u in grid_sizes]).to(device=device, dtype=torch.long)
             seq_len += full_ref.size(1)
-            # Concatenate ref tokens to the end of each sequence
-            x = [torch.concat([u, _full_ref.unsqueeze(0)], dim=1) for _full_ref, u in zip(full_ref, x)]
+            # Concatenate ref tokens to the beginning of each sequence
+            x = [torch.concat([_full_ref.unsqueeze(0), u], dim=1) for _full_ref, u in zip(full_ref, x)]
+            
+            ### Use t=0 for full_ref tokens instead of last_elements ####
             if t.dim() != 1 and t.size(1) < seq_len:
                 pad_size = seq_len - t.size(1)
-                last_elements = t[:, -1].unsqueeze(1)
-                padding = last_elements.repeat(1, pad_size)
-                t = torch.cat([t, padding], dim=1)
-            #### Use t=0 for full_ref tokens instead of last_elements ####
+                # Use t=0 for full_ref tokens instead of last_elements, prepend to the beginning
+                zero_timesteps = t.new_zeros(t.size(0), pad_size)
+                t = torch.cat([zero_timesteps, t], dim=1)
+        
+        if subject_ref is not None:
+            assert False, "multiref2 do not support subject_ref"
+            # subject_ref_frames = subject_ref.size(2)
+            # subject_ref = self.patch_embedding(subject_ref).flatten(2).transpose(1, 2)
+            # grid_sizes = torch.stack([torch.tensor([u[0] + subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+            # seq_len += subject_ref.size(1)
+            # x = [torch.concat([u, _subject_ref.unsqueeze(0)], dim=1) for _subject_ref, u in zip(subject_ref, x)]
             # if t.dim() != 1 and t.size(1) < seq_len:
             #     pad_size = seq_len - t.size(1)
-            #     # Use t=0 for full_ref tokens instead of last_elements
-            #     zero_timesteps = t.new_zeros(t.size(0), pad_size)
-            #     t = torch.cat([t, zero_timesteps], dim=1)
-
-        # if subject_ref is not None:
-        #     subject_ref_frames = subject_ref.size(2)
-        #     subject_ref = self.patch_embedding(subject_ref).flatten(2).transpose(1, 2)
-        #     grid_sizes = torch.stack([torch.tensor([u[0] + subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
-        #     seq_len += subject_ref.size(1)
-        #     x = [torch.concat([u, _subject_ref.unsqueeze(0)], dim=1) for _subject_ref, u in zip(subject_ref, x)]
-        #     if t.dim() != 1 and t.size(1) < seq_len:
-        #         pad_size = seq_len - t.size(1)
-        #         last_elements = t[:, -1].unsqueeze(1)
-        #         padding = last_elements.repeat(1, pad_size)
-        #         t = torch.cat([t, padding], dim=1)
+            #     last_elements = t[:, -1].unsqueeze(1)
+            #     padding = last_elements.repeat(1, pad_size)
+            #     t = torch.cat([t, padding], dim=1)
         
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         if self.sp_world_size > 1:
@@ -1480,6 +1733,7 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                 for u in context
             ]))
 
+        # Wan2_2RefTransformer3DModel doesn't have img_emb
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
@@ -1538,12 +1792,13 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                             x,
                             e0,
                             seq_lens,
-                            grid_sizes,
+                            original_grid_sizes,
                             self.freqs,
                             context,
                             context_lens,
                             dtype,
                             t,
+                            ref_grid_sizes,
                             **ckpt_kwargs,
                         )
                     else:
@@ -1551,12 +1806,13 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                         kwargs = dict(
                             e=e0,
                             seq_lens=seq_lens,
-                            grid_sizes=grid_sizes,
+                            grid_sizes=original_grid_sizes,
                             freqs=self.freqs,
                             context=context,
                             context_lens=context_lens,
                             dtype=dtype,
-                            t=t  
+                            t=t,
+                            ref_grid_sizes=ref_grid_sizes
                         )
                         x = block(x, **kwargs)
                     
@@ -1579,12 +1835,13 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                         x,
                         e0,
                         seq_lens,
-                        grid_sizes,
+                        original_grid_sizes,
                         self.freqs,
                         context,
                         context_lens,
                         dtype,
                         t,
+                        ref_grid_sizes,
                         **ckpt_kwargs,
                     )
                 else:
@@ -1592,12 +1849,13 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                     kwargs = dict(
                         e=e0,
                         seq_lens=seq_lens,
-                        grid_sizes=grid_sizes,
+                        grid_sizes=original_grid_sizes,
                         freqs=self.freqs,
                         context=context,
                         context_lens=context_lens,
                         dtype=dtype,
-                        t=t  
+                        t=t,
+                        ref_grid_sizes=ref_grid_sizes
                     )
                     x = block(x, **kwargs)
 
@@ -1619,13 +1877,15 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
         # Remove ref tokens from output
         if full_ref is not None:
             full_ref_length = full_ref.size(1)
-            x = x[:, :-full_ref_length]  # Remove from end since full_ref is now concatenated at the end
-            grid_sizes = torch.stack([torch.tensor([u[0] - ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+            x = x[:, full_ref_length:]  # Remove from beginning since full_ref is concatenated at the beginning
+            # Use original_grid_sizes for unpatchify
+            grid_sizes = original_grid_sizes
 
-        # if subject_ref is not None:
-        #     subject_ref_length = subject_ref.size(1)
-        #     x = x[:, :-subject_ref_length]
-        #     grid_sizes = torch.stack([torch.tensor([u[0] - subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+        if subject_ref is not None:
+            assert False, "multiref2 do not support subject_ref"
+            # subject_ref_length = subject_ref.size(1)
+            # x = x[:, :-subject_ref_length]
+            # grid_sizes = torch.stack([torch.tensor([u[0] - subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)

@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=img5b-8gpu
+#SBATCH --job-name=img5b-4gpu
 #SBATCH --nodes=1                  
-#SBATCH --ntasks-per-node=1         
-#SBATCH --gpus-per-node=8           
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=4
 #SBATCH --time=48:00:00
 #SBATCH --partition=preempt
 #SBATCH --account=liuyuan
@@ -28,7 +28,7 @@ CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/0922_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-noisy_afterconcat_selfattn"
+OUTPUT_DIR="ckpts/0925_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-t0_beforeconcat_selfattn_neg-rope"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="On a sunlit porch, the Pine-Sol Multi-Surface Cleaner sits atop an outdoor table surrounded by lush greenery. The camera angle is a close-up, focusing on the detailed textures and bright label of the bottle. The morning light is clean and crisp, highlighting the dew on nearby leaves. In the background, hints of a garden with colorful flowers can be seen, complemented by the soft chirping of birds, suggesting a tranquil, nature-infused environment."
@@ -83,7 +83,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --trainable_modules "self_attn" \
   --report_model_info \
   --report_to="wandb" \
-  --tracker_project_name="multiref-img-8gpu" \
+  --tracker_project_name="multiref-img" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
   # --low_vram \

@@ -22,16 +22,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 LEARNING_RATE=2e-05
 BATCH_SIZE=1
-MAX_TRAIN_STEPS=6000
+MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_overfit_${MAX_TRAIN_STEPS}steps_lr${LEARNING_RATE}_ref-t0_afterconcat"
+OUTPUT_DIR="ckpts/0925_${MODEL_SUFFIX}_overfit_${MAX_TRAIN_STEPS}steps_lr${LEARNING_RATE}_ref-t0_beforeconcat_rope"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
-VALIDATION_REF_PATH="datasets/synworld10/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
+VALIDATION_REF_PATH="$DATASET_NAME/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
 VALIDATION_SIZE="480 832 121"  # height width frames
 
 
@@ -58,7 +58,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --dataloader_num_workers=8 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
-  --checkpoints_total_limit=5 \
+  --checkpoints_total_limit=3 \
   --validation_steps=$VALIDATION_STEPS \
   --validation_prompts "$VALIDATION_PROMPTS" \
   --validation_ref_path $VALIDATION_REF_PATH \
