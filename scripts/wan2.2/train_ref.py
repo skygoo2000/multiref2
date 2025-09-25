@@ -209,7 +209,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                 save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
 
                 if args.report_to == "wandb":
-                    wandb.log({"validation/ref": wandb.Image(validation_ref.cpu())})
+                    accelerator.log({"validation/ref": wandb.Image(validation_ref.cpu())}, step=global_step)
             else:
                 # Load as video
                 try:
@@ -238,9 +238,6 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
                     # save_videos_grid expects torch.Tensor input
                     save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
-
-                    if args.report_to == "wandb":
-                        log_dict["validation/ref"] = wandb.Video(validation_ref.cpu(), fps=24, format="gif")
                     
                 except Exception as e:
                     logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")

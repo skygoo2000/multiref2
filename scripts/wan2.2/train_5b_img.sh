@@ -1,20 +1,20 @@
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.2-TI2V-5B"
 export DATASET_NAME="datasets/synworldimg53k/"
-export DATASET_META_NAME="$DATASET_NAME/train24.json"
+export DATASET_META_NAME="$DATASET_NAME/train.json"
 # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
 # export NCCL_IB_DISABLE=1
 # export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
-# export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=2,3
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=2
+BATCH_SIZE=1
 MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/0918_${MODEL_SUFFIX}_img24_lr${LEARNING_RATE}_ref-noisy_afterconcat_selfattn"
+OUTPUT_DIR="ckpts/0925_4090_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-t0_beforeconcat_selfattn_neg-rope"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="On a sunlit porch, the Pine-Sol Multi-Surface Cleaner sits atop an outdoor table surrounded by lush greenery. The camera angle is a close-up, focusing on the detailed textures and bright label of the bottle. The morning light is clean and crisp, highlighting the dew on nearby leaves. In the background, hints of a garden with colorful flowers can be seen, complemented by the soft chirping of birds, suggesting a tranquil, nature-infused environment."
@@ -69,6 +69,6 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --tracker_project_name="multiref-img" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
-  # --low_vram \
+  --low_vram \
   # --gradient_accumulation_steps=2 \
   # --enable_profiler
