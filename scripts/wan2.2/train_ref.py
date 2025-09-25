@@ -82,6 +82,9 @@ from videox_fun.pipeline import Wan2_2MultiRefPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
 if is_wandb_available():
     import wandb
 
@@ -328,11 +331,10 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                         sample_with_ref = sample_resized[:, :, :, start_h:end_h, start_w:end_w]
                     
                     comparison_video = torch.cat([validation_ref, sample_with_ref], dim=0)  # [2, C, F, H, W]
-                    caption = f"{args.validation_prompts[i].split('.')[0]}..."
                     if comparison_video.shape[2] == 1:
-                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.gif"), fps=1, caption=caption)
+                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.gif"), fps=1)
                     else:
-                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=24, caption=caption)
+                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=24)
 
                     if i == 0: # Log only the first prompt's result
                         log_dict = {}
@@ -340,9 +342,10 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                         # Prepare comparison for logging
                         log_comparison = comparison_video.clone().detach().clamp(0, 1) * 255
                         log_comparison = log_comparison.permute(0, 2, 1, 3, 4).to(torch.uint8)  # [2, F, C, H, W]
+                        caption = f"{args.validation_prompts[i].split('.')[0]}..."
 
                         if args.report_to == "wandb":
-                            log_dict["validation/comparison"] = wandb.Video(log_comparison.cpu(), fps=24, format="gif")
+                            log_dict["validation/comparison"] = wandb.Video(log_comparison.cpu(), fps=24, format="gif", caption=caption)
                         else: # Tensorboard
                             log_dict["validation/comparison"] = log_comparison
                         
