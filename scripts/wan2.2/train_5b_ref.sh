@@ -8,18 +8,18 @@ export NCCL_DEBUG=WARN
 # export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=1
+BATCH_SIZE=3
 MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/$(date +%m%d)_${MODEL_SUFFIX}_overfit_${MAX_TRAIN_STEPS}steps_lr${LEARNING_RATE}_ref-noisy_afterconcat_selfattn"
+OUTPUT_DIR="ckpts/0925_${MODEL_SUFFIX}_overfit_lr${LEARNING_RATE}_ref-t0_beforeconcat_neg-rope_360p"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
 VALIDATION_REF_PATH="$DATASET_NAME/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
-VALIDATION_SIZE="480 832 121"  # height width frames
+VALIDATION_SIZE="360 640 49"  # height width frames
 
 ## fsdp stage3
 # accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "FULL_SHARD" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False scripts/wan2.2/train_ref.py \
@@ -32,17 +32,16 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
   --train_data_meta=$DATASET_META_NAME \
-  --image_sample_size=1024 \
-  --video_sample_size=256 \
-  --token_sample_size=512 \
-  --video_sample_stride=2 \
-  --video_sample_n_frames=121 \
+  --image_sample_size=512 \
+  --video_sample_size=360 \
+  --video_sample_stride=1 \
+  --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=1 \
   --dataloader_num_workers=8 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
-  --checkpoints_total_limit=10 \
+  --checkpoints_total_limit=3 \
   --validation_steps=$VALIDATION_STEPS \
   --validation_prompts "$VALIDATION_PROMPTS" \
   --validation_ref_path $VALIDATION_REF_PATH \
@@ -57,18 +56,16 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --adam_epsilon=1e-10 \
   --vae_mini_batch=1 \
   --max_grad_norm=0.05 \
-  --random_hw_adapt \
-  --training_with_video_token_length \
   --enable_bucket \
   --uniform_sampling \
   --boundary_type="full" \
   --train_mode="ti2v" \
   --trainable_modules "self_attn" \
   --report_model_info \
-  --report_to="wandb" \
-  --tracker_project_name="multiref-ti2v-5b" \
+  --report_to="tensorboard" \
+  --tracker_project_name="multiref-5b-360p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
-  --low_vram \
-  # --gradient_accumulation_steps=2 \
+  # --low_vram \
+  # --gradient_accumulation_steps=4 \
   # --enable_profiler

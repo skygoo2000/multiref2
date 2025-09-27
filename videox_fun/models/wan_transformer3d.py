@@ -1567,6 +1567,9 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
             add_ref_conv=add_ref_conv,
             in_dim_ref_conv=in_dim_ref_conv,
         )
+
+        if hasattr(self, "img_emb"):
+            del self.img_emb
         
         # Replace blocks with ref-aware versions
         cross_attn_type = "cross_attn"
@@ -1732,11 +1735,6 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
-
-        # Wan2_2RefTransformer3DModel doesn't have img_emb
-        if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
-            context = torch.concat([context_clip, context], dim=1)
 
         # Context Parallel
         if self.sp_world_size > 1:

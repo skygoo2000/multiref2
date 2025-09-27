@@ -32,11 +32,10 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
   --train_data_meta=$DATASET_META_NAME \
-  --image_sample_size=1024 \
-  --video_sample_size=256 \
-  --token_sample_size=512 \
-  --video_sample_stride=2 \
-  --video_sample_n_frames=121 \
+  --image_sample_size=512 \
+  --video_sample_size=360 \
+  --video_sample_stride=1 \
+  --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=1 \
   --dataloader_num_workers=8 \
@@ -57,8 +56,6 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --adam_epsilon=1e-10 \
   --vae_mini_batch=1 \
   --max_grad_norm=0.05 \
-  --random_hw_adapt \
-  --training_with_video_token_length \
   --enable_bucket \
   --uniform_sampling \
   --boundary_type="full" \
