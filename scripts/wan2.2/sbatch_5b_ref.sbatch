@@ -53,7 +53,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --video_sample_stride=1 \
   --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
-  --video_repeat=1 \
+  --video_repeat=0 \
   --dataloader_num_workers=8 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \

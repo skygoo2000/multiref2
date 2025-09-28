@@ -2059,6 +2059,8 @@ def main():
                         else:
                             timesteps = mask.new_ones(mask_bs, seq_len) * timesteps[:, None,]
 
+                    # import ipdb; ipdb.set_trace()
+
                     # Predict the noise residual
                     if args.train_mode != "normal" and args.train_mode != "ti2v":
                         # For inpainting modes, use inpaint_latents as y
@@ -2196,74 +2198,70 @@ def main():
     
                         if accelerator.is_main_process:
                             logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")
-                            try:
 
-                                # test vae encode and decode
-                                if global_step <= 1:
-                                    vae_decoder = vae.eval()
-                                    # Ensure VAE is on the same device as latents for decoding
-                                    if args.low_vram:
-                                        vae_decoder.to(accelerator.device)
-                                    gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
-                                    full_ref_decoded = vae_decoder.decode(full_ref.to(vae_decoder.dtype)).sample
-                                    # Move VAE back to CPU if low_vram mode is enabled
-                                    if args.low_vram:
-                                        vae_decoder.to('cpu')
-                                        torch.cuda.empty_cache()
-                                    gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
-                                    gt = (pixel_values / 2 + 0.5).clamp(0, 1).cpu().float() 
-                                    full_ref_decoded = (full_ref_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
-                                    
-                                    # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
-                                    comparison = torch.cat([gt.permute(0,2,1,3,4).cpu().float(), gt_decoded, full_ref_decoded], dim=3) # down stack comparison in height [gt, gt_decoded, full_ref_decoded]
-                                    save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=24) # stack batch in width
-
-                                    # Prepare comparison for logging
-                                    log_vae_comparison = comparison.clone().detach().clamp(0, 1) * 255
-                                    log_vae_comparison = log_vae_comparison.permute(0, 2, 1, 3, 4).to(torch.uint8)  # [2, F, C, H, W]
-
-                                    log_dict = {}
-
-                                    if args.report_to == "wandb":
-                                        log_dict["validation/vae_decoded"] = wandb.Video(log_vae_comparison.cpu(), fps=24, format="gif")
-                                    else: # Tensorboard
-                                        log_dict["validation/vae_decoded"] = log_vae_comparison
-                                    
-                                    accelerator.log(log_dict, step=global_step)
-
-                                if args.use_ema:
-                                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                                    ema_transformer3d.store(transformer3d.parameters())
-                                    ema_transformer3d.copy_to(transformer3d.parameters())
+                            # test vae encode and decode
+                            if global_step <= 1:
+                                vae_decoder = vae.eval()
+                                # Ensure VAE is on the same device as latents for decoding
+                                if args.low_vram:
+                                    vae_decoder.to(accelerator.device)
+                                gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
+                                full_ref_decoded = vae_decoder.decode(full_ref.to(vae_decoder.dtype)).sample
+                                # Move VAE back to CPU if low_vram mode is enabled
+                                if args.low_vram:
+                                    vae_decoder.to('cpu')
+                                    torch.cuda.empty_cache()
+                                gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
+                                gt = (pixel_values / 2 + 0.5).clamp(0, 1).cpu().float().permute(0,2,1,3,4)
+                                full_ref_decoded = (full_ref_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
                                 
-                                log_validation(
-                                    vae,
-                                    text_encoder,
-                                    tokenizer,
-                                    transformer3d,
-                                    args,
-                                    config,
-                                    accelerator,
-                                    weight_dtype,
-                                    global_step,
-                                )
-                                transformer3d.train()
+                                if full_ref_decoded.shape[2] < gt.shape[2]:
+                                    last_frame = full_ref_decoded[:, :, -1:, :, :]
+                                    repeat_times = gt.shape[2] - full_ref_decoded.shape[2]
+                                    repeated_frames = last_frame.repeat(1, 1, repeat_times, 1, 1)
+                                    full_ref_decoded = torch.cat([full_ref_decoded, repeated_frames], dim=2)
+                                else:
+                                    full_ref_decoded = full_ref_decoded[:, :, :gt.shape[2], :, :]
+                                
+                                # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
+                                comparison = torch.cat([gt.cpu().float(), gt_decoded, full_ref_decoded], dim=3) # down stack comparison in height [gt, gt_decoded, full_ref_decoded]
+                                save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=24) # stack batch in width
 
-                                if args.use_ema:
-                                    # Switch back to the original transformer3d parameters.
-                                    ema_transformer3d.restore(transformer3d.parameters())
+                                # Prepare comparison for logging
+                                log_vae_comparison = comparison.clone().detach().clamp(0, 1) * 255
+                                log_vae_comparison = log_vae_comparison.permute(0, 2, 1, 3, 4).to(torch.uint8)  # [2, F, C, H, W]
+
+                                log_dict = {}
+
+                                if args.report_to == "wandb":
+                                    log_dict["validation/vae_decoded"] = wandb.Video(log_vae_comparison.cpu(), fps=24, format="gif")
+                                else: # Tensorboard
+                                    log_dict["validation/vae_decoded"] = log_vae_comparison
+                                
+                                accelerator.log(log_dict, step=global_step)
+
+                            if args.use_ema:
+                                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                                ema_transformer3d.store(transformer3d.parameters())
+                                ema_transformer3d.copy_to(transformer3d.parameters())
                             
-                            except Exception as e:
-                                logger.error(f"Validation failed: {e}")
-                                if args.use_ema:
-                                    # Make sure to restore EMA parameters even if validation fails
-                                    try:
-                                        ema_transformer3d.restore(transformer3d.parameters())
-                                    except:
-                                        logger.error("Failed to restore EMA parameters after validation failure")
-                                # Continue training despite validation failure
-                                logger.info("Continuing training despite validation failure")
+                            log_validation(
+                                vae,
+                                text_encoder,
+                                tokenizer,
+                                transformer3d,
+                                args,
+                                config,
+                                accelerator,
+                                weight_dtype,
+                                global_step,
+                            )
+                            transformer3d.train()
 
+                            if args.use_ema:
+                                # Switch back to the original transformer3d parameters.
+                                ema_transformer3d.restore(transformer3d.parameters())
+                        
                         logger.info(f"[Rank {accelerator.process_index}] Syncing after validation step...")
                         accelerator.wait_for_everyone()
 

@@ -1659,7 +1659,7 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]).to(device)
         
         # Store original grid sizes for main content (without ref)
-        original_grid_sizes = grid_sizes.clone()
+        x_grid_sizes = grid_sizes.clone()
 
         x = [u.flatten(2).transpose(1, 2) for u in x]
         
@@ -1669,7 +1669,7 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
             
             # Calculate ref_grid_sizes from full_ref shape
             ref_grid_sizes = torch.stack([
-                torch.tensor([ref_frames, original_grid_sizes[i][1], original_grid_sizes[i][2]], dtype=torch.long) 
+                torch.tensor([ref_frames, x_grid_sizes[i][1], x_grid_sizes[i][2]], dtype=torch.long) 
                 for i in range(len(x))
             ]).to(device=device, dtype=torch.long)
             
@@ -1790,7 +1790,7 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                             x,
                             e0,
                             seq_lens,
-                            original_grid_sizes,
+                            x_grid_sizes,
                             self.freqs,
                             context,
                             context_lens,
@@ -1804,7 +1804,7 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                         kwargs = dict(
                             e=e0,
                             seq_lens=seq_lens,
-                            grid_sizes=original_grid_sizes,
+                            grid_sizes=x_grid_sizes,
                             freqs=self.freqs,
                             context=context,
                             context_lens=context_lens,
@@ -1833,7 +1833,7 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                         x,
                         e0,
                         seq_lens,
-                        original_grid_sizes,
+                        x_grid_sizes,
                         self.freqs,
                         context,
                         context_lens,
@@ -1847,7 +1847,7 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                     kwargs = dict(
                         e=e0,
                         seq_lens=seq_lens,
-                        grid_sizes=original_grid_sizes,
+                        grid_sizes=x_grid_sizes,
                         freqs=self.freqs,
                         context=context,
                         context_lens=context_lens,
@@ -1876,8 +1876,8 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
         if full_ref is not None:
             full_ref_length = full_ref.size(1)
             x = x[:, full_ref_length:]  # Remove from beginning since full_ref is concatenated at the beginning
-            # Use original_grid_sizes for unpatchify
-            grid_sizes = original_grid_sizes
+            # Use x_grid_sizes for unpatchify
+            grid_sizes = x_grid_sizes
 
         if subject_ref is not None:
             assert False, "multiref2 do not support subject_ref"

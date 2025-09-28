@@ -28,7 +28,7 @@ CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/0925_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-t0_beforeconcat_selfattn_neg-rope"
+OUTPUT_DIR="ckpts/0928_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-t0_beforeconcat_selfattn_neg-rope"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="On a sunlit porch, the Pine-Sol Multi-Surface Cleaner sits atop an outdoor table surrounded by lush greenery. The camera angle is a close-up, focusing on the detailed textures and bright label of the bottle. The morning light is clean and crisp, highlighting the dew on nearby leaves. In the background, hints of a garden with colorful flowers can be seen, complemented by the soft chirping of birds, suggesting a tranquil, nature-infused environment."
@@ -54,7 +54,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --video_sample_stride=1 \
   --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
-  --video_repeat=1 \
+  --video_repeat=0 \
   --dataloader_num_workers=8 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \

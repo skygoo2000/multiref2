@@ -818,8 +818,8 @@ class ImageVideoRefDataset(Dataset):
         video_repeat=0,
         text_drop_ratio=0.1,
         enable_bucket=False,
-        video_length_drop_start=0.1, 
-        video_length_drop_end=0.9,
+        video_length_drop_start=0, 
+        video_length_drop_end=1.0,
         enable_inpaint=False,
         return_file_name=False,
     ):
