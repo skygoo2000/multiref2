@@ -321,7 +321,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                             sample_with_ref.view(-1, sample_with_ref.shape[1], sample_h, sample_w),
                             size=(new_h, new_w), mode='bilinear', align_corners=False
                         )
-                        sample_resized = sample_resized.view(sample_with_ref.shape[0], sample_with_ref.shape[1], ref_frames, new_h, new_w)
+                        sample_resized = sample_resized.view(sample_with_ref.shape[0], sample_with_ref.shape[1], sample_with_ref.shape[2], new_h, new_w)
                         
                         # Center crop to match ref size
                         start_h = max(0, (new_h - ref_h) // 2)
@@ -2205,15 +2205,18 @@ def main():
                                     if args.low_vram:
                                         vae_decoder.to(accelerator.device)
                                     gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
+                                    full_ref_decoded = vae_decoder.decode(full_ref.to(vae_decoder.dtype)).sample
                                     # Move VAE back to CPU if low_vram mode is enabled
                                     if args.low_vram:
                                         vae_decoder.to('cpu')
                                         torch.cuda.empty_cache()
                                     gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
                                     gt = (pixel_values / 2 + 0.5).clamp(0, 1).cpu().float() 
+                                    full_ref_decoded = (full_ref_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                    
                                     # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
-                                    comparison = torch.cat([gt.permute(0,2,1,3,4).cpu().float(), gt_decoded], dim=3)
-                                    save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=24)
+                                    comparison = torch.cat([gt.permute(0,2,1,3,4).cpu().float(), gt_decoded, full_ref_decoded], dim=3) # down stack comparison in height [gt, gt_decoded, full_ref_decoded]
+                                    save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=24) # stack batch in width
 
                                     # Prepare comparison for logging
                                     log_vae_comparison = comparison.clone().detach().clamp(0, 1) * 255

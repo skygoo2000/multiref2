@@ -117,6 +117,9 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 bash -lc '
       # --low_vram \
       # --gradient_accumulation_steps=2 \
       # --enable_profiler
+      # --random_hw_adapt \
+      # --video_token_length=49 \
+      # --training_with_video_token_length \
 '
 
 # sbatch scripts/wan2.2/sbatch_5b_nodes.sbatch

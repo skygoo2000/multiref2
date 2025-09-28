@@ -14,7 +14,7 @@ CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/0925_${MODEL_SUFFIX}_overfit_lr${LEARNING_RATE}_ref-t0_beforeconcat_neg-rope_360p"
+OUTPUT_DIR="ckpts/0928_${MODEL_SUFFIX}_overfit_lr${LEARNING_RATE}_ref-t0_beforeconcat_neg-rope_360p"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
@@ -62,10 +62,13 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --train_mode="ti2v" \
   --trainable_modules "self_attn" \
   --report_model_info \
-  --report_to="tensorboard" \
+  --report_to="wandb" \
   --tracker_project_name="multiref-5b-360p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
   # --low_vram \
   # --gradient_accumulation_steps=4 \
   # --enable_profiler
+  # --random_hw_adapt \
+  # --video_token_length=49 \
+  # --training_with_video_token_length \

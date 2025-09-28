@@ -27,7 +27,7 @@ CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/0925_${MODEL_SUFFIX}_overfit_lr${LEARNING_RATE}_ref-t0_beforeconcat_neg-rope_360p"
+OUTPUT_DIR="ckpts/0928_${MODEL_SUFFIX}_overfit_lr${LEARNING_RATE}_ref-t0_beforeconcat_neg-rope_360p"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
