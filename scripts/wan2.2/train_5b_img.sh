@@ -1,5 +1,5 @@
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.2-TI2V-5B"
-export DATASET_NAME="datasets/synworldimg53k/"
+export DATASET_NAME="datasets/synworldimg53k"
 export DATASET_META_NAME="$DATASET_NAME/train.json"
 # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
 # export NCCL_IB_DISABLE=1
@@ -9,7 +9,7 @@ export CUDA_VISIBLE_DEVICES=1,2,3
 
 LEARNING_RATE=2e-05
 BATCH_SIZE=2
-MAX_TRAIN_STEPS=10000
+MAX_TRAIN_STEPS=5000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
@@ -68,7 +68,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --gradient_checkpointing \
   --low_vram \
   # --gradient_accumulation_steps=2 \
-  # --enable_profiler
+  # --enable_profiler \
   # --random_hw_adapt \
   # --video_token_length=49 \
   # --training_with_video_token_length \

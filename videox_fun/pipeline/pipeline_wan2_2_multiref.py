@@ -286,7 +286,7 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
             )
 
         if do_classifier_free_guidance and negative_prompt_embeds is None:
-            negative_prompt = negative_prompt or ""
+            negative_prompt = negative_prompt or "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
 
             if prompt is not None and type(prompt) is not type(negative_prompt):
@@ -499,7 +499,8 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
         num_frames: int = 49,
         num_inference_steps: int = 50,
         timesteps: Optional[List[int]] = None,
-        guidance_scale: float = 6,
+        guide_scale_text: float = 5,
+        guide_scale_ref: float = 5,
         num_videos_per_prompt: int = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -514,7 +515,7 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
-        boundary: float = 0.875,
+        boundary: float = 0.95,
         comfyui_progressbar: bool = False,
         shift: int = 5,
     ) -> Union[WanPipelineOutput, Tuple]:
@@ -543,7 +544,6 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
             prompt_embeds,
             negative_prompt_embeds,
         )
-        self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
         self._interrupt = False
 
@@ -561,7 +561,7 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = guidance_scale > 1.0
+        do_classifier_free_guidance = guide_scale_text > 1.0 or guide_scale_ref > 1.0
 
         # 3. Encode input prompt
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
@@ -574,10 +574,6 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
             max_sequence_length=max_sequence_length,
             device=device,
         )
-        if do_classifier_free_guidance:
-            in_prompt_embeds = negative_prompt_embeds + prompt_embeds
-        else:
-            in_prompt_embeds = prompt_embeds
 
         # 4. Prepare timesteps
         if isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler):
@@ -624,6 +620,8 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
 
         # 6. Prepare reference latents
         ref_latents = None
+        ref_latents_neg = None
+
         if ref_video is not None:
             if len(ref_video.shape) == 4:  # Single image [B, C, H, W]
                 ref_video_length = 1
@@ -647,6 +645,8 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
                 generator,
                 do_classifier_free_guidance
             )
+            if do_classifier_free_guidance:
+                ref_latents_neg = torch.zeros_like(ref_latents, device=device, dtype=weight_dtype)
 
         # Prepare mask latent variables
         if init_video is not None:
@@ -711,35 +711,33 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
                 if self.interrupt:
                     continue
 
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = torch.cat([latents] * 3)if do_classifier_free_guidance else latents
+                in_prompt_embeds = negative_prompt_embeds + negative_prompt_embeds + prompt_embeds if do_classifier_free_guidance else prompt_embeds
+
                 if hasattr(self.scheduler, "scale_model_input"):
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # Prepare mask latent variables for inpainting
                 if init_video is not None:
-                    mask_input = torch.cat([mask_latents] * 2) if do_classifier_free_guidance else mask_latents
+                    mask_input = torch.cat([mask_latents] * 3) if do_classifier_free_guidance else mask_latents
                     masked_video_latents_input = (
-                        torch.cat([masked_video_latents] * 2) if do_classifier_free_guidance else masked_video_latents
+                        torch.cat([masked_video_latents] * 3) if do_classifier_free_guidance else masked_video_latents
                     )
                     y = torch.cat([mask_input, masked_video_latents_input], dim=1).to(device, weight_dtype) 
                 else:
                     y = None
 
                 # Prepare reference latents
+                full_ref = None
                 if ref_latents is not None:
-                    # Process ref_latents as full_ref
                     if ref_latents.size(2) == 1:
-                        # Single frame case: squeeze out the frame dimension
-                        full_ref = ref_latents.squeeze(2)  # [B, C, H, W]
+                        full_ref_single = ref_latents.squeeze(2)
                     else:
-                        # Multi-frame case: keep all frames
-                        full_ref = ref_latents  # [B, C, F, H, W]
+                        full_ref_single = ref_latents
                     
-                    full_ref = (
-                        torch.cat([full_ref] * 2) if do_classifier_free_guidance else full_ref
-                    ).to(device, weight_dtype)
-                else:
-                    full_ref = None
+                    zeros_ref = torch.zeros_like(full_ref_single)
+                    full_ref = torch.cat([zeros_ref, full_ref_single, full_ref_single])
+                    full_ref = full_ref.to(device, weight_dtype)
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 if self.vae.spatial_compression_ratio >= 16 and init_video is not None:
@@ -774,8 +772,12 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    noise_pred_neg, noise_pred_pos_i, noise_pred_pos_it = noise_pred.chunk(3)
+                    # noise_pred = noise_pred_neg +  guide_scale_ref * (noise_pred_pos_i - noise_pred_neg) + guide_scale_text * (noise_pred_pos_it - noise_pred_pos_i)
+                    if t >= boundary * self.scheduler.config.num_train_timesteps:
+                        noise_pred = noise_pred_neg + guide_scale_ref * (noise_pred_pos_i - noise_pred_neg) + guide_scale_text * (noise_pred_pos_it - noise_pred_pos_i)
+                    else:
+                        noise_pred = noise_pred_neg + guide_scale_ref * (noise_pred_pos_i - noise_pred_neg) + (guide_scale_text - 2.0) * (noise_pred_pos_it - noise_pred_pos_i)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]

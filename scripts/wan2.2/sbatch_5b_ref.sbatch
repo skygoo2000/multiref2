@@ -22,17 +22,17 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 LEARNING_RATE=2e-05
 BATCH_SIZE=3
-MAX_TRAIN_STEPS=10000
-CHECKPOINTING_STEPS=200
+MAX_TRAIN_STEPS=5000
+CHECKPOINTING_STEPS=500
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/0928_${MODEL_SUFFIX}_overfit_lr${LEARNING_RATE}_ref-t0_beforeconcat_neg-rope_360p"
+OUTPUT_DIR="ckpts/0928_${MODEL_SUFFIX}_overfit_lr${LEARNING_RATE}_ref-t0_beforeconcat_selfattn_neg-rope_256p_nodrop_cfg_black"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
 VALIDATION_REF_PATH="$DATASET_NAME/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
-VALIDATION_SIZE="360 640 49"  # height width frames
+VALIDATION_SIZE="256 448 49"  # height width frames
 
 
 source /project/liuyuan/zekai/miniconda3/etc/profile.d/conda.sh
@@ -49,7 +49,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --train_data_dir=$DATASET_NAME \
   --train_data_meta=$DATASET_META_NAME \
   --image_sample_size=512 \
-  --video_sample_size=360 \
+  --video_sample_size=256 \
   --video_sample_stride=1 \
   --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
@@ -79,12 +79,15 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --trainable_modules "self_attn" \
   --report_model_info \
   --report_to="wandb" \
-  --tracker_project_name="multiref-5b-360p" \
+  --tracker_project_name="multiref-5b-256p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
-  --gradient_checkpointing \
+  # --gradient_checkpointing \
   # --low_vram \
   # --gradient_accumulation_steps=4 \
   # --enable_profiler
+  # --random_hw_adapt \
+  # --video_token_length=49 \
+  # --training_with_video_token_length \
 
 
 # sbatch -o train_5b_360p.out scripts/wan2.2/sbatch_5b_ref.sbatch

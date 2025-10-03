@@ -10,7 +10,6 @@
 #SBATCH --partition=preempt
 #SBATCH --account=liuyuan
 
-# ===== 基础分布式参数 =====
 GPUS_PER_NODE=8
 export NUM_PROCESSES=$((SLURM_NNODES * GPUS_PER_NODE))
 
@@ -19,7 +18,7 @@ MASTER_PORT=$(shuf -i 20000-25000 -n 1)
 export MASTER_ADDR MASTER_PORT
 
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.2-TI2V-5B"
-export DATASET_NAME="datasets/synworldimg53k/"
+export DATASET_NAME="datasets/synworldimg53k"
 export DATASET_META_NAME="$DATASET_NAME/train.json"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -38,7 +37,7 @@ CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/0928_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-noisy_afterconcat_selfattn_16gpu"
+OUTPUT_DIR="ckpts/0928_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-t0_afterconcat_selfattn_16gpu"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="On a sunlit porch, the Pine-Sol Multi-Surface Cleaner sits atop an outdoor table surrounded by lush greenery. The camera angle is a close-up, focusing on the detailed textures and bright label of the bottle. The morning light is clean and crisp, highlighting the dew on nearby leaves. In the background, hints of a garden with colorful flowers can be seen, complemented by the soft chirping of birds, suggesting a tranquil, nature-infused environment."
@@ -81,7 +80,7 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 bash -lc '
       --train_data_dir=$DATASET_NAME \
       --train_data_meta=$DATASET_META_NAME \
       --image_sample_size=512 \
-      --video_sample_size=360 \
+      --video_sample_size=256 \
       --video_sample_stride=1 \
       --video_sample_n_frames=49 \
       --train_batch_size=$BATCH_SIZE \
@@ -116,7 +115,7 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 bash -lc '
       --gradient_checkpointing
       # --low_vram \
       # --gradient_accumulation_steps=2 \
-      # --enable_profiler
+      # --enable_profiler \
       # --random_hw_adapt \
       # --video_token_length=49 \
       # --training_with_video_token_length \

@@ -8,7 +8,7 @@
 #SBATCH --account=liuyuan
 
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.2-TI2V-5B"
-export DATASET_NAME="datasets/synworldimg53k/"
+export DATASET_NAME="datasets/synworldimg53k"
 export DATASET_META_NAME="$DATASET_NAME/train.json"
 
 export NCCL_DEBUG=WARN
@@ -23,12 +23,12 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 LEARNING_RATE=2e-05
 BATCH_SIZE=3
-MAX_TRAIN_STEPS=10000
+MAX_TRAIN_STEPS=20000
 CHECKPOINTING_STEPS=200
 RESUME_FROM_CHECKPOINT="latest"
 
 MODEL_SUFFIX=$(basename "$MODEL_NAME" | sed 's/.*-//')
-OUTPUT_DIR="ckpts/0928_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-t0_beforeconcat_selfattn_neg-rope"
+OUTPUT_DIR="ckpts/0925_${MODEL_SUFFIX}_img53k_lr${LEARNING_RATE}_ref-t0_beforeconcat_selfattn_neg-rope"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="On a sunlit porch, the Pine-Sol Multi-Surface Cleaner sits atop an outdoor table surrounded by lush greenery. The camera angle is a close-up, focusing on the detailed textures and bright label of the bottle. The morning light is clean and crisp, highlighting the dew on nearby leaves. In the background, hints of a garden with colorful flowers can be seen, complemented by the soft chirping of birds, suggesting a tranquil, nature-infused environment."
@@ -50,7 +50,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --train_data_dir=$DATASET_NAME \
   --train_data_meta=$DATASET_META_NAME \
   --image_sample_size=512 \
-  --video_sample_size=360 \
+  --video_sample_size=256 \
   --video_sample_stride=1 \
   --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
@@ -58,7 +58,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --dataloader_num_workers=8 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
-  --checkpoints_total_limit=5 \
+  --checkpoints_total_limit=3 \
   --validation_steps=$VALIDATION_STEPS \
   --validation_prompts "$VALIDATION_PROMPTS" \
   --validation_ref_path $VALIDATION_REF_PATH \
@@ -85,11 +85,11 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --gradient_checkpointing \
   # --low_vram \
   # --gradient_accumulation_steps=2 \
-  # --enable_profiler
+  # --enable_profiler \
   # --random_hw_adapt \
   # --video_token_length=49 \
   # --training_with_video_token_length \
   
 
 
-# sbatch --wait -o train_5b_img_8gpu.out scripts/wan2.2/sbatch_5b_img.sbatch
+# sbatch --wait -o train_5b_img_4gpu.out scripts/wan2.2/sbatch_5b_img.sbatch

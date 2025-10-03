@@ -332,7 +332,9 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     
                     comparison_video = torch.cat([validation_ref, sample_with_ref], dim=0)  # [2, C, F, H, W]
                     if comparison_video.shape[2] == 1:
-                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.gif"), fps=1)
+                        comparison_frame = comparison_video[0, :, 0, :, :].permute(1, 2, 0).clamp(0, 1) * 255
+                        comparison_frame = comparison_frame.cpu().numpy().astype('uint8')
+                        Image.fromarray(comparison_frame).save(os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.png"))
                     else:
                         save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=24)
 
@@ -1601,10 +1603,48 @@ def main():
         tracker_config.pop("trainable_modules_low_learning_rate")
         tracker_config.pop("fix_sample_size")
         tracker_config.pop("validation_size")
-        if args.report_to == "wandb":
-            accelerator.init_trackers(args.tracker_project_name, tracker_config, init_kwargs={"wandb": {"name": os.path.basename(args.output_dir.rstrip("/"))}})
-        else:
-            accelerator.init_trackers(args.tracker_project_name, tracker_config)
+
+        init_kwargs = {}
+        
+        if "wandb" in args.report_to.split(','):
+            wandb_kwargs = {}
+            run_name = os.path.basename(args.output_dir.rstrip("/"))
+            wandb_kwargs["name"] = run_name
+            
+            wandb_run_id_file = os.path.join(args.output_dir, "wandb_run_id.txt")
+
+            if args.resume_from_checkpoint:
+                if os.path.exists(wandb_run_id_file):
+                    with open(wandb_run_id_file, "r") as f:
+                        wandb_run_id = f.read().strip()
+                    if wandb_run_id:
+                        logger.info(f"Resuming W&B run with ID: {wandb_run_id}")
+                        wandb_kwargs["id"] = wandb_run_id
+                        wandb_kwargs["resume"] = "allow"
+                else:
+                    logger.warning(
+                        f"Trying to resume training, but no wandb run ID file found at {wandb_run_id_file}. "
+                        "A new W&B run will be created."
+                    )
+            
+            init_kwargs["wandb"] = wandb_kwargs
+
+        accelerator.init_trackers(
+            args.tracker_project_name, 
+            config=tracker_config, 
+            init_kwargs=init_kwargs
+        )
+        
+        if "wandb" in args.report_to.split(',') and "id" not in init_kwargs.get("wandb", {}):
+            try:
+                wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)
+                run_id_to_save = wandb_tracker.id
+                wandb_run_id_file = os.path.join(args.output_dir, "wandb_run_id.txt")
+                with open(wandb_run_id_file, "w") as f:
+                    f.write(run_id_to_save)
+                logger.info(f"Saved new W&B run ID to {wandb_run_id_file}: {run_id_to_save}")
+            except Exception as e:
+                logger.error(f"Could not get or save wandb run ID: {e}")
 
     # Function for unwrapping if model was compiled with `torch.compile`.
     def unwrap_model(model):
@@ -2060,6 +2100,16 @@ def main():
                             timesteps = mask.new_ones(mask_bs, seq_len) * timesteps[:, None,]
 
                     # import ipdb; ipdb.set_trace()
+
+                    # probability to drop full_ref
+                    if full_ref is not None:
+                        if rng is None:
+                            drop_ref = np.random.choice([0, 1], p=[0.9, 0.1])
+                        else:
+                            drop_ref = rng.choice([0, 1], p=[0.9, 0.1])
+                        
+                        if drop_ref:
+                            full_ref = torch.zeros_like(full_ref)
 
                     # Predict the noise residual
                     if args.train_mode != "normal" and args.train_mode != "ti2v":

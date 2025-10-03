@@ -1685,6 +1685,13 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                 # Use t=0 for full_ref tokens instead of last_elements, prepend to the beginning
                 zero_timesteps = t.new_zeros(t.size(0), pad_size)
                 t = torch.cat([zero_timesteps, t], dim=1)
+
+            # ### Use noisy t for full_ref tokens instead of last_elements ####
+            # if t.dim() != 1 and t.size(1) < seq_len:
+            #     pad_size = seq_len - t.size(1)
+            #     last_elements = t[:, -1]
+            #     padding = last_elements.unsqueeze(1).repeat(1, pad_size)
+            #     t = torch.cat([padding, t], dim=1)
         
         if subject_ref is not None:
             assert False, "multiref2 do not support subject_ref"
