@@ -98,7 +98,7 @@ save_path           = "samples/multiref"
 
 device = set_multi_gpus_devices(ulysses_degree, ring_degree)
 config = OmegaConf.load(config_path)
-boundary = 0.95
+boundary = 0.98
 
 # Load transformer (use Wan2_2RefTransformer3DModel instead of Wan2_2Transformer3DModel)
 transformer_load_path = custom_transformer_path if custom_transformer_path is not None else os.path.join(

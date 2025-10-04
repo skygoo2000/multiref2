@@ -1514,9 +1514,10 @@ class Wan2_2Transformer3DModel(WanTransformer3DModel):
 class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
     r"""
     Wan 2.2 diffusion backbone with multi-frame reference support.
-    Uses the same patch_embedding for both main input and reference, no additional weights.
+    Uses its own patch_embedding that accepts in_dim + 16 channels (16 extra channels for mask).
     """
     
+    @register_to_config
     def __init__(
         self,
         model_type='t2v',
@@ -1541,7 +1542,12 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
         downscale_factor_control_adapter=8,
         add_ref_conv=False,
         in_dim_ref_conv=16,
+        mask_channels=16,  # Number of mask channels to add
+        cross_attn_type=None,
     ):
+        # Store mask_channels before calling parent
+        self.mask_channels = mask_channels
+        
         # Call parent's __init__
         super().__init__(
             model_type=model_type,
@@ -1571,6 +1577,10 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
         if hasattr(self, "img_emb"):
             del self.img_emb
         
+        # Replace patch_embedding to accept in_dim + mask_channels
+        self.patch_embedding = nn.Conv3d(
+            in_dim + mask_channels, dim, kernel_size=patch_size, stride=patch_size)
+        
         # Replace blocks with ref-aware versions
         cross_attn_type = "cross_attn"
         self.blocks = nn.ModuleList([
@@ -1581,6 +1591,15 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
         for layer_idx, block in enumerate(self.blocks):
             block.self_attn.layer_idx = layer_idx
             block.self_attn.num_layers = self.num_layers
+        
+        # Initialize the new patch_embedding
+        self._init_patch_embedding()
+    
+    def _init_patch_embedding(self):
+        """Initialize patch_embedding with Xavier uniform initialization."""
+        nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
+        if self.patch_embedding.bias is not None:
+            nn.init.zeros_(self.patch_embedding.bias)
     
     @classmethod
     def from_pretrained(
@@ -1588,17 +1607,94 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
         low_cpu_mem_usage=False, torch_dtype=torch.bfloat16
     ):
         """
-        Override from_pretrained to ensure compatibility when loading from 
-        Wan2_2Transformer3DModel checkpoints.
+        Override from_pretrained to handle patch_embedding dimension mismatch.
+        If checkpoint has in_dim channels, we reinitialize patch_embedding.
+        If checkpoint has in_dim + mask_channels, we load it directly.
         """
-        # Call the parent's from_pretrained method, which will create the correct class instance
-        return super().from_pretrained(
-            pretrained_model_path=pretrained_model_path,
-            subfolder=subfolder,
-            transformer_additional_kwargs=transformer_additional_kwargs,
-            low_cpu_mem_usage=low_cpu_mem_usage,
-            torch_dtype=torch_dtype
-        )
+        if subfolder is not None:
+            pretrained_model_path = os.path.join(pretrained_model_path, subfolder)
+        print(f"loaded Wan2_2RefTransformer3DModel from {pretrained_model_path} ...")
+
+        config_file = os.path.join(pretrained_model_path, 'config.json')
+        if not os.path.isfile(config_file):
+            raise RuntimeError(f"{config_file} does not exist")
+        with open(config_file, "r") as f:
+            config = json.load(f)
+
+        from diffusers.utils import WEIGHTS_NAME
+        model_file = os.path.join(pretrained_model_path, WEIGHTS_NAME)
+        model_file_safetensors = model_file.replace(".bin", ".safetensors")
+
+        if "dict_mapping" in transformer_additional_kwargs.keys():
+            for key in transformer_additional_kwargs["dict_mapping"]:
+                transformer_additional_kwargs[transformer_additional_kwargs["dict_mapping"][key]] = config[key]
+
+        # Create model instance
+        model = cls.from_config(config, **transformer_additional_kwargs)
+        
+        # Load state dict
+        if os.path.exists(model_file):
+            state_dict = torch.load(model_file, map_location="cpu")
+        elif os.path.exists(model_file_safetensors):
+            from safetensors.torch import load_file
+            state_dict = load_file(model_file_safetensors)
+        else:
+            from safetensors.torch import load_file
+            model_files_safetensors = glob.glob(os.path.join(pretrained_model_path, "*.safetensors"))
+            state_dict = {}
+            print(model_files_safetensors)
+            for _model_file_safetensors in model_files_safetensors:
+                _state_dict = load_file(_model_file_safetensors)
+                for key in _state_dict:
+                    state_dict[key] = _state_dict[key]
+        
+        # Check patch_embedding dimensions
+        if 'patch_embedding.weight' in state_dict:
+            ckpt_patch_embed_shape = state_dict['patch_embedding.weight'].shape
+            model_patch_embed_shape = model.patch_embedding.weight.shape
+            
+            # ckpt_patch_embed_shape[1] is input channels
+            if ckpt_patch_embed_shape[1] != model_patch_embed_shape[1]:
+                print(f"Patch embedding input channels mismatch: checkpoint has {ckpt_patch_embed_shape[1]}, "
+                      f"model expects {model_patch_embed_shape[1]}.")
+                
+                # Initialize patch_embedding to zeros
+                new_patch_weight = torch.zeros(model_patch_embed_shape, dtype=state_dict['patch_embedding.weight'].dtype)
+                
+                # Load checkpoint weights to first 48 channels (or min of checkpoint and model channels)
+                num_channels_to_copy = min(ckpt_patch_embed_shape[1], 48)
+                new_patch_weight[:, :num_channels_to_copy, ...] = state_dict['patch_embedding.weight'][:, :num_channels_to_copy, ...]
+                
+                print(f"Loaded first {num_channels_to_copy} channels from checkpoint to patch_embedding, "
+                      f"remaining channels initialized to zeros.")
+                
+                # Update state_dict with the new patch_embedding weight
+                state_dict['patch_embedding.weight'] = new_patch_weight
+                
+                if 'patch_embedding.bias' in state_dict:
+                    pass
+            else:
+                pass
+        
+        # Filter state_dict to only include matching keys
+        tmp_state_dict = {} 
+        for key in state_dict:
+            if key in model.state_dict().keys() and model.state_dict()[key].size() == state_dict[key].size():
+                tmp_state_dict[key] = state_dict[key]
+            else:
+                print(f"{key}: Size don't match or not in model, skip")
+                
+        state_dict = tmp_state_dict
+
+        m, u = model.load_state_dict(state_dict, strict=False)
+        print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
+        print(f"Missing keys: {m}")
+        
+        params = [p.numel() if "." in n else 0 for n, p in model.named_parameters()]
+        print(f"### All Parameters: {sum(params) / 1e6} M")
+        
+        model = model.to(torch_dtype)
+        return model
     
     def forward(
         self,
@@ -1623,9 +1719,31 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                 - [B, C, F, H, W] for multi-frame reference
                 Uses the same patch_embedding as main input x.
         """
-        # Handle multi-frame full_ref using the same patch_embedding as x
+        # Handle multi-frame full_ref with mask channel
         ref_frames = 0
         ref_grid_sizes = None
+        
+        device = self.patch_embedding.weight.device if hasattr(self.patch_embedding, 'weight') else next(self.parameters()).device
+        dtype = x[0].dtype if isinstance(x, list) else x.dtype
+        if self.freqs.device != device and torch.device(type="meta") != device:
+            self.freqs = self.freqs.to(device)
+
+        if y is not None:
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+        # Process main input x: add mask channel of 0s
+        x_with_mask = []
+        for u in x:
+            # u shape: [C, F, H, W]
+            mask = torch.zeros(self.mask_channels, u.size(1), u.size(2), u.size(3), 
+                             device=u.device, dtype=u.dtype)
+            u_with_mask = torch.cat([u, mask], dim=0)  # [C+mask_channels, F, H, W]
+            x_with_mask.append(u_with_mask)
+        
+        # embeddings for main input
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x_with_mask]
+        
+        # Process full_ref if provided: add mask channel of 1s
         if full_ref is not None:
             if full_ref.dim() == 4:
                 # Single frame case: [B, C, H, W] -> [B, C, 1, H, W]
@@ -1635,20 +1753,15 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
                 # Multi-frame case: [B, C, F, H, W]
                 ref_frames = full_ref.size(2)
             
-            # Use the same patch_embedding as x (no additional weights)
+            # Add mask channel of 1s to full_ref
+            # full_ref shape: [B, C, F, H, W]
+            ref_mask = torch.ones(full_ref.size(0), self.mask_channels, full_ref.size(2), 
+                                 full_ref.size(3), full_ref.size(4), 
+                                 device=full_ref.device, dtype=full_ref.dtype)
+            full_ref = torch.cat([full_ref, ref_mask], dim=1)  # [B, C+mask_channels, F, H, W]
+            
+            # Apply patch_embedding to full_ref
             full_ref = self.patch_embedding(full_ref)
-        
-        # Call parent forward with preprocessing
-        device = self.patch_embedding.weight.device
-        dtype = x.dtype
-        if self.freqs.device != device and torch.device(type="meta") != device:
-            self.freqs = self.freqs.to(device)
-
-        if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
-
-        # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         # add control adapter
         if self.control_adapter is not None and y_camera is not None:
             y_camera = self.control_adapter(y_camera)
@@ -1900,3 +2013,5 @@ class Wan2_2RefTransformer3DModel(Wan2_2Transformer3DModel):
             if self.teacache.cnt == self.teacache.num_steps:
                 self.teacache.reset()
         return x
+
+

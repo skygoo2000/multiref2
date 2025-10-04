@@ -63,6 +63,7 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 bash -lc '
   export MASTER_PORT='"$MASTER_PORT"'
   export TOKENIZERS_PARALLELISM=false
   export OMP_NUM_THREADS=8
+  export PYTHONWARNINGS="ignore::FutureWarning"
 
   accelerate launch \
     --mixed_precision bf16 \
@@ -107,7 +108,7 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 bash -lc '
       --uniform_sampling \
       --boundary_type="full" \
       --train_mode="ti2v" \
-      --trainable_modules "self_attn" \
+      --trainable_modules 'self_attn' 'patch_embedding' \
       --report_model_info \
       --report_to="wandb" \
       --tracker_project_name="multiref-img-16gpu" \

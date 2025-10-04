@@ -12,6 +12,7 @@ export DATASET_NAME="datasets/synworldimg53k"
 export DATASET_META_NAME="$DATASET_NAME/train.json"
 
 export NCCL_DEBUG=WARN
+export PYTHONWARNINGS="ignore::FutureWarning"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
@@ -77,7 +78,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --uniform_sampling \
   --boundary_type="full" \
   --train_mode="ti2v" \
-  --trainable_modules "self_attn" \
+  --trainable_modules 'self_attn' 'patch_embedding' \
   --report_model_info \
   --report_to="wandb" \
   --tracker_project_name="multiref-img" \

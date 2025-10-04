@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
     parser.add_argument("--guide_scale_text", type=float, default=5.0, help="Text guidance scale")
     parser.add_argument("--guide_scale_ref", type=float, default=5.0, help="Image guidance scale")
-    parser.add_argument("--boundary", type=float, default=0.95, help="Boundary for transformer switching")
+    parser.add_argument("--boundary", type=float, default=0.98, help="Boundary for transformer switching")
     parser.add_argument("--shift", type=int, default=5, help="Shift parameter for scheduler")
     parser.add_argument("--seed", type=int, default=43, help="Random seed")
     

@@ -5,6 +5,7 @@ export DATASET_META_NAME="$DATASET_NAME/train.json"
 # export NCCL_IB_DISABLE=1
 # export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
+export PYTHONWARNINGS="ignore::FutureWarning"
 export CUDA_VISIBLE_DEVICES=1,2,3
 
 LEARNING_RATE=2e-05
@@ -60,7 +61,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --uniform_sampling \
   --boundary_type="full" \
   --train_mode="ti2v" \
-  --trainable_modules "self_attn" \
+  --trainable_modules 'self_attn' 'patch_embedding'\
   --report_model_info \
   --report_to="wandb" \
   --tracker_project_name="multiref-img" \
