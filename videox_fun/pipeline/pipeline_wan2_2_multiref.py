@@ -20,7 +20,8 @@ from PIL import Image
 from transformers import T5Tokenizer
 
 from ..models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
-                      WanT5EncoderModel, Wan2_2RefTransformer3DModel)
+                      WanT5EncoderModel)
+from ..models.wan_transformer3d_ref import Wan2_2RefTransformer3DModel
 from ..utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                 get_sampling_sigmas)
 from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler

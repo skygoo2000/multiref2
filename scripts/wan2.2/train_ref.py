@@ -76,8 +76,8 @@ from videox_fun.data.bucket_sampler import (ASPECT_RATIO_512,
 from videox_fun.data.dataset_image_video import (ImageVideoRefDataset,
                                                 ImageVideoSampler,
                                                 get_random_mask)
-from videox_fun.models import (AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel,
-                              Wan2_2RefTransformer3DModel)
+from videox_fun.models import (AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel)
+from videox_fun.models.wan_transformer3d_ref import Wan2_2RefTransformer3DModel
 from videox_fun.pipeline import Wan2_2MultiRefPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
