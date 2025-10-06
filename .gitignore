@@ -1,6 +1,6 @@
 # Byte-compiled / optimized / DLL files
-ckpts*
-models*
+/ckpts*
+/models*
 output*
 logs*
 taming*
