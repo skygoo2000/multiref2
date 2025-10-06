@@ -1,6 +1,8 @@
 import os
 import sys
+import json
 
+from safetensors.torch import load_file
 import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
@@ -40,7 +42,7 @@ from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 # 
 # sequential_cpu_offload means that each layer of the model will be moved to the CPU after use, 
 # resulting in slower speeds but saving a large amount of GPU memory.
-GPU_memory_mode     = "sequential_cpu_offload"
+GPU_memory_mode     = "model_full_load"
 # Multi GPUs config
 # Please ensure that the product of ulysses_degree and ring_degree equals the number of GPUs used. 
 # For example, if you are using 8 GPUs, you can set ulysses_degree = 2 and ring_degree = 4.
@@ -55,7 +57,7 @@ fsdp_text_encoder   = True
 compile_dit         = False
 
 # Support TeaCache.
-enable_teacache     = True
+enable_teacache     = False
 # Recommended to be set between 0.05 and 0.30. A larger threshold can cache more steps, speeding up the inference process, 
 # but it may cause slight differences between the generated content and the original content.
 # # --------------------------------------------------------------------------------------------------- #
@@ -82,7 +84,7 @@ riflex_k            = 6
 # Config and model path
 config_path         = "config/wan2.1/wan_civitai.yaml"
 # model path
-model_name          = "models/Diffusion_Transformer/Wan2.1-T2V-1.3B"
+model_name          = "models/Diffusion_Transformer/Wan2.1-T2V-14B"
 
 # Choose the sampler in "Flow", "Flow_Unipc", "Flow_DPM++"
 sampler_name        = "Flow_Unipc"
@@ -93,7 +95,7 @@ sampler_name        = "Flow_Unipc"
 shift               = 3 
 
 # Load pretrained model if need
-transformer_path    = "models/Personalized_Model/Phantom-Wan-1.3B.safetensors" 
+transformer_path    = "models/Personalized_Model/phantom-14B" 
 vae_path            = None
 lora_path           = None
 
@@ -120,7 +122,7 @@ guidance_scale          = 6.0
 seed                    = 43
 num_inference_steps     = 50
 lora_weight             = 0.55
-save_path               = "samples/wan-videos-phantom"
+save_path               = "samples/phantom1.3b"
 
 device = set_multi_gpus_devices(ulysses_degree, ring_degree)
 config = OmegaConf.load(config_path)
@@ -136,6 +138,24 @@ if transformer_path is not None:
     print(f"From checkpoint: {transformer_path}")
     if transformer_path.endswith("safetensors"):
         from safetensors.torch import load_file, safe_open
+    
+    if os.path.isdir(transformer_path):
+        index_file = os.path.join(transformer_path, "Phantom_Wan_14B.safetensors.index.json")
+        if os.path.exists(index_file):
+            with open(index_file, 'r') as f:
+                index = json.load(f)
+            state_dict = {}
+            weight_map = index["weight_map"]
+            shard_files = set(weight_map.values())
+            for shard_file in shard_files:
+                shard_path = os.path.join(transformer_path, shard_file)
+                shard_state_dict = load_file(shard_path)
+                state_dict.update(shard_state_dict)
+        else:
+            raise FileNotFoundError(f"Index file not found: {index_file}")
+    
+    elif transformer_path.endswith("safetensors"):
+        from safetensors.torch import load_file
         state_dict = load_file(transformer_path)
     else:
         state_dict = torch.load(transformer_path, map_location="cpu")

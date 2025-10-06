@@ -590,26 +590,16 @@ class WanFunPhantomPipeline(DiffusionPipeline):
             pbar.update(1)
 
         if subject_ref_images is not None:
-            video_length = subject_ref_images.shape[2]
-            subject_ref_images = self.image_processor.preprocess(rearrange(subject_ref_images, "b c f h w -> (b f) c h w"), height=height, width=width) 
-            subject_ref_images = subject_ref_images.to(dtype=torch.float32)
-            subject_ref_images = rearrange(subject_ref_images, "(b f) c h w -> b c f h w", f=video_length)
-
-            subject_ref_images_latentes = torch.cat(
-                [
-                    self.prepare_control_latents(
-                        None,
-                        subject_ref_images[:, :, i:i+1],
-                        batch_size,
-                        height,
-                        width,
-                        weight_dtype,
-                        device,
-                        generator,
-                        do_classifier_free_guidance
-                    )[1] for i in range(video_length)
-                ], dim = 2
-            )
+            # Encode subject_ref_images with VAE
+            # subject_ref_images: [B, C, F, H, W] or [B, C, H, W]
+            with torch.no_grad():
+                # Batch encode with VAE
+                if subject_ref_images.dim() == 4:
+                    # Single frame case: [B, C, H, W] - add frame dimension
+                    subject_ref_images_latentes = self.vae.encode(subject_ref_images.unsqueeze(2).to(device=device, dtype=weight_dtype))[0].sample()
+                else:
+                    # Multi-frame case: [B, C, F, H, W]
+                    subject_ref_images_latentes = self.vae.encode(subject_ref_images.to(device=device, dtype=weight_dtype))[0].sample()
 
         if comfyui_progressbar:
             pbar.update(1)
@@ -634,11 +624,12 @@ class WanFunPhantomPipeline(DiffusionPipeline):
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 if subject_ref_images is not None:
-                    subject_ref = (
-                        torch.cat(
-                            [torch.zeros_like(subject_ref_images_latentes), subject_ref_images_latentes]
-                        ) if do_classifier_free_guidance else subject_ref_images_latentes
-                    ).to(device, weight_dtype)
+                    subject_ref = subject_ref_images_latentes
+                    
+                    if do_classifier_free_guidance:
+                        subject_ref = torch.cat([torch.zeros_like(subject_ref), subject_ref])
+                    
+                    subject_ref = subject_ref.to(device, weight_dtype)
                 else:
                     subject_ref = None
     
@@ -646,7 +637,7 @@ class WanFunPhantomPipeline(DiffusionPipeline):
                 timestep = t.expand(latent_model_input.shape[0])
                 
                 # predict noise model_output
-                with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=device):
+                with torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=device):
                     noise_pred = self.transformer(
                         x=latent_model_input,
                         context=in_prompt_embeds,
