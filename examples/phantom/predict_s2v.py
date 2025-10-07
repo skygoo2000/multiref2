@@ -26,6 +26,7 @@ from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8,
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
 from videox_fun.utils.utils import (filter_kwargs, get_image_latent,
                                     save_videos_grid)
+import cv2
 from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
 from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
@@ -84,7 +85,7 @@ riflex_k            = 6
 # Config and model path
 config_path         = "config/wan2.1/wan_civitai.yaml"
 # model path
-model_name          = "models/Diffusion_Transformer/Wan2.1-T2V-14B"
+model_name          = "models/Diffusion_Transformer/Wan2.1-T2V-1.3B"
 
 # Choose the sampler in "Flow", "Flow_Unipc", "Flow_DPM++"
 sampler_name        = "Flow_Unipc"
@@ -95,7 +96,7 @@ sampler_name        = "Flow_Unipc"
 shift               = 3 
 
 # Load pretrained model if need
-transformer_path    = "models/Personalized_Model/phantom-14B" 
+transformer_path    = "ckpts/1006_4090_phantom1B3_img53k_lr2e-05/checkpoint-5000/transformer/diffusion_pytorch_model.safetensors" 
 vae_path            = None
 lora_path           = None
 
@@ -124,6 +125,55 @@ num_inference_steps     = 50
 lora_weight             = 0.55
 save_path               = "samples/phantom1.3b"
 
+def get_video_frames_as_latent(video_path, sample_size, padding=False, max_frames=None):
+    """
+    Extract frames from a video file and convert to latent format.
+    
+    Args:
+        video_path: Path to video file
+        sample_size: [height, width] target size
+        padding: Whether to pad the frames
+        max_frames: Maximum number of frames to extract (None = all frames)
+    
+    Returns:
+        torch.Tensor: Video frames in format [1, C, F, H, W]
+    """
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    
+    frame_count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if max_frames is not None and frame_count >= max_frames:
+            break
+            
+        # Convert BGR to RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = Image.fromarray(frame)
+        
+        # Resize with padding if needed
+        if padding:
+            from videox_fun.utils.utils import padding_image
+            frame = padding_image(frame, sample_size[1], sample_size[0])
+        frame = frame.resize((sample_size[1], sample_size[0]))
+        
+        frames.append(frame)
+        frame_count += 1
+    
+    cap.release()
+    
+    if not frames:
+        raise ValueError(f"No frames extracted from video: {video_path}")
+    
+    # Convert to tensor format [1, C, F, H, W]
+    frames_array = np.stack([np.array(frame) for frame in frames], axis=0)  # [F, H, W, C]
+    frames_tensor = torch.from_numpy(frames_array).permute(3, 0, 1, 2).unsqueeze(0) / 255.0  # [1, C, F, H, W]
+    
+    return frames_tensor
+
 device = set_multi_gpus_devices(ulysses_degree, ring_degree)
 config = OmegaConf.load(config_path)
 
@@ -140,8 +190,10 @@ if transformer_path is not None:
         from safetensors.torch import load_file, safe_open
     
     if os.path.isdir(transformer_path):
-        index_file = os.path.join(transformer_path, "Phantom_Wan_14B.safetensors.index.json")
-        if os.path.exists(index_file):
+        index_files = [f for f in os.listdir(transformer_path) if f.endswith('.safetensors.index.json')]
+        
+        if index_files:
+            index_file = os.path.join(transformer_path, index_files[0])
             with open(index_file, 'r') as f:
                 index = json.load(f)
             state_dict = {}
@@ -152,7 +204,15 @@ if transformer_path is not None:
                 shard_state_dict = load_file(shard_path)
                 state_dict.update(shard_state_dict)
         else:
-            raise FileNotFoundError(f"Index file not found: {index_file}")
+            safetensors_files = [f for f in os.listdir(transformer_path) if f.endswith('.safetensors')]
+            if not safetensors_files:
+                raise FileNotFoundError(f"No .safetensors files found in directory: {transformer_path}")
+            
+            state_dict = {}
+            for safetensors_file in safetensors_files:
+                safetensors_path = os.path.join(transformer_path, safetensors_file)
+                shard_state_dict = load_file(safetensors_path)
+                state_dict.update(shard_state_dict)
     
     elif transformer_path.endswith("safetensors"):
         from safetensors.torch import load_file
@@ -274,8 +334,23 @@ with torch.no_grad():
         pipeline.transformer.enable_riflex(k = riflex_k, L_test = latent_frames)
 
     if subject_ref_images is not None:
-        subject_ref_images = [get_image_latent(_subject_ref_image, sample_size=sample_size, padding=True) for _subject_ref_image in subject_ref_images]
-        subject_ref_images = torch.cat(subject_ref_images, dim=2)
+        # If subject_ref_images is a string (single video/image path), convert to list
+        if isinstance(subject_ref_images, str):
+            subject_ref_images = [subject_ref_images]
+        
+        processed_refs = []
+        for _subject_ref_image in subject_ref_images:
+            # Check if it's a video file
+            if _subject_ref_image.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
+                # Load video frames
+                frames = get_video_frames_as_latent(_subject_ref_image, sample_size=sample_size, padding=True)
+                processed_refs.append(frames)
+            else:
+                # Load single image
+                img = get_image_latent(_subject_ref_image, sample_size=sample_size, padding=True)
+                processed_refs.append(img)
+        
+        subject_ref_images = torch.cat(processed_refs, dim=2)
 
     sample = pipeline(
         prompt, 
