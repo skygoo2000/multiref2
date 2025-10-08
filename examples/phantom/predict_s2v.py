@@ -17,7 +17,7 @@ for project_root in project_roots:
 
 from videox_fun.dist import set_multi_gpus_devices, shard_model
 from videox_fun.models import (AutoencoderKLWan, AutoTokenizer,
-                               WanT5EncoderModel, WanTransformer3DModel)
+                               WanT5EncoderModel, Wan2_1RefTransformer3DModel)
 from videox_fun.models.cache_utils import get_teacache_coefficients
 from videox_fun.pipeline import WanFunPhantomPipeline
 from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8,
@@ -52,7 +52,7 @@ ulysses_degree      = 1
 ring_degree         = 1
 # Use FSDP to save more GPU memory in multi gpus.
 fsdp_dit            = False
-fsdp_text_encoder   = True
+fsdp_text_encoder   = False
 # Compile will give a speedup in fixed resolution and need a little GPU memory. 
 # The compile_dit is not compatible with the fsdp_dit and sequential_cpu_offload.
 compile_dit         = False
@@ -96,7 +96,7 @@ sampler_name        = "Flow_Unipc"
 shift               = 3 
 
 # Load pretrained model if need
-transformer_path    = "ckpts/1006_4090_phantom1B3_img53k_lr2e-05/checkpoint-5000/transformer/diffusion_pytorch_model.safetensors" 
+transformer_path    = "ckpts/1006_phantom1B3_mix_lr2e-05/checkpoint-5000/transformer/diffusion_pytorch_model.safetensors" 
 vae_path            = None
 lora_path           = None
 
@@ -177,10 +177,10 @@ def get_video_frames_as_latent(video_path, sample_size, padding=False, max_frame
 device = set_multi_gpus_devices(ulysses_degree, ring_degree)
 config = OmegaConf.load(config_path)
 
-transformer = WanTransformer3DModel.from_pretrained(
+transformer = Wan2_1RefTransformer3DModel.from_pretrained(
     os.path.join(model_name, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
     transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
-    low_cpu_mem_usage=True,
+    low_cpu_mem_usage=False,
     torch_dtype=weight_dtype,
 )
 
@@ -251,7 +251,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 text_encoder = WanT5EncoderModel.from_pretrained(
     os.path.join(model_name, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder')),
     additional_kwargs=OmegaConf.to_container(config['text_encoder_kwargs']),
-    low_cpu_mem_usage=True,
+    low_cpu_mem_usage=False,
     torch_dtype=weight_dtype,
 )
 text_encoder = text_encoder.eval()

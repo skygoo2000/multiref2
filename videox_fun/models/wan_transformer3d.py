@@ -164,8 +164,6 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).to(x.dtype)
 
 
-
-
 def rope_apply_qk(q, k, grid_sizes, freqs):
     q = rope_apply(q, grid_sizes, freqs)
     k = rope_apply(k, grid_sizes, freqs)
@@ -1119,8 +1117,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 import re
 
                 from diffusers import __version__ as diffusers_version
-                from diffusers.models.modeling_utils import \
-                    load_model_dict_into_meta
+                if diffusers_version >= "0.33.0":
+                    from diffusers.models.model_loading_utils import \
+                        load_model_dict_into_meta
+                else:
+                    from diffusers.models.modeling_utils import \
+                        load_model_dict_into_meta
                 from diffusers.utils import is_accelerate_available
                 if is_accelerate_available():
                     import accelerate

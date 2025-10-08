@@ -76,7 +76,7 @@ from videox_fun.data.bucket_sampler import (ASPECT_RATIO_512,
 from videox_fun.data.dataset_image_video import (ImageVideoRefDataset,
                                                 ImageVideoSampler,
                                                 get_random_mask)
-from videox_fun.models import (AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel, WanTransformer3DModel)
+from videox_fun.models import (AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel, Wan2_1RefTransformer3DModel)
 from videox_fun.pipeline import WanFunPhantomPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
@@ -1048,7 +1048,7 @@ def main():
     else:
         sub_path = config['transformer_additional_kwargs'].get('transformer_high_noise_model_subpath', 'transformer')
     
-    # Use WanTransformer3DModel for phantom training
+    # Use Wan2_1RefTransformer3DModel for phantom training
     transformer_additional_kwargs = OmegaConf.to_container(config['transformer_additional_kwargs'])
     
     # Check if transformer subdirectory exists (Wan2.2 style) or use main directory (Wan2.1 style)
@@ -1058,7 +1058,7 @@ def main():
         transformer_path = args.pretrained_model_name_or_path
         print(f"Transformer subdirectory not found, loading from main path: {transformer_path}")
     
-    transformer3d = WanTransformer3DModel.from_pretrained(
+    transformer3d = Wan2_1RefTransformer3DModel.from_pretrained(
         transformer_path,
         transformer_additional_kwargs=transformer_additional_kwargs,
     ).to(weight_dtype)
@@ -1122,12 +1122,12 @@ def main():
         if zero_stage == 3:
             raise NotImplementedError("FSDP does not support EMA.")
 
-        ema_transformer3d = WanTransformer3DModel.from_pretrained(
+        ema_transformer3d = Wan2_1RefTransformer3DModel.from_pretrained(
             os.path.join(args.pretrained_model_name_or_path, sub_path),
             transformer_additional_kwargs=transformer_additional_kwargs,
         ).to(weight_dtype)
 
-        ema_transformer3d = EMAModel(ema_transformer3d.parameters(), model_cls=WanTransformer3DModel, model_config=ema_transformer3d.config)
+        ema_transformer3d = EMAModel(ema_transformer3d.parameters(), model_cls=Wan2_1RefTransformer3DModel, model_config=ema_transformer3d.config)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -1184,12 +1184,12 @@ def main():
             def load_model_hook(models, input_dir):
                 if args.use_ema:
                     ema_path = os.path.join(input_dir, "transformer_ema")
-                    _, ema_kwargs = WanTransformer3DModel.load_config(ema_path, return_unused_kwargs=True)
-                    load_model = WanTransformer3DModel.from_pretrained(
+                    _, ema_kwargs = Wan2_1RefTransformer3DModel.load_config(ema_path, return_unused_kwargs=True)
+                    load_model = Wan2_1RefTransformer3DModel.from_pretrained(
                         input_dir, subfolder="transformer_ema",
                         transformer_additional_kwargs=transformer_additional_kwargs
                     )
-                    load_model = EMAModel(load_model.parameters(), model_cls=WanTransformer3DModel, model_config=load_model.config)
+                    load_model = EMAModel(load_model.parameters(), model_cls=Wan2_1RefTransformer3DModel, model_config=load_model.config)
                     load_model.load_state_dict(ema_kwargs)
 
                     ema_transformer3d.load_state_dict(load_model.state_dict())
@@ -1201,7 +1201,7 @@ def main():
                     model = models.pop()
 
                     # load diffusers style into model
-                    load_model = WanTransformer3DModel.from_pretrained(
+                    load_model = Wan2_1RefTransformer3DModel.from_pretrained(
                         input_dir, subfolder="transformer"
                     )
                     model.register_to_config(**load_model.config)

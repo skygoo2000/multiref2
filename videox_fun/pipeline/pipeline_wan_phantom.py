@@ -21,7 +21,7 @@ from PIL import Image
 from transformers import T5Tokenizer
 
 from ..models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
-                              WanT5EncoderModel, WanTransformer3DModel)
+                              WanT5EncoderModel, Wan2_1RefTransformer3DModel)
 from ..utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                 get_sampling_sigmas)
 from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
@@ -171,7 +171,7 @@ class WanFunPhantomPipeline(DiffusionPipeline):
         tokenizer: AutoTokenizer,
         text_encoder: WanT5EncoderModel,
         vae: AutoencoderKLWan,
-        transformer: WanTransformer3DModel,
+        transformer: Wan2_1RefTransformer3DModel,
         scheduler: FlowMatchEulerDiscreteScheduler,
     ):
         super().__init__()
