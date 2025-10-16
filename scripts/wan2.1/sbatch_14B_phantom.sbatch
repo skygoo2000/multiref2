@@ -6,7 +6,7 @@
 #SBATCH --partition=preempt
 #SBATCH --account=liuyuan
 
-export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-T2V-1.3B"
+export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-T2V-14B"
 export DATASET_NAME="datasets"
 export DATASET_META_NAME="$DATASET_NAME/train_vid.json"
 
@@ -22,15 +22,15 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export NCCL_IB_RETRY_CNT=10
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=6
+BATCH_SIZE=2
 MAX_TRAIN_STEPS=5000
 CHECKPOINTING_STEPS=500
-RESUME_FROM_CHECKPOINT="models/Personalized_Model/phantom-1.3B/Phantom-Wan-1.3B.pth"
+RESUME_FROM_CHECKPOINT="models/Personalized_Model/phantom-14B"
 
-OUTPUT_DIR="ckpts/1015_phantom1B3_vid15k_lr${LEARNING_RATE}_t0_gap1_selfattn"
+OUTPUT_DIR="ckpts/1015_phantom14B_vid15k_lr${LEARNING_RATE}_t0_gap1_selfattn_fromscratch"
 
 VALIDATION_STEPS=200
-VALIDATION_PROMPTS="this object is on the center of the table in a room"
+VALIDATION_PROMPTS="this object is on the table in the kitchen"
 VALIDATION_REF_PATH="asset/ref_1.png"
 VALIDATION_SIZE="256 448 49"  # height width frames
 
@@ -82,7 +82,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --trainable_modules 'self_attn' \
   --report_model_info \
   --report_to="wandb" \
-  --tracker_project_name="phantom_1B3-256p" \
+  --tracker_project_name="phantom_14B-256p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
   # --low_vram \

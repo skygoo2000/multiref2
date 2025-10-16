@@ -93,37 +93,37 @@ sampler_name        = "Flow_Unipc"
 # Used when the sampler is in "Flow_Unipc", "Flow_DPM++".
 # If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
 # If you want to generate a 720p video, it is recommended to set the shift value to 5.0.
-shift               = 3 
+shift               = 5 
 
 # Load pretrained model if need
-transformer_path    = "ckpts/1006_phantom1B3_mix_lr2e-05/checkpoint-5000/transformer/diffusion_pytorch_model.safetensors" 
+transformer_path    = "models/Personalized_Model/phantom-1.3B/Phantom-Wan-1.3B.pth" 
 vae_path            = None
 lora_path           = None
 
 # Other params
-sample_size         = [480, 832]
-video_length        = 81
+sample_size         = [256, 448]
+video_length        = 49
 fps                 = 16
 
 # Use torch.float16 if GPU does not support torch.bfloat16
 # ome graphics cards, such as v100, 2080ti, do not support torch.bfloat16
 weight_dtype            = torch.bfloat16
-subject_ref_images      = ["asset/ref_1.png", "asset/ref_2.png"]
+subject_ref_images      = "asset/ref_1.png"
 
 # 使用更长的neg prompt如"模糊，突变，变形，失真，画面暗，文本字幕，画面固定，连环画，漫画，线稿，没有主体。"，可以增加稳定性
 # 在neg prompt中添加"安静，固定"等词语可以增加动态性。
-prompt                  = "暖阳漫过草地，扎着双马尾、头戴绿色蝴蝶结、身穿浅绿色连衣裙的小女孩蹲在盛开的雏菊旁。她身旁一只棕白相间的狗狗吐着舌头，毛茸茸尾巴欢快摇晃。小女孩笑着举起黄红配色、带有蓝色按钮的玩具相机，将和狗狗的欢乐瞬间定格。"
+prompt                  = "this object is on the center of the table in a room"
 negative_prompt         = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
 # Using longer neg prompt such as "Blurring, mutation, deformation, distortion, dark and solid, comics, text subtitles, line art." can increase stability
 # Adding words such as "quiet, solid" to the neg prompt can increase dynamism.
 # prompt                  = "A young woman with beautiful, clear eyes and blonde hair stands in the forest, wearing a white dress and a crown. Her expression is serene, reminiscent of a movie star, with fair and youthful skin. Her brown long hair flows in the wind. The video quality is very high, with a clear view. High quality, masterpiece, best quality, high resolution, ultra-fine, fantastical."
 # negative_prompt         = "Twisted body, limb deformities, text captions, comic, static, ugly, error, messy code."
-guidance_scale          = 6.0
+guidance_scale          = 5
 seed                    = 43
 num_inference_steps     = 50
 lora_weight             = 0.55
-save_path               = "samples/phantom1.3b"
+save_path               = "samples/phantom1.3b/original/t0gap1"
 
 def get_video_frames_as_latent(video_path, sample_size, padding=False, max_frames=None):
     """

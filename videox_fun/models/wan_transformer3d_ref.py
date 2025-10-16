@@ -23,17 +23,17 @@ from .wan_transformer3d import (
 
 @amp.autocast('cuda',enabled=False)
 @torch.compiler.disable()
-def rope_apply_with_ref(x, grid_sizes, ref_grid_sizes, freqs, gap=10):
+def rope_apply_with_ref(x, grid_sizes, ref_grid_sizes, freqs, gap=1):
     """
     Apply RoPE to a tensor x which is a concatenation of a main part and a reference part.
-    The reference part is given positional offsets after the main part with a gap of 10 frames.
+    The reference part is given positional offsets after the main part with a gap of n frames.
 
     Args:
         x (Tensor): Input tensor, shape [B, L, num_heads, C / num_heads]. (main + ref)
         grid_sizes (Tensor): Shape [B, 3], grid sizes (F, H, W) for the main part.
         ref_grid_sizes (Tensor): Shape [B, 3], grid sizes (rF, rH, rW) for the reference part.
         freqs (Tensor): RoPE frequencies.
-        gap (int): Frame gap between main and ref positions (default: 10).
+        gap (int): Frame gap between main and ref positions.
     """
     n, c = x.size(2), x.size(3) // 2
 
@@ -374,8 +374,15 @@ class Wan2_1RefTransformer3DModel(WanTransformer3DModel):
             if t.dim() != 1 and t.size(1) < seq_len:
                 pad_size = seq_len - t.size(1)
                 # Use t=0 for subject_ref tokens, append to the end
-                zero_timesteps = t.new_zeros(t.size(0), pad_size)
-                t = torch.cat([t, zero_timesteps], dim=1)
+                padding_zero = t.new_zeros(t.size(0), pad_size)
+                t = torch.cat([t, padding_zero], dim=1)
+            
+            # ### Use noisy subject_ref tokens ####
+            # if t.dim() != 1 and t.size(1) < seq_len:
+            #     pad_size = seq_len - t.size(1)
+            #     last_elements = t[:, -1].unsqueeze(1)
+            #     padding = last_elements.repeat(1, pad_size)
+            #     t = torch.cat([t, padding], dim=1)
         
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         if self.sp_world_size > 1:
