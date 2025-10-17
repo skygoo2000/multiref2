@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=1B3-256p         
 #SBATCH --nodes=1
-#SBATCH --gpus=2
+#SBATCH --gpus=1
 #SBATCH --time=48:00:00          # total run time limit (HH:MM:SS)
 #SBATCH --partition=preempt
 #SBATCH --account=liuyuan
@@ -18,7 +18,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=6
+BATCH_SIZE=12
 MAX_TRAIN_STEPS=2000
 CHECKPOINTING_STEPS=500
 RESUME_FROM_CHECKPOINT="models/Personalized_Model/phantom-1.3B"
@@ -47,7 +47,7 @@ accelerate launch scripts/wan2.1/train_phantom.py \
   --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=0 \
-  --dataloader_num_workers=8 \
+  --dataloader_num_workers=16 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
   --checkpoints_total_limit=3 \
@@ -74,7 +74,7 @@ accelerate launch scripts/wan2.1/train_phantom.py \
   --report_to="wandb" \
   --tracker_project_name="phantom_1B3-256p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
-  --gradient_checkpointing \
+  # --gradient_checkpointing \
   # --low_vram \
   # --gradient_accumulation_steps=4 \
   # --enable_profiler \

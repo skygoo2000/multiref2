@@ -671,9 +671,6 @@ def parse_args():
         "--training_with_video_token_length", action="store_true", help="The training stage of the model in training.",
     )
     parser.add_argument(
-        "--auto_tile_batch_size", action="store_true", help="Whether to auto tile batch size.",
-    )
-    parser.add_argument(
         "--motion_sub_loss", action="store_true", help="Whether enable motion sub loss."
     )
     parser.add_argument(
@@ -1459,8 +1456,14 @@ def main():
                 new_examples["text"].append(example["text"])
                 
                 # Process ref_pixel_values
-                ref_pixel_values = torch.from_numpy(example["ref_pixel_values"]).permute(0, 3, 1, 2).contiguous()
-                ref_pixel_values = ref_pixel_values / 255.
+                ref_pixel_values = example["ref_pixel_values"]
+                if isinstance(ref_pixel_values, np.ndarray):
+                    ref_pixel_values = torch.from_numpy(ref_pixel_values).permute(0, 3, 1, 2).contiguous()
+                    ref_pixel_values = ref_pixel_values / 255.
+                elif isinstance(ref_pixel_values, torch.Tensor):
+                    if ref_pixel_values.dtype == torch.uint8:
+                        ref_pixel_values = ref_pixel_values.float() / 255.
+                
                 new_examples["ref_pixel_values"].append(transform(ref_pixel_values))
 
                 batch_video_length = int(min(batch_video_length, len(pixel_values)))
@@ -1673,18 +1676,28 @@ def main():
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
-        # Check if this is a phantom model directory (contains .pth file) or a training checkpoint (checkpoint-XXX)
-        if os.path.isdir(args.resume_from_checkpoint) and not args.resume_from_checkpoint.endswith("latest"):
-            # Check if it's a phantom model directory with .pth file
-            all_pth_files = [f for f in os.listdir(args.resume_from_checkpoint) if f.endswith('.pth')]
-            # Prioritize files with 'phantom' in the name, exclude VAE files
-            pth_files = [f for f in all_pth_files if 'phantom' in f.lower() and 'vae' not in f.lower()]
-            if not pth_files:
-                # Fallback to any .pth file that's not VAE
-                pth_files = [f for f in all_pth_files if 'vae' not in f.lower()]
-            if not pth_files:
-                # Last resort: use any .pth file
-                pth_files = all_pth_files
+        if not args.resume_from_checkpoint.endswith("latest"):
+            # Check if it's a file or directory
+            if os.path.isfile(args.resume_from_checkpoint):
+                # Direct file path provided
+                if args.resume_from_checkpoint.endswith('.pth'):
+                    pth_files = [os.path.basename(args.resume_from_checkpoint)]
+                    args.resume_from_checkpoint = os.path.dirname(args.resume_from_checkpoint)
+                elif args.resume_from_checkpoint.endswith('.safetensors'):
+                    pth_files = [os.path.basename(args.resume_from_checkpoint)]
+                    args.resume_from_checkpoint = os.path.dirname(args.resume_from_checkpoint)
+                else:
+                    raise ValueError(f"No phantom weights found in {args.resume_from_checkpoint}")
+            else:
+                # Directory path provided - search for .pth files
+                all_pth_files = [f for f in os.listdir(args.resume_from_checkpoint) if f.endswith('.pth')]
+                # Prioritize files with 'phantom' in the name, exclude VAE files
+                pth_files = [f for f in all_pth_files if 'phantom' in f.lower() and 'vae' not in f.lower()]
+                if not pth_files:
+                    # Fallback to any .pth file that's not VAE
+                    pth_files = [f for f in all_pth_files if 'vae' not in f.lower()]
+                if not pth_files:
+                    raise ValueError(f"No phantom weights found in {args.resume_from_checkpoint}")
             
             if pth_files:
                 # Load phantom transformer weights
@@ -1954,37 +1967,10 @@ def main():
                     
                     # Log memory after data loading
                     log_memory_usage("2_data_loaded", global_step)
-
-                    # Increase the batch size when the length of the latent sequence of the current sample is small
-                    if args.auto_tile_batch_size and args.training_with_video_token_length and zero_stage != 3:
-                        if args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 16 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                            pixel_values = torch.tile(pixel_values, (4, 1, 1, 1, 1))
-                            ref_pixel_values = torch.tile(ref_pixel_values, (4, 1, 1, 1, 1))
-                            if args.enable_text_encoder_in_dataloader:
-                                batch['encoder_hidden_states'] = torch.tile(batch['encoder_hidden_states'], (4, 1, 1))
-                                batch['encoder_attention_mask'] = torch.tile(batch['encoder_attention_mask'], (4, 1))
-                            else:
-                                batch['text'] = batch['text'] * 4
-                        elif args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 4 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                            pixel_values = torch.tile(pixel_values, (2, 1, 1, 1, 1))
-                            ref_pixel_values = torch.tile(ref_pixel_values, (2, 1, 1, 1, 1))
-                            if args.enable_text_encoder_in_dataloader:
-                                batch['encoder_hidden_states'] = torch.tile(batch['encoder_hidden_states'], (2, 1, 1))
-                                batch['encoder_attention_mask'] = torch.tile(batch['encoder_attention_mask'], (2, 1))
-                            else:
-                                batch['text'] = batch['text'] * 2
                     
                     if args.train_mode != "normal":
                         mask_pixel_values = batch["mask_pixel_values"].to(weight_dtype)
                         mask = batch["mask"].to(weight_dtype)
-                        # Increase the batch size when the length of the latent sequence of the current sample is small
-                        if args.auto_tile_batch_size and args.training_with_video_token_length and zero_stage != 3:
-                            if args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 16 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                                mask_pixel_values = torch.tile(mask_pixel_values, (4, 1, 1, 1, 1))
-                                mask = torch.tile(mask, (4, 1, 1, 1, 1))
-                            elif args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 4 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                                mask_pixel_values = torch.tile(mask_pixel_values, (2, 1, 1, 1, 1))
-                                mask = torch.tile(mask, (2, 1, 1, 1, 1))
 
                     if args.random_frame_crop:
                         def _create_special_list(length):
@@ -2073,6 +2059,22 @@ def main():
                                 new_pixel_values.append(pixel_values_bs)
                             return torch.cat(new_pixel_values, dim = 0)
                         
+                        def _batch_encode_vae_ref(ref_pixel_values):
+                            ref_pixel_values = rearrange(ref_pixel_values, "b f c h w -> b c f h w")
+                            bs = args.vae_mini_batch
+                            new_ref_latents = []
+                            for i in range(0, ref_pixel_values.shape[0], bs):
+                                ref_pixel_values_bs = ref_pixel_values[i : i + bs]
+                                ref_latents_list = []
+                                for frame_idx in range(ref_pixel_values_bs.shape[2]):
+                                    single_frame = ref_pixel_values_bs[:, :, frame_idx:frame_idx+1, :, :]
+                                    frame_latent = vae.encode(single_frame)[0]
+                                    frame_latent = frame_latent.sample()
+                                    ref_latents_list.append(frame_latent)
+                                ref_latents_bs = torch.cat(ref_latents_list, dim=2)
+                                new_ref_latents.append(ref_latents_bs)
+                            return torch.cat(new_ref_latents, dim = 0)
+                        
                         # Encode main latents
                         with conditional_record_function("vae_encode_main"):
                             if vae_stream_1 is not None:
@@ -2086,7 +2088,7 @@ def main():
                         
                         # Encode ref latents
                         with conditional_record_function("vae_encode_ref"):
-                            ref_latents = _batch_encode_vae(ref_pixel_values)
+                            ref_latents = _batch_encode_vae_ref(ref_pixel_values)
                         
                         log_memory_usage("4_vae_encode_ref", global_step)
 

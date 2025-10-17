@@ -27,7 +27,7 @@ VALIDATION_SIZE="256 448 49"  # height width frames
 ## deepspeed zero2
 # accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.1/train_phantom.py \
 
-accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.1/train_phantom.py \
+accelerate launch scripts/wan2.1/train_phantom.py \
   --config_path="config/wan2.1/wan_civitai.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
@@ -38,7 +38,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=0 \
-  --dataloader_num_workers=8 \
+  --dataloader_num_workers=16 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
   --checkpoints_total_limit=3 \
@@ -62,7 +62,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --train_mode="normal" \
   --trainable_modules 'self_attn' \
   --report_model_info \
-  --report_to="wandb" \
+  --report_to="tensorboard" \
   --tracker_project_name="phantom_1B3-256p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
