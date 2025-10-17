@@ -183,8 +183,8 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
             val_frames = args.video_sample_n_frames
             logger.info(f"Using default validation size: {val_height}x{val_width}, {val_frames} frames")
         
-        scheduler = FlowUniPCMultistepScheduler(
-            **filter_kwargs(FlowUniPCMultistepScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
         )
         transformer3d_val = accelerator.unwrap_model(transformer3d)
         pipeline = WanFunPhantomPipeline(
@@ -983,8 +983,8 @@ def main():
         print(f"Weight dtype: {weight_dtype}")
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = FlowUniPCMultistepScheduler(
-        **filter_kwargs(FlowUniPCMultistepScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
+    noise_scheduler = FlowMatchEulerDiscreteScheduler(
+        **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
     )
 
     # Get Tokenizer

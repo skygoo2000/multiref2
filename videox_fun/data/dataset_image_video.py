@@ -1167,6 +1167,11 @@ class ImageVideoRefDataset(Dataset):
 
                 pixel_values, ref_pixel_values, name, data_type, file_path = self.get_batch(idx)
 
+                # Randomly shuffle frames of ref_pixel_values
+                if ref_pixel_values.shape[0] > 1:
+                    perm = torch.randperm(ref_pixel_values.shape[0])
+                    ref_pixel_values = ref_pixel_values[perm]
+
                 sample["pixel_values"] = pixel_values
                 sample["ref_pixel_values"] = ref_pixel_values
                 sample["text"] = name

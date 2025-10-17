@@ -62,7 +62,7 @@ accelerate launch scripts/wan2.1/train_phantom.py \
   --train_mode="normal" \
   --trainable_modules 'self_attn' \
   --report_model_info \
-  --report_to="tensorboard" \
+  --report_to="wandb" \
   --tracker_project_name="phantom_1B3-256p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
