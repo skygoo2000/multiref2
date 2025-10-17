@@ -1,5 +1,5 @@
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-T2V-1.3B"
-export DATASET_NAME="datasets/synworld12"
+export DATASET_NAME="datasets/vace12"
 export DATASET_META_NAME="$DATASET_NAME/train.json"
 # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
 # export NCCL_IB_DISABLE=1
@@ -9,16 +9,16 @@ export PYTHONWARNINGS="ignore::FutureWarning"
 # export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=3
+BATCH_SIZE=12
 MAX_TRAIN_STEPS=2000
 CHECKPOINTING_STEPS=500
 RESUME_FROM_CHECKPOINT="models/Personalized_Model/phantom-1.3B"
 
-OUTPUT_DIR="ckpts/1006_phantom1B3_overfit_lr${LEARNING_RATE}"
+OUTPUT_DIR="ckpts/1016_phantom1B3_vace12_lr${LEARNING_RATE}_selfattn"
 
 VALIDATION_STEPS=200
-VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
-VALIDATION_REF_PATH="$DATASET_NAME/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
+VALIDATION_PROMPTS="一台Polaroid相机，从不同的角度和位置进行展示。视频的主要对象是一台Polaroid相机，它被拍摄到不同的角度和位置，包括正面、侧面和背面。相机整体呈现为白色和黑色，带有一些红色和黄色的细节。视频中的场景主要是一个浅蓝色的背景，背景颜色逐渐变浅，从顶部到底部呈现出渐变效果。背景的色调为柔和的粉色和蓝色，营造出一种柔和的氛围。在视频中，相机被拍摄到不同的位置和角度，包括正面、侧面和背面。相机从不同的角度展示，包括正面、侧面和背面的视角。"
+VALIDATION_REF_PATH="asset/cam_ref.jpg"
 VALIDATION_SIZE="256 448 49"  # height width frames
 
 ## fsdp stage3

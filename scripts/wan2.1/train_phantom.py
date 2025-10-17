@@ -79,7 +79,8 @@ from videox_fun.data.dataset_image_video import (ImageVideoRefDataset,
 from videox_fun.models import (AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel, WanTransformer3DModel)
 from videox_fun.pipeline import WanFunPhantomPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
-from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
+from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid, get_image_latent
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -168,7 +169,7 @@ check_min_version("0.18.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
-def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, accelerator, weight_dtype, global_step):
+def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, accelerator, weight_dtype, global_step, num_ref_frames_in_vid=4):
     
     logger.info("Running validation... ")
 
@@ -182,71 +183,8 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
             val_frames = args.video_sample_n_frames
             logger.info(f"Using default validation size: {val_height}x{val_width}, {val_frames} frames")
         
-        # Load validation reference if provided
-        validation_ref = None
-        is_ref_image = False
-        if args.validation_ref_path is not None:
-            
-            ref_path = args.validation_ref_path
-            logger.info(f"Loading validation reference from: {ref_path}")
-            
-            # Check if ref is image or video by extension
-            ref_ext = ref_path.lower().split('.')[-1]
-            if ref_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
-                is_ref_image = True
-                # Load as image
-                ref_image = Image.open(ref_path).convert('RGB')
-                # Transform to match model input
-                transform = transforms.Compose([
-                    transforms.Resize(min(val_height, val_width)),
-                    transforms.CenterCrop((val_height, val_width)),
-                    transforms.ToTensor(),
-                ])
-                validation_ref = transform(ref_image).unsqueeze(0).unsqueeze(0)  # [1, 1, C, H, W]
-                logger.info(f"Loaded reference image with shape: {validation_ref.shape}")
-                
-                # Save validation reference image as gif (single frame)
-                os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
-                validation_ref = validation_ref.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W] for save_videos_grid
-                save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
-
-                if args.report_to == "wandb":
-                    accelerator.log({"validation/ref": wandb.Image(validation_ref.cpu())}, step=global_step)
-            else:
-                # Load as video
-                try:
-                    vr = VideoReader(ref_path)
-                    # Use all frames from the reference video
-                    max_ref_frames = len(vr)  # Use all frames
-                    ref_frames = vr.get_batch(list(range(max_ref_frames))).asnumpy()
-                    
-                    # Transform frames
-                    transform = transforms.Compose([
-                        transforms.ToPILImage(),
-                        transforms.Resize(min(val_height, val_width)),
-                        transforms.CenterCrop((val_height, val_width)),
-                        transforms.ToTensor(),
-                    ])
-                    
-                    ref_tensor_list = []
-                    for frame in ref_frames:
-                        ref_tensor_list.append(transform(frame))
-                    
-                    validation_ref = torch.stack(ref_tensor_list).unsqueeze(0)  # [1, F, C, H, W]
-                    validation_ref = validation_ref.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W]
-                    logger.info(f"Loaded reference video with shape: {validation_ref.shape}")
-                    
-                    # Save validation reference as gif
-                    os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
-                    # save_videos_grid expects torch.Tensor input
-                    save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
-                    validation_ref = None
-        
-        scheduler = FlowMatchEulerDiscreteScheduler(
-            **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
+        scheduler = FlowUniPCMultistepScheduler(
+            **filter_kwargs(FlowUniPCMultistepScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
         )
         transformer3d_val = accelerator.unwrap_model(transformer3d)
         pipeline = WanFunPhantomPipeline(
@@ -268,6 +206,61 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
         for i in range(len(args.validation_prompts)):
             with torch.no_grad():
                 os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+
+                # Load validation reference if provided
+                validation_ref = None
+                if args.validation_ref_path is not None:
+                    
+                    ref_path = args.validation_ref_path
+                    logger.info(f"Loading validation reference from: {ref_path}")
+                    
+                    # Check if ref is image or video by extension
+                    ref_ext = ref_path.lower().split('.')[-1]
+                    if ref_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
+                        # Load as image using get_image_latent
+                        sample_size = [val_height, val_width]
+                        validation_ref = get_image_latent(ref_image=ref_path, sample_size=sample_size, padding=True)
+                        # validation_ref is [1, C, 1, H, W] from get_image_latent
+                        logger.info(f"Loaded reference image with shape: {validation_ref.shape}")
+                        
+                        # Save validation reference image as gif (single frame)
+                        os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
+                        save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                    else:
+                        # Load as video
+                        try:
+                            vr = VideoReader(ref_path)
+                            total_frames = len(vr)
+                            
+                            if total_frames <= num_ref_frames_in_vid:
+                                frame_indices = list(range(total_frames))
+                            else:
+                                frame_indices = np.linspace(0, total_frames - 1, num_ref_frames_in_vid, dtype=int).tolist()
+                            
+                            ref_list = []
+                            sample_size = [val_height, val_width]
+                            for idx in frame_indices:
+                                frame = vr[idx].asnumpy()
+                                frame_pil = Image.fromarray(frame)
+                                
+                                # Use get_image_latent to process (returns [1, C, 1, H, W])
+                                frame_latent = get_image_latent(ref_image=frame_pil, sample_size=sample_size, padding=True)
+                                # Squeeze the frame dimension: [1, C, 1, H, W] -> [1, C, H, W]
+                                frame_latent = frame_latent.squeeze(2)
+                                ref_list.append(frame_latent)
+                            
+                            # Concatenate all frames: list of [1, C, H, W] -> [1, C, F, H, W]
+                            validation_ref = torch.cat([f.unsqueeze(2) for f in ref_list], dim=2)
+                            logger.info(f"Loaded reference video with {len(frame_indices)} sampled frames, shape: {validation_ref.shape}")
+                            
+                            # Save validation reference as gif
+                            os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+                            # save_videos_grid expects torch.Tensor input
+                            save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                            
+                        except Exception as e:
+                            logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
+                            validation_ref = None
                 
                 # Generate with reference if provided
                 if validation_ref is not None:
@@ -275,7 +268,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     sample_with_ref = pipeline(
                         args.validation_prompts[i],
                         num_frames = val_frames,
-                        negative_prompt = "bad detailed", 
+                        negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走", 
                         height      = val_height,
                         width       = val_width,
                         generator   = generator,
@@ -993,8 +986,8 @@ def main():
         print(f"Weight dtype: {weight_dtype}")
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = FlowMatchEulerDiscreteScheduler(
-        **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
+    noise_scheduler = FlowUniPCMultistepScheduler(
+        **filter_kwargs(FlowUniPCMultistepScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
     )
 
     # Get Tokenizer
@@ -1458,7 +1451,7 @@ def main():
                         resize_size = int(h * closest_size[1] / w), closest_size[1]
                     
                     transform = transforms.Compose([
-                        transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.BILINEAR),  # Image.BICUBIC
+                        transforms.Resize(resize_size),
                         transforms.CenterCrop(closest_size),
                         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
                     ])
@@ -1892,6 +1885,36 @@ def main():
                 f'memory/max_allocated/{step_name}_gb': max_memory_allocated
             }, step=global_step)
 
+    # Run validation before training starts
+    if global_step == 0 and args.validation_prompts is not None and not args.use_fsdp:
+        if accelerator.is_main_process:
+            logger.info(f"Running initial validation at step 0...")
+            
+            if args.use_ema:
+                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                ema_transformer3d.store(transformer3d.parameters())
+                ema_transformer3d.copy_to(transformer3d.parameters())
+            
+            log_validation(
+                vae,
+                text_encoder,
+                tokenizer,
+                transformer3d,
+                args,
+                config,
+                accelerator,
+                weight_dtype,
+                global_step,
+            )
+            transformer3d.train()
+
+            if args.use_ema:
+                # Switch back to the original transformer3d parameters.
+                ema_transformer3d.restore(transformer3d.parameters())
+        
+        logger.info(f"[Rank {accelerator.process_index}] Syncing after initial validation...")
+        accelerator.wait_for_everyone()
+    
     # Use profiler as context manager if enabled
     profiler_context = profiler if profiler is not None else nullcontext()
     
@@ -2335,7 +2358,7 @@ def main():
                             accelerator.save_state(save_path)
                             logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompts is not None and (global_step % args.validation_steps == 0 or global_step == 1) and not args.use_fsdp:
+                    if args.validation_prompts is not None and global_step % args.validation_steps == 0 and not args.use_fsdp:
     
                         if accelerator.is_main_process:
                             logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")

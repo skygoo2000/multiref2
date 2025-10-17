@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=1B3-256p         
 #SBATCH --nodes=1
-#SBATCH --gpus=4
+#SBATCH --gpus=2
 #SBATCH --time=48:00:00          # total run time limit (HH:MM:SS)
 #SBATCH --partition=preempt
 #SBATCH --account=liuyuan
@@ -18,16 +18,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=3
+BATCH_SIZE=6
 MAX_TRAIN_STEPS=2000
 CHECKPOINTING_STEPS=500
 RESUME_FROM_CHECKPOINT="models/Personalized_Model/phantom-1.3B"
 
-OUTPUT_DIR="ckpts/1006_phantom1B3_overfit_lr${LEARNING_RATE}"
+OUTPUT_DIR="ckpts/1016_phantom1B3_overfit_lr${LEARNING_RATE}_selfattn"
 
 VALIDATION_STEPS=200
-VALIDATION_PROMPTS="White pickup truck parked on a grassy area. The truck is a modern model with a large grille and black wheels. In the background, there is a red pickup truck parked next to the white truck. The scene appears to be set in a rural or semi-rural area, with a building and trees visible in the distance. The sky is partly cloudy, suggesting it might be a cool or overcast day."
-VALIDATION_REF_PATH="$DATASET_NAME/fg_video/H7z_-9IjXBA_85_23to151_fg.mp4"
+VALIDATION_PROMPTS="一台Polaroid相机，从不同的角度和位置进行展示。视频的主要对象是一台Polaroid相机，它被拍摄到不同的角度和位置，包括正面、侧面和背面。相机整体呈现为白色和黑色，带有一些红色和黄色的细节。视频中的场景主要是一个浅蓝色的背景，背景颜色逐渐变浅，从顶部到底部呈现出渐变效果。背景的色调为柔和的粉色和蓝色，营造出一种柔和的氛围。在视频中，相机被拍摄到不同的位置和角度，包括正面、侧面和背面。相机从不同的角度展示，包括正面、侧面和背面的视角。"
+VALIDATION_REF_PATH="asset/cam_ref.jpg"
 VALIDATION_SIZE="256 448 49"  # height width frames
 
 ## fsdp stage3
@@ -36,7 +36,7 @@ VALIDATION_SIZE="256 448 49"  # height width frames
 ## deepspeed zero2
 # accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.1/train_phantom.py \
 
-accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.1/train_phantom.py \
+accelerate launch scripts/wan2.1/train_phantom.py \
   --config_path="config/wan2.1/wan_civitai.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \

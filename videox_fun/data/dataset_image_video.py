@@ -26,6 +26,49 @@ from torch.utils.data.dataset import Dataset
 
 VIDEO_READER_TIMEOUT = 20
 
+def padding_image(images, new_width, new_height):
+    new_image = Image.new('RGB', (new_width, new_height), (255, 255, 255))
+
+    aspect_ratio = images.width / images.height
+    if new_width / new_height > 1:
+        if aspect_ratio > new_width / new_height:
+            new_img_width = new_width
+            new_img_height = int(new_img_width / aspect_ratio)
+        else:
+            new_img_height = new_height
+            new_img_width = int(new_img_height * aspect_ratio)
+    else:
+        if aspect_ratio > new_width / new_height:
+            new_img_width = new_width
+            new_img_height = int(new_img_width / aspect_ratio)
+        else:
+            new_img_height = new_height
+            new_img_width = int(new_img_height * aspect_ratio)
+
+    resized_img = images.resize((new_img_width, new_img_height))
+
+    paste_x = (new_width - new_img_width) // 2
+    paste_y = (new_height - new_img_height) // 2
+
+    new_image.paste(resized_img, (paste_x, paste_y))
+
+    return new_image
+
+def get_image_latent(ref_image=None, sample_size=None, padding=False):
+    if ref_image is not None:
+        if isinstance(ref_image, str):
+            ref_image = Image.open(ref_image).convert("RGB")
+            if padding:
+                ref_image = padding_image(ref_image, sample_size[1], sample_size[0])
+            ref_image = ref_image.resize((sample_size[1], sample_size[0]))
+            ref_image = torch.from_numpy(np.array(ref_image))
+            ref_image = ref_image.unsqueeze(0).permute([3, 0, 1, 2]).unsqueeze(0) / 255
+        else:
+            ref_image = torch.from_numpy(np.array(ref_image))
+            ref_image = ref_image.unsqueeze(0).permute([3, 0, 1, 2]).unsqueeze(0) / 255
+
+    return ref_image
+
 def get_random_mask(shape, image_start_only=False):
     f, c, h, w = shape
     mask = torch.zeros((f, 1, h, w), dtype=torch.uint8)
@@ -822,6 +865,7 @@ class ImageVideoRefDataset(Dataset):
         video_length_drop_end=1.0,
         enable_inpaint=False,
         return_file_name=False,
+        num_ref_frames=4,
     ):
         # Loading annotations from files
         print(f"loading annotations from {ann_path} ...")
@@ -851,6 +895,7 @@ class ImageVideoRefDataset(Dataset):
         self.length = len(self.dataset)
         print(f"data scale: {self.length}")
         # TODO: enable bucket training
+        self.num_ref_frames = num_ref_frames
         self.enable_bucket = enable_bucket
         self.text_drop_ratio = text_drop_ratio
         self.enable_inpaint = enable_inpaint
@@ -886,7 +931,7 @@ class ImageVideoRefDataset(Dataset):
         data_info = self.dataset[idx % len(self.dataset)]
         video_id, text = data_info['file_path'], data_info['text']
 
-        if data_info.get('type', 'image')=='video':
+        if data_info.get('type', 'image') == 'video':
             if self.data_root is None:
                 video_dir = video_id
             else:
@@ -935,7 +980,7 @@ class ImageVideoRefDataset(Dataset):
                 if random.random() < self.text_drop_ratio:
                     text = ''
 
-            # Process ref file (can be video or image)
+            # Process ref file (can be video, image, or directory)
             ref_file_path = data_info.get('ref', '')
             
             # Handle empty ref: use first frame of gt video
@@ -951,49 +996,88 @@ class ImageVideoRefDataset(Dataset):
                 else:
                     ref_file_id = os.path.join(self.data_root, ref_file_path)
             
-                # Check if ref file is image or video by extension
-                ref_file_ext = ref_file_path.lower().split('.')[-1]
-                if ref_file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
-                    # Process as image
-                    ref_image = Image.open(ref_file_id).convert('RGB')
-                    if not self.enable_bucket:
-                        ref_pixel_values = self.image_transforms(ref_image).unsqueeze(0)  # Add frame dimension
-                    else:
-                        ref_pixel_values = np.expand_dims(np.array(ref_image), 0)  # Add frame dimension
-                else:
-                    # Process as video
-                    with VideoReader_contextmanager(ref_file_id, num_threads=2) as ref_video_reader:
-                        # For ref video, we might want different sampling strategy
-                        # Here we use the same batch_index as gt video, but you can modify this
-                        ref_batch_index = batch_index
-                        if len(ref_video_reader) < max(ref_batch_index) + 1:
-                            # If ref video is shorter, adjust the batch index
-                            ref_batch_index = np.linspace(0, len(ref_video_reader) - 1, len(batch_index), dtype=int)
-                        
-                        try:
-                            sample_args = (ref_video_reader, ref_batch_index)
-                            ref_pixel_values = func_timeout(
-                                VIDEO_READER_TIMEOUT, get_video_reader_batch, args=sample_args
-                            )
-                            resized_frames = []
-                            for i in range(len(ref_pixel_values)):
-                                frame = ref_pixel_values[i]
-                                resized_frame = resize_frame(frame, self.larger_side_of_image_and_video)
-                                resized_frames.append(resized_frame)
-                            ref_pixel_values = np.array(resized_frames)
-                        except FunctionTimedOut:
-                            raise ValueError(f"Read {idx} timeout.")
-                        except Exception as e:
-                            raise ValueError(f"Failed to extract frames from ref video. Error is {e}.")
-
+                # Check if ref_file_id is a directory
+                if os.path.isdir(ref_file_id):
+                    # Load all images from the directory
+                    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+                    image_files = []
+                    for file in sorted(os.listdir(ref_file_id)):
+                        if any(file.lower().endswith(ext) for ext in image_extensions):
+                            image_files.append(os.path.join(ref_file_id, file))
+                    
+                    if len(image_files) == 0:
+                        raise ValueError(f"No image files found in directory: {ref_file_id}")
+                    
+                    # Process all images in the directory
+                    ref_frames_list = []
+                    for img_path in image_files:
                         if not self.enable_bucket:
-                            ref_pixel_values = torch.from_numpy(ref_pixel_values).permute(0, 3, 1, 2).contiguous()
-                            ref_pixel_values = ref_pixel_values / 255.
+                            ref_image = Image.open(img_path).convert('RGB')
+                            ref_frame = self.image_transforms(ref_image)
+                            ref_frames_list.append(ref_frame)
                         else:
-                            ref_pixel_values = ref_pixel_values
-
+                            ref_frame = get_image_latent(
+                                ref_image=img_path,
+                                sample_size=[self.larger_side_of_image_and_video, self.larger_side_of_image_and_video],
+                                padding=True
+                            )
+                            ref_frame = ref_frame.squeeze(0).squeeze(1)
+                            # Convert back to numpy [H, W, C] for bucket mode
+                            ref_frame = ref_frame.permute(1, 2, 0).numpy() * 255
+                            ref_frames_list.append(ref_frame.astype(np.uint8))
+                    
+                    if not self.enable_bucket:
+                        ref_pixel_values = torch.stack(ref_frames_list)  # [F, C, H, W]
+                    else:
+                        ref_pixel_values = np.array(ref_frames_list)  # [F, H, W, C]
+                else:
+                    # Check if ref file is image or video by extension
+                    ref_file_ext = ref_file_path.lower().split('.')[-1]
+                    if ref_file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
+                        # Process as image
+                        ref_image = Image.open(ref_file_id).convert('RGB')
                         if not self.enable_bucket:
-                            ref_pixel_values = self.video_transforms(ref_pixel_values)
+                            ref_pixel_values = self.image_transforms(ref_image).unsqueeze(0)  # Add frame dimension
+                        else:
+                            ref_pixel_values = np.expand_dims(np.array(ref_image), 0)  # Add frame dimension
+                    else:
+                        # Process as video - randomly and uniformly sample 4 frames
+                        with VideoReader_contextmanager(ref_file_id, num_threads=2) as ref_video_reader:
+                            total_frames = len(ref_video_reader)
+                            
+                            if total_frames <= self.num_ref_frames:
+                                ref_batch_index = list(range(total_frames))
+                            else:
+                                ref_batch_index = np.linspace(0, total_frames - 1, self.num_ref_frames, dtype=int)
+                            
+                            try:
+                                sample_args = (ref_video_reader, ref_batch_index)
+                                ref_frames = func_timeout(
+                                    VIDEO_READER_TIMEOUT, get_video_reader_batch, args=sample_args
+                                )
+                                
+                                # Process each frame as image
+                                ref_frames_list = []
+                                for i in range(len(ref_frames)):
+                                    frame = ref_frames[i]
+                                    resized_frame = resize_frame(frame, self.larger_side_of_image_and_video)
+                                    frame_pil = Image.fromarray(resized_frame)
+                                    
+                                    if not self.enable_bucket:
+                                        ref_frame = self.image_transforms(frame_pil)
+                                        ref_frames_list.append(ref_frame)
+                                    else:
+                                        ref_frames_list.append(resized_frame)
+                                
+                                if not self.enable_bucket:
+                                    ref_pixel_values = torch.stack(ref_frames_list)  # [F, C, H, W]
+                                else:
+                                    ref_pixel_values = np.array(ref_frames_list)  # [F, H, W, C]
+                                    
+                            except FunctionTimedOut:
+                                raise ValueError(f"Read {idx} timeout.")
+                            except Exception as e:
+                                raise ValueError(f"Failed to extract frames from ref video. Error is {e}.")
 
             return pixel_values, ref_pixel_values, text, "video", video_dir
 
@@ -1010,7 +1094,7 @@ class ImageVideoRefDataset(Dataset):
             if random.random() < self.text_drop_ratio:
                 text = ''
 
-            # Process ref file (can be video or image)
+            # Process ref file (can be video, image, or directory)
             ref_file_path = data_info.get('ref', '')
 
             # Handle empty ref: use gt image as ref
@@ -1023,46 +1107,88 @@ class ImageVideoRefDataset(Dataset):
                 else:
                     ref_file_id = os.path.join(self.data_root, ref_file_path)
 
-                # Check if ref file is image or video by extension
-                ref_file_ext = ref_file_path.lower().split('.')[-1]
-                if ref_file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
-                    # Process as image
-                    ref_image = Image.open(ref_file_id).convert('RGB')
-                    if not self.enable_bucket:
-                        ref_pixel_values = self.image_transforms(ref_image).unsqueeze(0)  # Add frame dimension
-                    else:
-                        ref_pixel_values = np.expand_dims(np.array(ref_image), 0)  # Add frame dimension
-                else:
-                    # Process as video
-                    with VideoReader_contextmanager(ref_file_id, num_threads=2) as ref_video_reader:
-                        # For ref video when gt is image, you might want to sample different frames
-                        # Here we sample all frames, but you can modify this strategy
-                        ref_batch_index = list(range(len(ref_video_reader)))
-                        
-                        try:
-                            sample_args = (ref_video_reader, ref_batch_index)
-                            ref_pixel_values = func_timeout(
-                                VIDEO_READER_TIMEOUT, get_video_reader_batch, args=sample_args
-                            )
-                            resized_frames = []
-                            for i in range(len(ref_pixel_values)):
-                                frame = ref_pixel_values[i]
-                                resized_frame = resize_frame(frame, self.larger_side_of_image_and_video)
-                                resized_frames.append(resized_frame)
-                            ref_pixel_values = np.array(resized_frames)
-                        except FunctionTimedOut:
-                            raise ValueError(f"Read {idx} timeout.")
-                        except Exception as e:
-                            raise ValueError(f"Failed to extract frames from ref video. Error is {e}.")
-
+                # Check if ref_file_id is a directory
+                if os.path.isdir(ref_file_id):
+                    # Load all images from the directory
+                    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+                    image_files = []
+                    for file in sorted(os.listdir(ref_file_id)):
+                        if any(file.lower().endswith(ext) for ext in image_extensions):
+                            image_files.append(os.path.join(ref_file_id, file))
+                    
+                    if len(image_files) == 0:
+                        raise ValueError(f"No image files found in directory: {ref_file_id}")
+                    
+                    # Process all images in the directory
+                    ref_frames_list = []
+                    for img_path in image_files:
                         if not self.enable_bucket:
-                            ref_pixel_values = torch.from_numpy(ref_pixel_values).permute(0, 3, 1, 2).contiguous()
-                            ref_pixel_values = ref_pixel_values / 255.
+                            ref_image = Image.open(img_path).convert('RGB')
+                            ref_frame = self.image_transforms(ref_image)
+                            ref_frames_list.append(ref_frame)
                         else:
-                            ref_pixel_values = ref_pixel_values
-
+                            ref_frame = get_image_latent(
+                                ref_image=img_path,
+                                sample_size=[self.larger_side_of_image_and_video, self.larger_side_of_image_and_video],
+                                padding=True
+                            )
+                            ref_frame = ref_frame.squeeze(0).squeeze(1)
+                            # Convert back to numpy [H, W, C] for bucket mode
+                            ref_frame = ref_frame.permute(1, 2, 0).numpy() * 255
+                            ref_frames_list.append(ref_frame.astype(np.uint8))
+                    
+                    if not self.enable_bucket:
+                        ref_pixel_values = torch.stack(ref_frames_list)  # [F, C, H, W]
+                    else:
+                        ref_pixel_values = np.array(ref_frames_list)  # [F, H, W, C]
+                else:
+                    # Check if ref file is image or video by extension
+                    ref_file_ext = ref_file_path.lower().split('.')[-1]
+                    if ref_file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
+                        # Process as image
+                        ref_image = Image.open(ref_file_id).convert('RGB')
                         if not self.enable_bucket:
-                            ref_pixel_values = self.video_transforms(ref_pixel_values)
+                            ref_pixel_values = self.image_transforms(ref_image).unsqueeze(0)  # Add frame dimension
+                        else:
+                            ref_pixel_values = np.expand_dims(np.array(ref_image), 0)  # Add frame dimension
+                    else:
+                        # Process as video
+                        with VideoReader_contextmanager(ref_file_id, num_threads=2) as ref_video_reader:
+                            total_frames = len(ref_video_reader)
+                            
+                            if total_frames <= self.num_ref_frames:
+                                ref_batch_index = list(range(total_frames))
+                            else:
+                                ref_batch_index = np.linspace(0, total_frames - 1, self.num_ref_frames, dtype=int)
+                            
+                            try:
+                                sample_args = (ref_video_reader, ref_batch_index)
+                                ref_frames = func_timeout(
+                                    VIDEO_READER_TIMEOUT, get_video_reader_batch, args=sample_args
+                                )
+                                
+                                # Process each frame as image
+                                ref_frames_list = []
+                                for i in range(len(ref_frames)):
+                                    frame = ref_frames[i]
+                                    resized_frame = resize_frame(frame, self.larger_side_of_image_and_video)
+                                    frame_pil = Image.fromarray(resized_frame)
+                                    
+                                    if not self.enable_bucket:
+                                        ref_frame = self.image_transforms(frame_pil)
+                                        ref_frames_list.append(ref_frame)
+                                    else:
+                                        ref_frames_list.append(resized_frame)
+                                
+                                if not self.enable_bucket:
+                                    ref_pixel_values = torch.stack(ref_frames_list)  # [F, C, H, W]
+                                else:
+                                    ref_pixel_values = np.array(ref_frames_list)  # [F, H, W, C]
+                                    
+                            except FunctionTimedOut:
+                                raise ValueError(f"Read {idx} timeout.")
+                            except Exception as e:
+                                raise ValueError(f"Failed to extract frames from ref video. Error is {e}.")
 
             return image, ref_pixel_values, text, 'image', image_path
             
