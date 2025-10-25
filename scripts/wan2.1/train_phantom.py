@@ -23,6 +23,7 @@ import os
 import pickle
 import shutil
 import sys
+import glob
 
 import accelerate
 import diffusers
@@ -214,53 +215,87 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     ref_path = args.validation_ref_path
                     logger.info(f"Loading validation reference from: {ref_path}")
                     
-                    # Check if ref is image or video by extension
-                    ref_ext = ref_path.lower().split('.')[-1]
-                    if ref_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
-                        # Load as image using get_image_latent
-                        sample_size = [val_height, val_width]
-                        validation_ref = get_image_latent(ref_image=ref_path, sample_size=sample_size, padding=True)
-                        # validation_ref is [1, C, 1, H, W] from get_image_latent
-                        logger.info(f"Loaded reference image with shape: {validation_ref.shape}")
+                    # Check if ref_path is a directory
+                    if os.path.isdir(ref_path):
+                        # Load all images from directory
+                        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+                        image_files = []
+                        for ext in image_extensions:
+                            image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext}')))
+                            image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext.upper()}')))
                         
-                        # Save validation reference image as gif (single frame)
-                        os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
-                        save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
-                    else:
-                        # Load as video
-                        try:
-                            vr = VideoReader(ref_path)
-                            total_frames = len(vr)
-                            
-                            if total_frames <= num_ref_frames_in_vid:
-                                frame_indices = list(range(total_frames))
-                            else:
-                                frame_indices = np.linspace(0, total_frames - 1, num_ref_frames_in_vid, dtype=int).tolist()
+                        image_files = sorted(image_files)  # Sort for consistent ordering
+                        
+                        if len(image_files) == 0:
+                            logger.warning(f"No image files found in directory: {ref_path}")
+                            validation_ref = None
+                        else:
+                            logger.info(f"Found {len(image_files)} images in directory")
                             
                             ref_list = []
                             sample_size = [val_height, val_width]
-                            for idx in frame_indices:
-                                frame = vr[idx].asnumpy()
-                                frame_pil = Image.fromarray(frame)
-                                
+                            for img_path in image_files:
                                 # Use get_image_latent to process (returns [1, C, 1, H, W])
-                                frame_latent = get_image_latent(ref_image=frame_pil, sample_size=sample_size, padding=True)
+                                frame_latent = get_image_latent(ref_image=img_path, sample_size=sample_size, padding=True)
                                 # Squeeze the frame dimension: [1, C, 1, H, W] -> [1, C, H, W]
                                 frame_latent = frame_latent.squeeze(2)
                                 ref_list.append(frame_latent)
                             
                             # Concatenate all frames: list of [1, C, H, W] -> [1, C, F, H, W]
                             validation_ref = torch.cat([f.unsqueeze(2) for f in ref_list], dim=2)
-                            logger.info(f"Loaded reference video with {len(frame_indices)} sampled frames, shape: {validation_ref.shape}")
+                            logger.info(f"Loaded reference from directory with {len(image_files)} frames, shape: {validation_ref.shape}")
                             
                             # Save validation reference as gif
-                            os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
-                            # save_videos_grid expects torch.Tensor input
+                            os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
                             save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                    else:
+                        # Check if ref is image or video by extension
+                        ref_ext = ref_path.lower().split('.')[-1]
+                        if ref_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
+                            # Load as image using get_image_latent
+                            sample_size = [val_height, val_width]
+                            validation_ref = get_image_latent(ref_image=ref_path, sample_size=sample_size, padding=True)
+                            # validation_ref is [1, C, 1, H, W] from get_image_latent
+                            logger.info(f"Loaded reference image with shape: {validation_ref.shape}")
                             
-                        except Exception as e:
-                            logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
-                            validation_ref = None
+                            # Save validation reference image as gif (single frame)
+                            os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
+                            save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                        else:
+                            # Load as video
+                            try:
+                                vr = VideoReader(ref_path)
+                                total_frames = len(vr)
+                                
+                                if total_frames <= num_ref_frames_in_vid:
+                                    frame_indices = list(range(total_frames))
+                                else:
+                                    frame_indices = np.linspace(0, total_frames - 1, num_ref_frames_in_vid, dtype=int).tolist()
+                                
+                                ref_list = []
+                                sample_size = [val_height, val_width]
+                                for idx in frame_indices:
+                                    frame = vr[idx].asnumpy()
+                                    frame_pil = Image.fromarray(frame)
+                                    
+                                    # Use get_image_latent to process (returns [1, C, 1, H, W])
+                                    frame_latent = get_image_latent(ref_image=frame_pil, sample_size=sample_size, padding=True)
+                                    # Squeeze the frame dimension: [1, C, 1, H, W] -> [1, C, H, W]
+                                    frame_latent = frame_latent.squeeze(2)
+                                    ref_list.append(frame_latent)
+                                
+                                # Concatenate all frames: list of [1, C, H, W] -> [1, C, F, H, W]
+                                validation_ref = torch.cat([f.unsqueeze(2) for f in ref_list], dim=2)
+                                logger.info(f"Loaded reference video with {len(frame_indices)} sampled frames, shape: {validation_ref.shape}")
+                                
+                                # Save validation reference as gif
+                                os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+                                # save_videos_grid expects torch.Tensor input
+                                save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                                
+                            except Exception as e:
+                                logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
+                                validation_ref = None
                 
                 # Generate with reference if provided
                 if validation_ref is not None:
@@ -286,18 +321,14 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     sample_frames = sample_with_ref.shape[2]
                     
                     if ref_frames != sample_frames:
-                        if sample_frames < ref_frames:
-                            # Repeat last frame to match reference length
-                            last_frame = sample_with_ref[:, :, -1:, :, :] 
-                            repeat_count = ref_frames - sample_frames
-                            repeated_frames = last_frame.repeat(1, 1, repeat_count, 1, 1)
-                            sample_with_ref = torch.cat([sample_with_ref, repeated_frames], dim=2)
-                        else:
-                            # Repeat last frame to match sample length
-                            last_frame = validation_ref[:, :, -1:, :, :] 
-                            repeat_count = sample_frames - ref_frames
-                            repeated_frames = last_frame.repeat(1, 1, repeat_count, 1, 1)
-                            validation_ref = torch.cat([validation_ref, repeated_frames], dim=2)
+                        B, C, F_ref, H, W = validation_ref.shape
+                        validation_ref_reshaped = validation_ref.view(B * C, 1, F_ref, H * W)
+                        validation_ref_interpolated = torch.nn.functional.interpolate(
+                            validation_ref_reshaped,
+                            size=(sample_frames, H * W),
+                            mode='nearest'
+                        )
+                        validation_ref = validation_ref_interpolated.view(B, C, sample_frames, H, W)
                     
                     # spatial mismatch
                     ref_h, ref_w = validation_ref.shape[3], validation_ref.shape[4]
@@ -1674,121 +1705,166 @@ def main():
     global_step = 0
     first_epoch = 0
 
+    # Helper function to load phantom weights (supports .pth, .safetensors, and sharded safetensors)
+    def load_phantom_weights(weight_path):
+        """Load phantom weights from file or directory
+        
+        Supports:
+        1. Direct file paths: 
+           - .pth files (e.g., "models/phantom-1.3B/Phantom-Wan-1.3B.pth")
+           - .safetensors files
+           - .safetensors.index.json files (for sharded models)
+        2. Directory paths:
+           - Automatically finds and loads phantom weights from directory
+           - Equivalent to specifying the exact file path
+        """
+        from safetensors.torch import load_file
+        import json
+        
+        print(f"Attempting to load phantom weights from: {weight_path}")
+        
+        # Direct file
+        if os.path.isfile(weight_path):
+            if weight_path.endswith('.pth'):
+                print(f"Loading phantom weights from .pth file: {weight_path}")
+                state_dict = torch.load(weight_path, map_location="cpu")
+                return state_dict.get("state_dict", state_dict), weight_path
+            elif weight_path.endswith('.safetensors'):
+                print(f"Loading phantom weights from .safetensors file: {weight_path}")
+                state_dict = load_file(weight_path)
+                return {k: v.to("cpu") for k, v in state_dict.items()}, weight_path
+            elif weight_path.endswith('.safetensors.index.json'):
+                # Handle sharded safetensors index file directly
+                print(f"Loading sharded safetensors from index file: {weight_path}")
+                with open(weight_path, "r") as f:
+                    index = json.load(f)
+                
+                state_dict = {}
+                shard_files = set(index["weight_map"].values())
+                base_dir = os.path.dirname(weight_path)
+                for shard_file in sorted(shard_files):
+                    print(f"  Loading shard: {shard_file}")
+                    shard_state = load_file(os.path.join(base_dir, shard_file))
+                    state_dict.update({k: v.to("cpu") for k, v in shard_state.items()})
+                
+                print(f"  Total loaded keys: {len(state_dict)}")
+                return state_dict, weight_path
+            else:
+                raise ValueError(f"Unsupported file format: {weight_path}")
+        
+        # Directory path
+        if not os.path.isdir(weight_path):
+            raise ValueError(f"Weight path is not a directory: {weight_path}")
+        
+        # Check for sharded safetensors (Phantom-14B style)
+        index_files = [f for f in os.listdir(weight_path) if f.endswith('.safetensors.index.json')]
+        if index_files:
+            index_path = os.path.join(weight_path, index_files[0])
+            print(f"Loading sharded safetensors from: {index_path}")
+            with open(index_path, "r") as f:
+                index = json.load(f)
+            
+            state_dict = {}
+            shard_files = set(index["weight_map"].values())
+            for shard_file in sorted(shard_files):
+                print(f"  Loading shard: {shard_file}")
+                shard_state = load_file(os.path.join(weight_path, shard_file))
+                state_dict.update({k: v.to("cpu") for k, v in shard_state.items()})
+            
+            print(f"  Total loaded keys: {len(state_dict)}")
+            return state_dict, weight_path
+        
+        # Check for single safetensors file
+        safetensors_files = [f for f in os.listdir(weight_path) if f.endswith('.safetensors') 
+                            and 'phantom' in f.lower() and 'vae' not in f.lower()]
+        if not safetensors_files:
+            safetensors_files = [f for f in os.listdir(weight_path) 
+                                if f.endswith('.safetensors') and 'vae' not in f.lower()]
+        
+        if safetensors_files:
+            file_path = os.path.join(weight_path, safetensors_files[0])
+            print(f"Loading phantom weights from: {file_path}")
+            state_dict = load_file(file_path)
+            return {k: v.to("cpu") for k, v in state_dict.items()}, file_path
+        
+        # Check for .pth file
+        pth_files = [f for f in os.listdir(weight_path) if f.endswith('.pth') 
+                    and 'phantom' in f.lower() and 'vae' not in f.lower()]
+        if not pth_files:
+            pth_files = [f for f in os.listdir(weight_path) 
+                        if f.endswith('.pth') and 'vae' not in f.lower()]
+        if not pth_files:
+            pth_files = [f for f in os.listdir(weight_path) if f.endswith('.pth')]
+        
+        if pth_files:
+            file_path = os.path.join(weight_path, pth_files[0])
+            print(f"Loading phantom weights from: {file_path}")
+            state_dict = torch.load(file_path, map_location="cpu")
+            return state_dict.get("state_dict", state_dict), file_path
+        
+        return None, None
+    
+    # Helper function to apply phantom weights to model
+    def apply_phantom_weights(state_dict, source_path):
+        """Apply phantom weights to transformer model with validation"""
+        trainable_module_names = set(args.trainable_modules + args.trainable_modules_low_learning_rate)
+        model_keys = set(transformer3d.state_dict().keys())
+        phantom_keys = set(state_dict.keys())
+        
+        # Handle 'module.' prefix for DDP/DeepSpeed/FSDP
+        needs_module_prefix = any(k.startswith('module.') for k in model_keys)
+        has_module_prefix = any(k.startswith('module.') for k in phantom_keys)
+        
+        if needs_module_prefix and not has_module_prefix:
+            print(f"Adding 'module.' prefix for DDP/DeepSpeed/FSDP compatibility")
+            state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+            phantom_keys = set(state_dict.keys())
+        
+        m, u = transformer3d.load_state_dict(state_dict, strict=False)
+        
+        # Print summary
+        print(f"\n{'='*60}")
+        print(f"Phantom weight loading summary:")
+        print(f"  - Source: {source_path}")
+        print(f"  - Phantom parameters: {len(state_dict)} keys")
+        print(f"  - Model parameters: {len(model_keys)} keys")
+        print(f"  - Successfully loaded: {len(phantom_keys & model_keys)} keys")
+        print(f"  - Missing keys: {len(m)}")
+        print(f"  - Unexpected keys: {len(u)}")
+        
+        if len(u) > 0:
+            print(f"\n  Sample unexpected keys: {list(u)[:3]}")
+            print(f"  Sample model keys: {list(model_keys)[:3]}")
+        
+        # Validate trainable modules
+        loaded_trainable = [k for k in phantom_keys if any(mod in k for mod in trainable_module_names)]
+        matched_trainable = [k for k in loaded_trainable if k in model_keys]
+        print(f"\n  - Trainable modules in phantom: {len(loaded_trainable)}")
+        print(f"  - Trainable modules matched: {len(matched_trainable)}")
+        if matched_trainable:
+            print(f"    Examples: {matched_trainable[:3]}")
+        print(f"{'='*60}\n")
+    
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
-        if not args.resume_from_checkpoint.endswith("latest"):
-            # Check if it's a file or directory
-            if os.path.isfile(args.resume_from_checkpoint):
-                # Direct file path provided
-                if args.resume_from_checkpoint.endswith('.pth'):
-                    pth_files = [os.path.basename(args.resume_from_checkpoint)]
-                    args.resume_from_checkpoint = os.path.dirname(args.resume_from_checkpoint)
-                elif args.resume_from_checkpoint.endswith('.safetensors'):
-                    pth_files = [os.path.basename(args.resume_from_checkpoint)]
-                    args.resume_from_checkpoint = os.path.dirname(args.resume_from_checkpoint)
-                else:
-                    raise ValueError(f"No phantom weights found in {args.resume_from_checkpoint}")
+        # Check if it's a training checkpoint keyword or path
+        is_training_checkpoint = (
+            args.resume_from_checkpoint == "latest" or
+            args.resume_from_checkpoint.startswith("checkpoint-") or
+            (os.path.isdir(args.resume_from_checkpoint) and 
+             os.path.basename(args.resume_from_checkpoint).startswith("checkpoint-"))
+        )
+        
+        if is_training_checkpoint:
+            # It's a training checkpoint - handle "latest" or specific checkpoint path
+            if args.resume_from_checkpoint == "latest":
+                dirs = os.listdir(args.output_dir)
+                dirs = [d for d in dirs if d.startswith("checkpoint")]
+                dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+                path = dirs[-1] if len(dirs) > 0 else None
             else:
-                # Directory path provided - search for .pth files
-                all_pth_files = [f for f in os.listdir(args.resume_from_checkpoint) if f.endswith('.pth')]
-                # Prioritize files with 'phantom' in the name, exclude VAE files
-                pth_files = [f for f in all_pth_files if 'phantom' in f.lower() and 'vae' not in f.lower()]
-                if not pth_files:
-                    # Fallback to any .pth file that's not VAE
-                    pth_files = [f for f in all_pth_files if 'vae' not in f.lower()]
-                if not pth_files:
-                    raise ValueError(f"No phantom weights found in {args.resume_from_checkpoint}")
+                path = os.path.basename(args.resume_from_checkpoint)
             
-            if pth_files:
-                # Load phantom transformer weights
-                phantom_weight_path = os.path.join(args.resume_from_checkpoint, pth_files[0])
-                print(f"Loading phantom transformer weights from: {phantom_weight_path}")
-                state_dict = torch.load(phantom_weight_path, map_location="cpu")
-                state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
-                
-                # Get trainable module names for validation
-                trainable_module_names = set(args.trainable_modules + args.trainable_modules_low_learning_rate)
-                
-                # Get current model's parameter names
-                model_keys = set(transformer3d.state_dict().keys())
-                phantom_keys = set(state_dict.keys())
-                
-                # Check if we need to add 'module.' prefix (when using DDP/DeepSpeed/FSDP)
-                # Only add prefix if model has 'module.' prefix AND phantom doesn't
-                needs_module_prefix = any(k.startswith('module.') for k in model_keys)
-                has_module_prefix = any(k.startswith('module.') for k in phantom_keys)
-                
-                if needs_module_prefix and not has_module_prefix:
-                    print(f"Adding 'module.' prefix to phantom weights for DDP/DeepSpeed/FSDP compatibility")
-                    state_dict = {f'module.{k}': v for k, v in state_dict.items()}
-                    phantom_keys = set(state_dict.keys())
-                
-                m, u = transformer3d.load_state_dict(state_dict, strict=False)
-                print(f"\n{'='*60}")
-                print(f"Phantom weight loading summary:")
-                print(f"  - Phantom file parameters: {len(state_dict)} keys")
-                print(f"  - Current model parameters: {len(model_keys)} keys")
-                print(f"  - Successfully loaded: {len(phantom_keys & model_keys)} keys")
-                print(f"  - Missing keys: {len(m)} (in model but not in phantom)")
-                print(f"  - Unexpected keys: {len(u)} (in phantom but not in model)")
-                
-                # Show some examples of key differences
-                if len(u) > 0:
-                    print(f"\n  Examples of unexpected keys:")
-                    for i, key in enumerate(list(u)[:5]):
-                        print(f"    - {key}")
-                    print(f"\n  Examples of current model keys:")
-                    for i, key in enumerate(list(model_keys)[:5]):
-                        print(f"    - {key}")
-                
-                # Check if trainable modules are in loaded state_dict
-                loaded_trainable = [k for k in state_dict.keys() if any(mod in k for mod in trainable_module_names)]
-                matched_trainable = [k for k in loaded_trainable if k in model_keys]
-                print(f"\n  - Trainable modules in phantom: {len(loaded_trainable)} parameters")
-                print(f"  - Trainable modules matched: {len(matched_trainable)} parameters")
-                if len(matched_trainable) > 0:
-                    print(f"    Examples: {matched_trainable[:3]}")
-                print(f"{'='*60}\n")
-                
-                initial_global_step = 0
-            else:
-                # It's a training checkpoint directory, handle normally
-                if args.resume_from_checkpoint != "latest":
-                    path = os.path.basename(args.resume_from_checkpoint)
-                else:
-                    # Get the most recent checkpoint
-                    dirs = os.listdir(args.output_dir)
-                    dirs = [d for d in dirs if d.startswith("checkpoint")]
-                    dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-                    path = dirs[-1] if len(dirs) > 0 else None
-
-                if path is None:
-                    accelerator.print(
-                        f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
-                    )
-                    args.resume_from_checkpoint = None
-                    initial_global_step = 0
-                else:
-                    global_step = int(path.split("-")[1])
-                    initial_global_step = global_step
-
-                    pkl_path = os.path.join(os.path.join(args.output_dir, path), "sampler_pos_start.pkl")
-                    if os.path.exists(pkl_path):
-                        with open(pkl_path, 'rb') as file:
-                            _, first_epoch = pickle.load(file)
-                    else:
-                        first_epoch = global_step // num_update_steps_per_epoch
-                    print(f"Load pkl from {pkl_path}. Get first_epoch = {first_epoch}.")
-
-                    accelerator.print(f"Resuming from checkpoint {path}")
-                    accelerator.load_state(os.path.join(args.output_dir, path))
-        elif args.resume_from_checkpoint == "latest":
-            # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
-
             if path is None:
                 accelerator.print(
                     f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
@@ -1798,19 +1874,31 @@ def main():
             else:
                 global_step = int(path.split("-")[1])
                 initial_global_step = global_step
-
-                pkl_path = os.path.join(os.path.join(args.output_dir, path), "sampler_pos_start.pkl")
+                
+                pkl_path = os.path.join(args.output_dir, path, "sampler_pos_start.pkl")
                 if os.path.exists(pkl_path):
                     with open(pkl_path, 'rb') as file:
                         _, first_epoch = pickle.load(file)
                 else:
                     first_epoch = global_step // num_update_steps_per_epoch
                 print(f"Load pkl from {pkl_path}. Get first_epoch = {first_epoch}.")
-
+                
                 accelerator.print(f"Resuming from checkpoint {path}")
                 accelerator.load_state(os.path.join(args.output_dir, path))
         else:
-            initial_global_step = 0
+            # Try to load phantom weights
+            state_dict, source_path = load_phantom_weights(args.resume_from_checkpoint)
+            
+            if state_dict is not None:
+                # It's a phantom weight file/directory
+                apply_phantom_weights(state_dict, source_path)
+                initial_global_step = 0
+            else:
+                accelerator.print(
+                    f"Could not load phantom weights from '{args.resume_from_checkpoint}'. Starting a new training run."
+                )
+                args.resume_from_checkpoint = None
+                initial_global_step = 0
     else:
         initial_global_step = 0
 
@@ -2366,7 +2454,7 @@ def main():
                             logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")
 
                             # test vae encode and decode
-                            if global_step <= 1:
+                            if global_step <= 500:
                                 vae_decoder = vae.eval()
                                 # Ensure VAE is on the same device as latents for decoding
                                 if args.low_vram:

@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=1B3-256p         
+#SBATCH --job-name=14B-256p         
 #SBATCH --nodes=1
-#SBATCH --gpus=2
+#SBATCH --gpus=4
 #SBATCH --time=60:00:00          # total run time limit (HH:MM:SS)
-#SBATCH --partition=preempt
+#SBATCH --partition=normal
 #SBATCH --account=liuyuan
 
-export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-T2V-1.3B"
+export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-T2V-14B"
 export DATASET_NAME="datasets/TexVerse10k"
 export DATASET_META_NAME="$DATASET_NAME/train.json"
 # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
@@ -23,12 +23,12 @@ conda activate ref
 cd /project/liuyuan/zekai/code/multiref2
 
 LEARNING_RATE=1e-04
-BATCH_SIZE=8
+BATCH_SIZE=2
 MAX_TRAIN_STEPS=10000
-CHECKPOINTING_STEPS=500
-RESUME_FROM_CHECKPOINT="models/Personalized_Model/phantom-1.3B"
+CHECKPOINTING_STEPS=1000
+RESUME_FROM_CHECKPOINT="models/Personalized_Model/phantom-14B/"
 
-OUTPUT_DIR="ckpts/1024_phantom1B3_tex10k_lr${LEARNING_RATE}_fullattn_10ksteps"
+OUTPUT_DIR="ckpts/1024_phantom14B_tex10k_lr${LEARNING_RATE}_selfattn"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="A stylized 3D model of a revolver-style handgun."
@@ -41,7 +41,7 @@ VALIDATION_SIZE="256 448 49"  # height width frames
 ## deepspeed zero2
 # accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.1/train_phantom.py \
 
-accelerate launch scripts/wan2.1/train_phantom.py \
+accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.1/train_phantom.py \
   --config_path="config/wan2.1/wan_civitai.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
@@ -49,10 +49,10 @@ accelerate launch scripts/wan2.1/train_phantom.py \
   --image_sample_size=512 \
   --video_sample_size=256 \
   --video_sample_stride=1 \
-  --video_sample_n_frames=49 \
+  --video_sample_n_frames=121 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=0 \
-  --dataloader_num_workers=32 \
+  --dataloader_num_workers=16 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
   --checkpoints_total_limit=3 \
@@ -74,14 +74,14 @@ accelerate launch scripts/wan2.1/train_phantom.py \
   --uniform_sampling \
   --boundary_type="full" \
   --train_mode="normal" \
-  --trainable_modules '.' \
+  --trainable_modules 'self_attn' \
   --report_model_info \
   --report_to="wandb" \
-  --tracker_project_name="phantom_1B3-256p" \
+  --tracker_project_name="phantom_14B-256p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
-  # --low_vram \
-  # --gradient_accumulation_steps=4 \
+  --low_vram \
+  --gradient_accumulation_steps=2 \
   # --enable_profiler \
   # --random_hw_adapt \
   # --video_token_length=49 \
