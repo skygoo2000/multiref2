@@ -23,6 +23,7 @@ import os
 import pickle
 import shutil
 import sys
+import glob
 
 import accelerate
 import diffusers
@@ -79,7 +80,8 @@ from videox_fun.data.dataset_image_video import (ImageVideoRefDataset,
 from videox_fun.models import (AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel, Wan2_1RefTransformer3DModel)
 from videox_fun.pipeline import WanFunPhantomPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
-from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
+from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid, get_image_latent
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -168,7 +170,7 @@ check_min_version("0.18.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
-def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, accelerator, weight_dtype, global_step):
+def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, accelerator, weight_dtype, global_step, num_ref_frames_in_vid=4):
     
     logger.info("Running validation... ")
 
@@ -264,6 +266,91 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
         for i in range(len(args.validation_prompts)):
             with torch.no_grad():
                 os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+
+                # Load validation reference if provided
+                validation_ref = None
+                if args.validation_ref_path is not None:
+                    
+                    ref_path = args.validation_ref_path
+                    logger.info(f"Loading validation reference from: {ref_path}")
+                    
+                    # Check if ref_path is a directory
+                    if os.path.isdir(ref_path):
+                        # Load all images from directory
+                        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+                        image_files = []
+                        for ext in image_extensions:
+                            image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext}')))
+                            image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext.upper()}')))
+                        
+                        if len(image_files) == 0:
+                            logger.warning(f"No image files found in directory: {ref_path}")
+                            validation_ref = None
+                        else:
+                            logger.info(f"Found {len(image_files)} images in directory")
+                            
+                            ref_list = []
+                            sample_size = [val_height, val_width]
+                            for img_path in image_files:
+                                # Use get_image_latent to process (returns [1, C, 1, H, W])
+                                frame_latent = get_image_latent(ref_image=img_path, sample_size=sample_size, padding=True)
+                                ref_list.append(frame_latent)
+                            
+                            # Concatenate all frames: list of [1, C, 1, H, W] -> [1, C, F, H, W]
+                            validation_ref = torch.cat(ref_list, dim=2)
+                            logger.info(f"Loaded reference from directory with {len(image_files)} frames, shape: {validation_ref.shape}")
+                            
+                            # Save validation reference as gif
+                            os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
+                            save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                    else:
+                        # Check if ref is image or video by extension
+                        ref_ext = ref_path.lower().split('.')[-1]
+                        if ref_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
+                            # Load as image using get_image_latent
+                            sample_size = [val_height, val_width]
+                            validation_ref = get_image_latent(ref_image=ref_path, sample_size=sample_size, padding=True)
+                            # validation_ref is [1, C, 1, H, W] from get_image_latent
+                            logger.info(f"Loaded reference image with shape: {validation_ref.shape}")
+                            
+                            # Save validation reference image as gif (single frame)
+                            os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
+                            save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                        else:
+                            # Load as video
+                            try:
+                                vr = VideoReader(ref_path)
+                                total_frames = len(vr)
+                                
+                                if total_frames <= num_ref_frames_in_vid:
+                                    frame_indices = list(range(total_frames))
+                                else:
+                                    frame_indices = np.linspace(0, total_frames - 1, num_ref_frames_in_vid, dtype=int).tolist()
+                                
+                                ref_list = []
+                                sample_size = [val_height, val_width]
+                                for idx in frame_indices:
+                                    frame = vr[idx].asnumpy()
+                                    frame_pil = Image.fromarray(frame)
+                                    
+                                    # Use get_image_latent to process (returns [1, C, 1, H, W])
+                                    frame_latent = get_image_latent(ref_image=frame_pil, sample_size=sample_size, padding=True)
+                                    # Squeeze the frame dimension: [1, C, 1, H, W] -> [1, C, H, W]
+                                    frame_latent = frame_latent.squeeze(2)
+                                    ref_list.append(frame_latent)
+                                
+                                # Concatenate all frames: list of [1, C, H, W] -> [1, C, F, H, W]
+                                validation_ref = torch.cat([f.unsqueeze(2) for f in ref_list], dim=2)
+                                logger.info(f"Loaded reference video with {len(frame_indices)} sampled frames, shape: {validation_ref.shape}")
+                                
+                                # Save validation reference as gif
+                                os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+                                # save_videos_grid expects torch.Tensor input
+                                save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                                
+                            except Exception as e:
+                                logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
+                                validation_ref = None
                 
                 # Generate with reference if provided
                 if validation_ref is not None:
@@ -271,7 +358,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     sample_with_ref = pipeline(
                         args.validation_prompts[i],
                         num_frames = val_frames,
-                        negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量", 
+                        negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走", 
                         height      = val_height,
                         width       = val_width,
                         generator   = generator,
@@ -289,18 +376,14 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     sample_frames = sample_with_ref.shape[2]
                     
                     if ref_frames != sample_frames:
-                        if sample_frames < ref_frames:
-                            # Repeat last frame to match reference length
-                            last_frame = sample_with_ref[:, :, -1:, :, :] 
-                            repeat_count = ref_frames - sample_frames
-                            repeated_frames = last_frame.repeat(1, 1, repeat_count, 1, 1)
-                            sample_with_ref = torch.cat([sample_with_ref, repeated_frames], dim=2)
-                        else:
-                            # Repeat last frame to match sample length
-                            last_frame = validation_ref[:, :, -1:, :, :] 
-                            repeat_count = sample_frames - ref_frames
-                            repeated_frames = last_frame.repeat(1, 1, repeat_count, 1, 1)
-                            validation_ref = torch.cat([validation_ref, repeated_frames], dim=2)
+                        B, C, F_ref, H, W = validation_ref.shape
+                        validation_ref_reshaped = validation_ref.view(B * C, 1, F_ref, H * W)
+                        validation_ref_interpolated = torch.nn.functional.interpolate(
+                            validation_ref_reshaped,
+                            size=(sample_frames, H * W),
+                            mode='nearest'
+                        )
+                        validation_ref = validation_ref_interpolated.view(B, C, sample_frames, H, W)
                     
                     # spatial mismatch
                     ref_h, ref_w = validation_ref.shape[3], validation_ref.shape[4]
@@ -672,9 +755,6 @@ def parse_args():
     )
     parser.add_argument(
         "--training_with_video_token_length", action="store_true", help="The training stage of the model in training.",
-    )
-    parser.add_argument(
-        "--auto_tile_batch_size", action="store_true", help="Whether to auto tile batch size.",
     )
     parser.add_argument(
         "--motion_sub_loss", action="store_true", help="Whether enable motion sub loss."
@@ -1454,7 +1534,7 @@ def main():
                         resize_size = int(h * closest_size[1] / w), closest_size[1]
                     
                     transform = transforms.Compose([
-                        transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.BILINEAR),  # Image.BICUBIC
+                        transforms.Resize(resize_size),
                         transforms.CenterCrop(closest_size),
                         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
                     ])
@@ -1462,8 +1542,14 @@ def main():
                 new_examples["text"].append(example["text"])
                 
                 # Process ref_pixel_values
-                ref_pixel_values = torch.from_numpy(example["ref_pixel_values"]).permute(0, 3, 1, 2).contiguous()
-                ref_pixel_values = ref_pixel_values / 255.
+                ref_pixel_values = example["ref_pixel_values"]
+                if isinstance(ref_pixel_values, np.ndarray):
+                    ref_pixel_values = torch.from_numpy(ref_pixel_values).permute(0, 3, 1, 2).contiguous()
+                    ref_pixel_values = ref_pixel_values / 255.
+                elif isinstance(ref_pixel_values, torch.Tensor):
+                    if ref_pixel_values.dtype == torch.uint8:
+                        ref_pixel_values = ref_pixel_values.float() / 255.
+                
                 new_examples["ref_pixel_values"].append(transform(ref_pixel_values))
 
                 batch_video_length = int(min(batch_video_length, len(pixel_values)))
@@ -1676,11 +1762,23 @@ def main():
 
     # Helper function to load phantom weights (supports .pth, .safetensors, and sharded safetensors)
     def load_phantom_weights(weight_path):
-        """Load phantom weights from file or directory"""
+        """Load phantom weights from file or directory
+        
+        Supports:
+        1. Direct file paths: 
+           - .pth files (e.g., "models/phantom-1.3B/Phantom-Wan-1.3B.pth")
+           - .safetensors files
+           - .safetensors.index.json files (for sharded models)
+        2. Directory paths:
+           - Automatically finds and loads phantom weights from directory
+           - Equivalent to specifying the exact file path
+        """
         from safetensors.torch import load_file
         import json
         
-        # Direct file path
+        print(f"Attempting to load phantom weights from: {weight_path}")
+        
+        # Direct file
         if os.path.isfile(weight_path):
             if weight_path.endswith('.pth'):
                 print(f"Loading phantom weights from .pth file: {weight_path}")
@@ -1690,13 +1788,28 @@ def main():
                 print(f"Loading phantom weights from .safetensors file: {weight_path}")
                 state_dict = load_file(weight_path)
                 return {k: v.to("cpu") for k, v in state_dict.items()}, weight_path
+            elif weight_path.endswith('.safetensors.index.json'):
+                # Handle sharded safetensors index file directly
+                print(f"Loading sharded safetensors from index file: {weight_path}")
+                with open(weight_path, "r") as f:
+                    index = json.load(f)
+                
+                state_dict = {}
+                shard_files = set(index["weight_map"].values())
+                base_dir = os.path.dirname(weight_path)
+                for shard_file in sorted(shard_files):
+                    print(f"  Loading shard: {shard_file}")
+                    shard_state = load_file(os.path.join(base_dir, shard_file))
+                    state_dict.update({k: v.to("cpu") for k, v in shard_state.items()})
+                
+                print(f"  Total loaded keys: {len(state_dict)}")
+                return state_dict, weight_path
             else:
-                print(f"Warning: Unsupported file format: {weight_path}")
-                return None, None
+                raise ValueError(f"Unsupported file format: {weight_path}")
         
         # Directory path
         if not os.path.isdir(weight_path):
-            return None, None
+            raise ValueError(f"Weight path is not a directory: {weight_path}")
         
         # Check for sharded safetensors (Phantom-14B style)
         index_files = [f for f in os.listdir(weight_path) if f.endswith('.safetensors.index.json')]
@@ -1789,14 +1902,15 @@ def main():
     
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
-        # Try to load phantom weights
-        state_dict, source_path = load_phantom_weights(args.resume_from_checkpoint)
+        # Check if it's a training checkpoint keyword or path
+        is_training_checkpoint = (
+            args.resume_from_checkpoint == "latest" or
+            args.resume_from_checkpoint.startswith("checkpoint-") or
+            (os.path.isdir(args.resume_from_checkpoint) and 
+             os.path.basename(args.resume_from_checkpoint).startswith("checkpoint-"))
+        )
         
-        if state_dict is not None:
-            # It's a phantom weight file/directory
-            apply_phantom_weights(state_dict, source_path)
-            initial_global_step = 0
-        else:
+        if is_training_checkpoint:
             # It's a training checkpoint - handle "latest" or specific checkpoint path
             if args.resume_from_checkpoint == "latest":
                 dirs = os.listdir(args.output_dir)
@@ -1826,6 +1940,20 @@ def main():
                 
                 accelerator.print(f"Resuming from checkpoint {path}")
                 accelerator.load_state(os.path.join(args.output_dir, path))
+        else:
+            # Try to load phantom weights
+            state_dict, source_path = load_phantom_weights(args.resume_from_checkpoint)
+            
+            if state_dict is not None:
+                # It's a phantom weight file/directory
+                apply_phantom_weights(state_dict, source_path)
+                initial_global_step = 0
+            else:
+                accelerator.print(
+                    f"Could not load phantom weights from '{args.resume_from_checkpoint}'. Starting a new training run."
+                )
+                args.resume_from_checkpoint = None
+                initial_global_step = 0
     else:
         initial_global_step = 0
 
@@ -1913,6 +2041,36 @@ def main():
                 f'memory/max_allocated/{step_name}_gb': max_memory_allocated
             }, step=global_step)
 
+    # Run validation before training starts
+    if global_step == 0 and args.validation_prompts is not None and not args.use_fsdp:
+        if accelerator.is_main_process:
+            logger.info(f"Running initial validation at step 0...")
+            
+            if args.use_ema:
+                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                ema_transformer3d.store(transformer3d.parameters())
+                ema_transformer3d.copy_to(transformer3d.parameters())
+            
+            log_validation(
+                vae,
+                text_encoder,
+                tokenizer,
+                transformer3d,
+                args,
+                config,
+                accelerator,
+                weight_dtype,
+                global_step,
+            )
+            transformer3d.train()
+
+            if args.use_ema:
+                # Switch back to the original transformer3d parameters.
+                ema_transformer3d.restore(transformer3d.parameters())
+        
+        logger.info(f"[Rank {accelerator.process_index}] Syncing after initial validation...")
+        accelerator.wait_for_everyone()
+    
     # Use profiler as context manager if enabled
     profiler_context = profiler if profiler is not None else nullcontext()
     
@@ -1952,37 +2110,10 @@ def main():
                     
                     # Log memory after data loading
                     log_memory_usage("2_data_loaded", global_step)
-
-                    # Increase the batch size when the length of the latent sequence of the current sample is small
-                    if args.auto_tile_batch_size and args.training_with_video_token_length and zero_stage != 3:
-                        if args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 16 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                            pixel_values = torch.tile(pixel_values, (4, 1, 1, 1, 1))
-                            ref_pixel_values = torch.tile(ref_pixel_values, (4, 1, 1, 1, 1))
-                            if args.enable_text_encoder_in_dataloader:
-                                batch['encoder_hidden_states'] = torch.tile(batch['encoder_hidden_states'], (4, 1, 1))
-                                batch['encoder_attention_mask'] = torch.tile(batch['encoder_attention_mask'], (4, 1))
-                            else:
-                                batch['text'] = batch['text'] * 4
-                        elif args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 4 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                            pixel_values = torch.tile(pixel_values, (2, 1, 1, 1, 1))
-                            ref_pixel_values = torch.tile(ref_pixel_values, (2, 1, 1, 1, 1))
-                            if args.enable_text_encoder_in_dataloader:
-                                batch['encoder_hidden_states'] = torch.tile(batch['encoder_hidden_states'], (2, 1, 1))
-                                batch['encoder_attention_mask'] = torch.tile(batch['encoder_attention_mask'], (2, 1))
-                            else:
-                                batch['text'] = batch['text'] * 2
                     
                     if args.train_mode != "normal":
                         mask_pixel_values = batch["mask_pixel_values"].to(weight_dtype)
                         mask = batch["mask"].to(weight_dtype)
-                        # Increase the batch size when the length of the latent sequence of the current sample is small
-                        if args.auto_tile_batch_size and args.training_with_video_token_length and zero_stage != 3:
-                            if args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 16 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                                mask_pixel_values = torch.tile(mask_pixel_values, (4, 1, 1, 1, 1))
-                                mask = torch.tile(mask, (4, 1, 1, 1, 1))
-                            elif args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 4 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
-                                mask_pixel_values = torch.tile(mask_pixel_values, (2, 1, 1, 1, 1))
-                                mask = torch.tile(mask, (2, 1, 1, 1, 1))
 
                     if args.random_frame_crop:
                         def _create_special_list(length):
@@ -2071,6 +2202,22 @@ def main():
                                 new_pixel_values.append(pixel_values_bs)
                             return torch.cat(new_pixel_values, dim = 0)
                         
+                        def _batch_encode_vae_ref(ref_pixel_values):
+                            ref_pixel_values = rearrange(ref_pixel_values, "b f c h w -> b c f h w")
+                            bs = args.vae_mini_batch
+                            new_ref_latents = []
+                            for i in range(0, ref_pixel_values.shape[0], bs):
+                                ref_pixel_values_bs = ref_pixel_values[i : i + bs]
+                                ref_latents_list = []
+                                for frame_idx in range(ref_pixel_values_bs.shape[2]):
+                                    single_frame = ref_pixel_values_bs[:, :, frame_idx:frame_idx+1, :, :]
+                                    frame_latent = vae.encode(single_frame)[0]
+                                    frame_latent = frame_latent.sample()
+                                    ref_latents_list.append(frame_latent)
+                                ref_latents_bs = torch.cat(ref_latents_list, dim=2)
+                                new_ref_latents.append(ref_latents_bs)
+                            return torch.cat(new_ref_latents, dim = 0)
+                        
                         # Encode main latents
                         with conditional_record_function("vae_encode_main"):
                             if vae_stream_1 is not None:
@@ -2084,7 +2231,7 @@ def main():
                         
                         # Encode ref latents
                         with conditional_record_function("vae_encode_ref"):
-                            ref_latents = _batch_encode_vae(ref_pixel_values)
+                            ref_latents = _batch_encode_vae_ref(ref_pixel_values)
                         
                         log_memory_usage("4_vae_encode_ref", global_step)
 
@@ -2356,13 +2503,13 @@ def main():
                             accelerator.save_state(save_path)
                             logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompts is not None and (global_step % args.validation_steps == 0 or global_step == 1) and not args.use_fsdp:
+                    if args.validation_prompts is not None and global_step % args.validation_steps == 0 and not args.use_fsdp:
     
                         if accelerator.is_main_process:
                             logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")
 
                             # test vae encode and decode
-                            if global_step <= 1:
+                            if global_step <= 500:
                                 vae_decoder = vae.eval()
                                 # Ensure VAE is on the same device as latents for decoding
                                 if args.low_vram:

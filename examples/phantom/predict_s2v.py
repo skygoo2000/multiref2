@@ -119,58 +119,55 @@ negative_prompt         = "色调艳丽，过曝，静态，细节模糊不清�
 # Adding words such as "quiet, solid" to the neg prompt can increase dynamism.
 # prompt                  = "A young woman with beautiful, clear eyes and blonde hair stands in the forest, wearing a white dress and a crown. Her expression is serene, reminiscent of a movie star, with fair and youthful skin. Her brown long hair flows in the wind. The video quality is very high, with a clear view. High quality, masterpiece, best quality, high resolution, ultra-fine, fantastical."
 # negative_prompt         = "Twisted body, limb deformities, text captions, comic, static, ugly, error, messy code."
-guidance_scale          = 5
-seed                    = 43
+guidance_scale          = 6.0
+seed                    = 42
 num_inference_steps     = 50
 lora_weight             = 0.55
-save_path               = "samples/phantom1.3b/original/t0gap1"
+save_path               = "samples/phantom1.3b/original"
 
 def get_video_frames_as_latent(video_path, sample_size, padding=False, max_frames=None):
     """
     Extract frames from a video file and convert to latent format.
+    Randomly and uniformly samples 4 frames from the video.
     
     Args:
         video_path: Path to video file
         sample_size: [height, width] target size
         padding: Whether to pad the frames
-        max_frames: Maximum number of frames to extract (None = all frames)
+        max_frames: Maximum number of frames to extract (deprecated, always samples 4 frames)
     
     Returns:
         torch.Tensor: Video frames in format [1, C, F, H, W]
     """
-    cap = cv2.VideoCapture(video_path)
-    frames = []
+    from decord import VideoReader
     
-    frame_count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    vr = VideoReader(video_path)
+    total_frames = len(vr)
+    
+    # Randomly and uniformly sample 4 frames
+    num_sample_frames = 4
+    if total_frames <= num_sample_frames:
+        # If video has 4 or fewer frames, use all frames
+        frame_indices = list(range(total_frames))
+    else:
+        # Uniformly sample 4 frames
+        frame_indices = np.linspace(0, total_frames - 1, num_sample_frames, dtype=int).tolist()
+    
+    # Process each sampled frame using get_image_latent
+    ref_list = []
+    for idx in frame_indices:
+        frame = vr[idx].asnumpy()
+        # Convert to PIL Image
+        frame_pil = Image.fromarray(frame)
         
-        if max_frames is not None and frame_count >= max_frames:
-            break
-            
-        # Convert BGR to RGB
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = Image.fromarray(frame)
-        
-        # Resize with padding if needed
-        if padding:
-            from videox_fun.utils.utils import padding_image
-            frame = padding_image(frame, sample_size[1], sample_size[0])
-        frame = frame.resize((sample_size[1], sample_size[0]))
-        
-        frames.append(frame)
-        frame_count += 1
+        # Use get_image_latent to process (returns [1, C, 1, H, W])
+        frame_latent = get_image_latent(ref_image=frame_pil, sample_size=sample_size, padding=padding)
+        # Squeeze the frame dimension: [1, C, 1, H, W] -> [1, C, H, W]
+        frame_latent = frame_latent.squeeze(2)
+        ref_list.append(frame_latent)
     
-    cap.release()
-    
-    if not frames:
-        raise ValueError(f"No frames extracted from video: {video_path}")
-    
-    # Convert to tensor format [1, C, F, H, W]
-    frames_array = np.stack([np.array(frame) for frame in frames], axis=0)  # [F, H, W, C]
-    frames_tensor = torch.from_numpy(frames_array).permute(3, 0, 1, 2).unsqueeze(0) / 255.0  # [1, C, F, H, W]
+    # Concatenate all frames: list of [1, C, H, W] -> [1, C, F, H, W]
+    frames_tensor = torch.cat([f.unsqueeze(2) for f in ref_list], dim=2)
     
     return frames_tensor
 

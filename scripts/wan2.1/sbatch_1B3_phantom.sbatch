@@ -1,15 +1,17 @@
 #!/bin/bash
 #SBATCH --job-name=1B3-256p         
 #SBATCH --nodes=1
-#SBATCH --gpus=4
-#SBATCH --time=48:00:00          # total run time limit (HH:MM:SS)
+#SBATCH --gpus=2
+#SBATCH --time=60:00:00          # total run time limit (HH:MM:SS)
 #SBATCH --partition=preempt
 #SBATCH --account=liuyuan
 
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-T2V-1.3B"
-export DATASET_NAME="datasets"
-export DATASET_META_NAME="$DATASET_NAME/train_vid.json"
-
+export DATASET_NAME="datasets/TexVerse10k"
+export DATASET_META_NAME="$DATASET_NAME/train.json"
+# NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
+# export NCCL_IB_DISABLE=1
+# export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
 export PYTHONWARNINGS="ignore::FutureWarning"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -21,17 +23,22 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export NCCL_IB_TIMEOUT=300
 # export NCCL_IB_RETRY_CNT=10
 
-LEARNING_RATE=2e-05
-BATCH_SIZE=6
-MAX_TRAIN_STEPS=5000
+source /project/liuyuan/zekai/miniconda3/etc/profile.d/conda.sh
+conda activate ref
+
+cd /project/liuyuan/zekai/code/multiref2
+
+LEARNING_RATE=1e-04
+BATCH_SIZE=8
+MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=500
 RESUME_FROM_CHECKPOINT="models/Personalized_Model/phantom-1.3B/Phantom-Wan-1.3B.pth"
 
-OUTPUT_DIR="ckpts/1015_phantom1B3_vid15k_lr${LEARNING_RATE}_t0_gap1_selfattn"
+OUTPUT_DIR="ckpts/1024_phantom1B3_tex10k_lr${LEARNING_RATE}_fullattn_10ksteps"
 
 VALIDATION_STEPS=200
-VALIDATION_PROMPTS="this object is on the center of the table in a room"
-VALIDATION_REF_PATH="asset/ref_1.png"
+VALIDATION_PROMPTS="A stylized 3D model of a revolver-style handgun."
+VALIDATION_REF_PATH="$DATASET_NAME/ref/0a6e2f3307384866949359535c42552b"
 VALIDATION_SIZE="256 448 49"  # height width frames
 
 source /project/liuyuan/zekai/miniconda3/etc/profile.d/conda.sh
@@ -45,7 +52,7 @@ cd /project/liuyuan/zekai/code/multiref2
 ## deepspeed zero2
 # accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.1/train_phantom.py \
 
-accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/wan2.1/train_phantom.py \
+accelerate launch scripts/wan2.1/train_phantom.py \
   --config_path="config/wan2.1/wan_civitai.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
@@ -57,7 +64,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=0 \
-  --dataloader_num_workers=8 \
+  --dataloader_num_workers=32 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
   --checkpoints_total_limit=3 \
@@ -66,7 +73,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --validation_ref_path $VALIDATION_REF_PATH \
   --validation_size $VALIDATION_SIZE \
   --learning_rate=$LEARNING_RATE \
-  --lr_scheduler="constant_with_warmup" \
+  --lr_scheduler="cosine_with_restarts" \
   --lr_warmup_steps=100 \
   --seed=42 \
   --output_dir=$OUTPUT_DIR \
@@ -79,7 +86,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --uniform_sampling \
   --boundary_type="full" \
   --train_mode="normal" \
-  --trainable_modules 'self_attn' \
+  --trainable_modules '.' \
   --report_model_info \
   --report_to="wandb" \
   --tracker_project_name="phantom_1B3-256p" \
