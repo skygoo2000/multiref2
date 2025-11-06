@@ -224,8 +224,6 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                             image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext}')))
                             image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext.upper()}')))
                         
-                        image_files = sorted(image_files)  # Sort for consistent ordering
-                        
                         if len(image_files) == 0:
                             logger.warning(f"No image files found in directory: {ref_path}")
                             validation_ref = None
@@ -237,12 +235,10 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                             for img_path in image_files:
                                 # Use get_image_latent to process (returns [1, C, 1, H, W])
                                 frame_latent = get_image_latent(ref_image=img_path, sample_size=sample_size, padding=True)
-                                # Squeeze the frame dimension: [1, C, 1, H, W] -> [1, C, H, W]
-                                frame_latent = frame_latent.squeeze(2)
                                 ref_list.append(frame_latent)
                             
-                            # Concatenate all frames: list of [1, C, H, W] -> [1, C, F, H, W]
-                            validation_ref = torch.cat([f.unsqueeze(2) for f in ref_list], dim=2)
+                            # Concatenate all frames: list of [1, C, 1, H, W] -> [1, C, F, H, W]
+                            validation_ref = torch.cat(ref_list, dim=2)
                             logger.info(f"Loaded reference from directory with {len(image_files)} frames, shape: {validation_ref.shape}")
                             
                             # Save validation reference as gif

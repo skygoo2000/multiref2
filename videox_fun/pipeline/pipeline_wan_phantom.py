@@ -590,16 +590,23 @@ class WanFunPhantomPipeline(DiffusionPipeline):
             pbar.update(1)
 
         if subject_ref_images is not None:
-            # Encode subject_ref_images with VAE
-            # subject_ref_images: [B, C, F, H, W] or [B, C, H, W]
+            subject_ref_images = (subject_ref_images - 0.5) / 0.5
             with torch.no_grad():
-                # Batch encode with VAE
                 if subject_ref_images.dim() == 4:
-                    # Single frame case: [B, C, H, W] - add frame dimension
+                    # Single frame case: [B, C, H, W]
+                    B, C, H, W = subject_ref_images.shape
+                    # Encode with VAE - add frame dimension
                     subject_ref_images_latentes = self.vae.encode(subject_ref_images.unsqueeze(2).to(device=device, dtype=weight_dtype))[0].sample()
                 else:
                     # Multi-frame case: [B, C, F, H, W]
-                    subject_ref_images_latentes = self.vae.encode(subject_ref_images.to(device=device, dtype=weight_dtype))[0].sample()
+                    B, C, F, H, W = subject_ref_images.shape
+                    # Encode frame by frame with VAE
+                    encoded_frames = []
+                    for f in range(F):
+                        frame = subject_ref_images[:, :, f:f+1, :, :]  # [B, C, 1, H, W]
+                        encoded_frame = self.vae.encode(frame.to(device=device, dtype=weight_dtype))[0].sample()
+                        encoded_frames.append(encoded_frame)
+                    subject_ref_images_latentes = torch.cat(encoded_frames, dim=2)  # [B, C_latent, F, H_latent, W_latent]
 
         if comfyui_progressbar:
             pbar.update(1)
