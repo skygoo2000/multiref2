@@ -624,6 +624,7 @@ class Wan2_2MultiRefPipeline(DiffusionPipeline):
         ref_latents_neg = None
 
         if ref_video is not None:
+            ref_video = (ref_video - 0.5) / 0.5
             if len(ref_video.shape) == 4:  # Single image [B, C, H, W]
                 ref_video_length = 1
                 ref_video = ref_video.unsqueeze(2)  # Add frame dimension -> [B, C, 1, H, W]
