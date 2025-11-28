@@ -293,9 +293,78 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                                 logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
                                 validation_ref = None
                 
+                # Load validation mask if provided
+                validation_mask = None
+                if args.validation_mask_path is not None:
+                    mask_path = args.validation_mask_path
+                    logger.info(f"Loading validation mask from: {mask_path}")
+                    try:
+                        vr = VideoReader(mask_path)
+                        total_frames = len(vr)
+                        # Sample frames to match val_frames
+                        if total_frames <= val_frames:
+                            frame_indices = list(range(total_frames))
+                        else:
+                            frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
+                        
+                        mask_frames = []
+                        for idx in frame_indices:
+                            frame = vr[idx].asnumpy()
+                            frame_pil = Image.fromarray(frame)
+                            # Resize to validation size
+                            frame_pil = frame_pil.resize((val_width, val_height))
+                            mask_frames.append(np.array(frame_pil))
+                        
+                        # Stack to [F, H, W, C]
+                        validation_mask = np.stack(mask_frames, axis=0)
+                        # Convert to torch and normalize to [-1, 1]
+                        validation_mask = torch.from_numpy(validation_mask).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
+                        validation_mask = validation_mask * 2.0 - 1.0  # [0, 1] -> [-1, 1]
+                        validation_mask = validation_mask.unsqueeze(0)  # [1, F, C, H, W]
+                        logger.info(f"Loaded validation mask with shape: {validation_mask.shape}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load validation mask: {e}")
+                        validation_mask = None
+                
+                # Load validation fg if provided
+                validation_fg = None
+                if args.validation_fg_path is not None:
+                    fg_path = args.validation_fg_path
+                    logger.info(f"Loading validation fg from: {fg_path}")
+                    try:
+                        vr = VideoReader(fg_path)
+                        total_frames = len(vr)
+                        # Sample frames to match val_frames
+                        if total_frames <= val_frames:
+                            frame_indices = list(range(total_frames))
+                        else:
+                            frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
+                        
+                        fg_frames = []
+                        for idx in frame_indices:
+                            frame = vr[idx].asnumpy()
+                            frame_pil = Image.fromarray(frame)
+                            # Resize to validation size
+                            frame_pil = frame_pil.resize((val_width, val_height))
+                            fg_frames.append(np.array(frame_pil))
+                        
+                        # Stack to [F, H, W, C]
+                        validation_fg = np.stack(fg_frames, axis=0)
+                        # Convert to torch and normalize to [-1, 1]
+                        validation_fg = torch.from_numpy(validation_fg).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
+                        validation_fg = validation_fg * 2.0 - 1.0  # [0, 1] -> [-1, 1]
+                        validation_fg = validation_fg.unsqueeze(0)  # [1, F, C, H, W]
+                        logger.info(f"Loaded validation fg with shape: {validation_fg.shape}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load validation fg: {e}")
+                        validation_fg = None
+                
                 # Generate with reference if provided
                 if validation_ref is not None:
                     ref_video_input = validation_ref.to(device=accelerator.device, dtype=weight_dtype)
+                    mask_input = validation_mask.to(device=accelerator.device, dtype=weight_dtype) if validation_mask is not None else None
+                    fg_input = validation_fg.to(device=accelerator.device, dtype=weight_dtype) if validation_fg is not None else None
+                    
                     sample_with_ref = pipeline(
                         args.validation_prompts[i],
                         num_frames = val_frames,
@@ -303,7 +372,9 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                         height      = val_height,
                         width       = val_width,
                         generator   = generator,
-                        subject_ref_images = ref_video_input
+                        subject_ref_images = ref_video_input,
+                        validation_mask = mask_input,
+                        validation_fg = fg_input
                     ).videos
 
                     # save as gif if single frame, otherwise save as mp4
@@ -460,6 +531,18 @@ def parse_args():
         type=str,
         default=None,
         help=("Path to reference image or video used for validation. If not provided, will use generated first frame."),
+    )
+    parser.add_argument(
+        "--validation_mask_path",
+        type=str,
+        default=None,
+        help=("Path to mask video used for validation."),
+    )
+    parser.add_argument(
+        "--validation_fg_path",
+        type=str,
+        default=None,
+        help=("Path to foreground video used for validation."),
     )
     parser.add_argument(
         "--validation_size",
@@ -1371,6 +1454,9 @@ def main():
             new_examples["text"]         = []
             # Used in Ref mode
             new_examples["ref_pixel_values"] = []
+            # Used for bg_mask and fg
+            new_examples["bg_mask"] = []
+            new_examples["fg"] = []
             # Used in Inpaint mode 
             if args.train_mode != "normal":
                 new_examples["mask_pixel_values"] = []
@@ -1493,6 +1579,32 @@ def main():
                 
                 new_examples["ref_pixel_values"].append(transform(ref_pixel_values))
 
+                # Process bg_mask if exists
+                if "bg_mask" in example and example["bg_mask"] is not None:
+                    bg_mask = example["bg_mask"] # [F, H, W, C] [0, 255] when enable_bucket
+                    if isinstance(bg_mask, np.ndarray):
+                        bg_mask = torch.from_numpy(bg_mask).permute(0, 3, 1, 2).contiguous()
+                        bg_mask = bg_mask / 255.
+                    elif isinstance(bg_mask, torch.Tensor):
+                        if bg_mask.dtype == torch.uint8:
+                            bg_mask = bg_mask.float() / 255.
+                    new_examples["bg_mask"].append(transform(bg_mask)) # [F, C, H, W] [-1, 1]
+                else:
+                    new_examples["bg_mask"].append(None)
+
+                # Process fg if exists
+                if "fg" in example and example["fg"] is not None:
+                    fg = example["fg"] # [F, H, W, C] [0, 255] when enable_bucket
+                    if isinstance(fg, np.ndarray):
+                        fg = torch.from_numpy(fg).permute(0, 3, 1, 2).contiguous()
+                        fg = fg / 255.
+                    elif isinstance(fg, torch.Tensor):
+                        if fg.dtype == torch.uint8:
+                            fg = fg.float() / 255.
+                    new_examples["fg"].append(transform(fg)) # [F, C, H, W] [-1, 1]
+                else:
+                    new_examples["fg"].append(None)
+
                 batch_video_length = int(min(batch_video_length, len(pixel_values)))
 
                 # Magvae needs the number of frames to be 4n + 1.
@@ -1542,6 +1654,27 @@ def main():
                 new_examples["ref_pixel_values"] = torch.stack(aligned_ref_pixel_values)
             else:
                 new_examples["ref_pixel_values"] = torch.stack(new_examples["ref_pixel_values"])
+            
+            # Stack bg_mask and fg if they exist
+            if all(example is not None for example in new_examples["bg_mask"]):
+                new_examples["bg_mask"] = torch.stack([example[:batch_video_length] for example in new_examples["bg_mask"]])
+            else:
+                new_examples.pop("bg_mask")
+
+            if all(example is not None for example in new_examples["fg"]):
+                new_examples["fg"] = torch.stack([example[:batch_video_length] for example in new_examples["fg"]])
+            else:
+                new_examples.pop("fg")
+
+            if rng is None:
+                if np.random.rand() < 0.1:
+                    new_examples.pop("fg")
+                    new_examples.pop("bg_mask")
+            else:
+                if rng.random() < 0.1:
+                    new_examples.pop("fg")
+                    new_examples.pop("bg_mask")
+            
             if args.train_mode != "normal":
                 new_examples["mask_pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["mask_pixel_values"]])
                 new_examples["mask"] = torch.stack([example[:batch_video_length] for example in new_examples["mask"]])
@@ -1981,36 +2114,6 @@ def main():
                 f'memory/reserved/{step_name}_gb': memory_reserved,
                 f'memory/max_allocated/{step_name}_gb': max_memory_allocated
             }, step=global_step)
-
-    # Run validation before training starts
-    if global_step == 0 and args.validation_prompts is not None and not args.use_fsdp:
-        if accelerator.is_main_process:
-            logger.info(f"Running initial validation at step 0...")
-            
-            if args.use_ema:
-                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                ema_transformer3d.store(transformer3d.parameters())
-                ema_transformer3d.copy_to(transformer3d.parameters())
-            
-            log_validation(
-                vae,
-                text_encoder,
-                tokenizer,
-                transformer3d,
-                args,
-                config,
-                accelerator,
-                weight_dtype,
-                global_step,
-            )
-            transformer3d.train()
-
-            if args.use_ema:
-                # Switch back to the original transformer3d parameters.
-                ema_transformer3d.restore(transformer3d.parameters())
-        
-        logger.info(f"[Rank {accelerator.process_index}] Syncing after initial validation...")
-        accelerator.wait_for_everyone()
     
     # Use profiler as context manager if enabled
     profiler_context = profiler if profiler is not None else nullcontext()
@@ -2049,6 +2152,15 @@ def main():
                     pixel_values = batch["pixel_values"].to(weight_dtype)
                     ref_pixel_values = batch["ref_pixel_values"].to(weight_dtype)
                     
+                    # Load bg_mask and fg if they exist
+                    bg_mask = batch.get("bg_mask", None) # [B, F, C, H, W] [-1, 1]
+                    fg = batch.get("fg", None) # [B, F, C, H, W] [-1, 1]
+                    
+                    if bg_mask is not None:
+                        bg_mask = bg_mask.to(weight_dtype)
+                    if fg is not None:
+                        fg = fg.to(weight_dtype)
+                    
                     # Log memory after data loading
                     log_memory_usage("2_data_loaded", global_step)
                     
@@ -2083,6 +2195,11 @@ def main():
                         pixel_values = pixel_values[:, :temp_n_frames, :, :]
                         # Note: ref_pixel_values may have different frame count, don't crop it here
 
+                        if bg_mask is not None:
+                            bg_mask = bg_mask[:, :temp_n_frames, :, :]
+                        if fg is not None:
+                            fg = fg[:, :temp_n_frames, :, :]
+
                         if args.train_mode != "normal":
                             mask_pixel_values = mask_pixel_values[:, :temp_n_frames, :, :]
                             mask = mask[:, :temp_n_frames, :, :]
@@ -2109,6 +2226,12 @@ def main():
 
                         pixel_values = pixel_values[:, :actual_video_length, :, :]
                         # Note: ref_pixel_values may have different frame count, don't crop it here
+                        
+                        if bg_mask is not None:
+                            bg_mask = bg_mask[:, :actual_video_length, :, :]
+                        if fg is not None:
+                            fg = fg[:, :actual_video_length, :, :]
+                        
                         if args.train_mode != "normal":
                             mask_pixel_values = mask_pixel_values[:, :actual_video_length, :, :]
                             mask = mask[:, :actual_video_length, :, :]
@@ -2158,6 +2281,60 @@ def main():
                                 ref_latents_bs = torch.cat(ref_latents_list, dim=2)
                                 new_ref_latents.append(ref_latents_bs)
                             return torch.cat(new_ref_latents, dim = 0)
+                        
+                        # Generate masked_fg and encode it
+                        masked_fg_latent = None
+                        bg_mask_downsampled = None
+                        if bg_mask is not None and fg is not None:
+                            B, F_frames, C, H, W = fg.shape
+
+                            # transform compose with ColorJitter
+                            fg_transform = transforms.Compose([
+                                transforms.Lambda(lambda x: (x + 1.0) / 2.0),  # [-1, 1] -> [0, 1]
+                                transforms.ColorJitter(
+                                    brightness=0.3,
+                                    contrast=0.3,
+                                    saturation=0.3,
+                                    hue=0.2
+                                ),
+                                transforms.Lambda(lambda x: x * 2.0 - 1.0),  # [0, 1] -> [-1, 1]
+                            ])
+
+                            # Apply transform to fg
+                            fg_flat = fg_transform(fg.view(B * F_frames, C, H, W))
+                            fg = fg_flat.view(B, F_frames, C, H, W)
+
+                            # Apply mask: bg_mask=1 keeps fg, bg_mask=0 fills with black (-1)
+                            # bg_mask shape: [B, F, C, H, W], values in [-1, 1]
+                            # Convert bg_mask from [-1, 1] to [0, 1] for masking
+                            mask_binary = (bg_mask + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                            
+                            # Apply mask to fg: where mask=1 keep fg, where mask=0 use black (-1)
+                            masked_fg = fg * mask_binary + (-1.0) * (1.0 - mask_binary)
+
+                            # data augmentation
+                            masked_fg_downsampled = torch.nn.functional.interpolate(
+                                masked_fg.view(B * F_frames, C, H, W),
+                                size=(H // 2, W // 2),
+                                mode='bilinear'
+                            )
+                            masked_fg = torch.nn.functional.interpolate(
+                                masked_fg_downsampled,
+                                size=(H, W),
+                                mode='bilinear',
+                                align_corners=False
+                            ).view(B, F_frames, C, H, W)
+                            
+                            # Encode masked_fg using the same function as pixel_values
+                            masked_fg_latent = _batch_encode_vae(masked_fg) # [B, 16, (F-1)/4+1, H/8, W/8]
+                            bg_mask_for_downsample = rearrange(bg_mask, "b f c h w -> b c f h w")
+                            _, _, latent_f, latent_h, latent_w = masked_fg_latent.shape
+                            bg_mask_downsampled = torch.nn.functional.interpolate(
+                                bg_mask_for_downsample,
+                                size=(latent_f, latent_h, latent_w),
+                                mode='nearest'
+                            )  # [B, C, latent_f, latent_h, latent_w]
+                            bg_mask_downsampled = ((bg_mask_downsampled + 1.0) / 2.0 > 0.5).float()  # [B, C, latent_f, latent_h, latent_w], values in {0, 1}
                         
                         # Encode main latents
                         with conditional_record_function("vae_encode_main"):
@@ -2284,6 +2461,12 @@ def main():
                     # zt = (1 - texp) * x + texp * z1
                     sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
                     noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+                    
+                    # Replace noisy_latents with masked_fg_latent where bg_mask_downsampled == 1
+                    if masked_fg_latent is not None and bg_mask_downsampled is not None:
+                        mask_for_replacement = bg_mask_downsampled[:, 0:1, :, :, :]  # [B, 1, latent_f, latent_h, latent_w]
+                        mask_for_replacement = mask_for_replacement.expand_as(noisy_latents)  # [B, 16, latent_f, latent_h, latent_w]
+                        noisy_latents = noisy_latents * (1.0 - mask_for_replacement) + masked_fg_latent * mask_for_replacement
 
                     # Add noise
                     target = noise - latents
@@ -2402,18 +2585,8 @@ def main():
 
                     if args.use_ema:
                         ema_transformer3d.step(transformer3d.parameters())
-                    progress_bar.update(1)
-                    global_step += 1
-                    
-                    current_lr = lr_scheduler.get_last_lr()[0]
-                    accelerator.log({
-                        "train/loss": train_loss, 
-                        "train/learning_rate": current_lr
-                    }, step=global_step)
-                    
-                    train_loss = 0.0
 
-                    if global_step % args.checkpointing_steps == 0:
+                    if global_step % args.checkpointing_steps == 0 and global_step != 0:
                         if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
                             # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                             if args.checkpoints_total_limit is not None:
@@ -2450,21 +2623,33 @@ def main():
                             logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")
 
                             # test vae encode and decode
-                            if global_step <= 500:
+                            if global_step == 0:
                                 vae_decoder = vae.eval()
                                 # Ensure VAE is on the same device as latents for decoding
                                 if args.low_vram:
                                     vae_decoder.to(accelerator.device)
+                                
                                 gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
                                 full_ref_decoded = vae_decoder.decode(full_ref.to(vae_decoder.dtype)).sample
+                                noisy_latents_decoded = vae_decoder.decode(noisy_latents.to(vae_decoder.dtype)).sample
+                                
+                                # Decode masked_fg if it exists
+                                masked_fg_decoded = None
+                                if masked_fg_latent is not None:
+                                    masked_fg_decoded = vae_decoder.decode(masked_fg_latent.to(vae_decoder.dtype)).sample
+                                
                                 # Move VAE back to CPU if low_vram mode is enabled
                                 if args.low_vram:
                                     vae_decoder.to('cpu')
                                     torch.cuda.empty_cache()
+                                
+                                # Normalize to [0, 1]
                                 gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
                                 gt = (pixel_values / 2 + 0.5).clamp(0, 1).cpu().float().permute(0,2,1,3,4)
                                 full_ref_decoded = (full_ref_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                noisy_latents_decoded = (noisy_latents_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
                                 
+                                # Align frame counts for full_ref_decoded
                                 if full_ref_decoded.shape[2] < gt.shape[2]:
                                     last_frame = full_ref_decoded[:, :, -1:, :, :]
                                     repeat_times = gt.shape[2] - full_ref_decoded.shape[2]
@@ -2473,9 +2658,27 @@ def main():
                                 else:
                                     full_ref_decoded = full_ref_decoded[:, :, :gt.shape[2], :, :]
                                 
-                                # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
-                                comparison = torch.cat([gt.cpu().float(), gt_decoded, full_ref_decoded], dim=3) # down stack comparison in height [gt, gt_decoded, full_ref_decoded]
-                                save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=24) # stack batch in width
+                                # Build comparison list: [gt, gt_decoded, full_ref_decoded, noisy_latents_decoded, fg, bg_mask, masked_fg]
+                                comparison_list = [gt.cpu().float(), gt_decoded, full_ref_decoded, noisy_latents_decoded]
+                                
+                                # Add fg if exists
+                                if fg is not None:
+                                    fg_normalized = (fg / 2 + 0.5).clamp(0, 1).cpu().permute(0, 2, 1, 3, 4).float()
+                                    comparison_list.append(fg_normalized)
+                                
+                                # Add bg_mask if exists
+                                if bg_mask is not None:
+                                    bg_mask_normalized = (bg_mask / 2 + 0.5).clamp(0, 1).cpu().permute(0, 2, 1, 3, 4).float()
+                                    comparison_list.append(bg_mask_normalized)
+                                
+                                # Add masked_fg if exists
+                                if masked_fg_decoded is not None:
+                                    masked_fg_decoded = (masked_fg_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                    comparison_list.append(masked_fg_decoded)
+                                
+                                # Stack vertically: [gt, gt_decoded, full_ref_decoded, fg, bg_mask, masked_fg]
+                                comparison = torch.cat(comparison_list, dim=3)  # stack in height dimension
+                                save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=24)
 
                                 # Prepare comparison for logging
                                 log_vae_comparison = comparison.clone().detach().clamp(0, 1) * 255
@@ -2514,6 +2717,17 @@ def main():
                         
                         logger.info(f"[Rank {accelerator.process_index}] Syncing after validation step...")
                         accelerator.wait_for_everyone()
+                    
+                    progress_bar.update(1)
+                    global_step += 1
+                    
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    accelerator.log({
+                        "train/loss": train_loss, 
+                        "train/learning_rate": current_lr
+                    }, step=global_step)
+                    
+                    train_loss = 0.0
 
                 logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)

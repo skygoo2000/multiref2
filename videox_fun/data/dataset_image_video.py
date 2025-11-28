@@ -928,7 +928,55 @@ class ImageVideoRefDataset(Dataset):
         self.image_minor_side = min(self.image_sample_size)
         self.video_minor_side = min(self.video_sample_size)
     
-    def _process_ref_file(self, ref_file_path, idx, data_type='image', target_size=None):
+    def _read_video_frames(self, video_path, batch_index, idx, apply_transforms=True, is_mask=False):
+        """
+        Unified video reading function.
+
+        Args:
+            video_path: Path to the video file.
+            batch_index: Indices of the frames to read.
+            idx: Index in the dataset (for error reporting).
+            apply_transforms: Whether to apply video_transforms.
+            is_mask: Whether this is a mask video (requires inversion and binarization).
+
+        Returns:
+            Processed video frame data.
+        """
+        with VideoReader_contextmanager(video_path, num_threads=2) as video_reader:
+            try:
+                sample_args = (video_reader, batch_index)
+                pixel_values = func_timeout(
+                    VIDEO_READER_TIMEOUT, get_video_reader_batch, args=sample_args
+                )
+                resized_frames = []
+                for i in range(len(pixel_values)):
+                    frame = pixel_values[i]
+                    resized_frame = resize_frame(frame, self.video_minor_side)
+                    resized_frames.append(resized_frame)
+                pixel_values = np.array(resized_frames)
+            except FunctionTimedOut:
+                raise ValueError(f"Read video {idx} timeout.")
+            except Exception as e:
+                raise ValueError(f"Failed to extract frames from video. Error is {e}.")
+            
+            # invert mask from blender output
+            if is_mask:
+                pixel_values = 255 - pixel_values
+                pixel_values = (pixel_values > 127.5).astype(np.float32) * 255.0
+            
+            if not self.enable_bucket:
+                pixel_values = torch.from_numpy(pixel_values).permute(0, 3, 1, 2).contiguous()
+                pixel_values = pixel_values / 255.
+                del video_reader
+            else:
+                pixel_values = pixel_values
+            
+            if not self.enable_bucket and apply_transforms:
+                pixel_values = self.video_transforms(pixel_values)
+            
+            return pixel_values
+    
+    def _ref_preprocess(self, ref_file_path, idx, data_type='image', target_size=None):
         """
         Process reference file which can be: image, video, or directory of images.
         Returns ref_pixel_values in appropriate format based on enable_bucket setting.
@@ -1052,12 +1100,14 @@ class ImageVideoRefDataset(Dataset):
         data_info = self.dataset[idx % len(self.dataset)]
         video_id, text = data_info['file_path'], data_info['text']
 
+        # video
         if data_info.get('type', 'image') == 'video':
             if self.data_root is None:
                 video_dir = video_id
             else:
                 video_dir = os.path.join(self.data_root, video_id)
 
+            # Calculate batch_index for frame sampling
             with VideoReader_contextmanager(video_dir, num_threads=2) as video_reader:
                 min_sample_n_frames = min(
                     self.video_sample_n_frames, 
@@ -1070,36 +1120,13 @@ class ImageVideoRefDataset(Dataset):
                 clip_length = min(video_length, (min_sample_n_frames - 1) * self.video_sample_stride + 1)
                 start_idx   = random.randint(int(self.video_length_drop_start * video_length), video_length - clip_length) if video_length != clip_length else 0
                 batch_index = np.linspace(start_idx, start_idx + clip_length - 1, min_sample_n_frames, dtype=int)
-
-                try:
-                    sample_args = (video_reader, batch_index)
-                    pixel_values = func_timeout(
-                        VIDEO_READER_TIMEOUT, get_video_reader_batch, args=sample_args
-                    )
-                    resized_frames = []
-                    for i in range(len(pixel_values)):
-                        frame = pixel_values[i]
-                        resized_frame = resize_frame(frame, self.video_minor_side)
-                        resized_frames.append(resized_frame)
-                    pixel_values = np.array(resized_frames)
-                except FunctionTimedOut:
-                    raise ValueError(f"Read {idx} timeout.")
-                except Exception as e:
-                    raise ValueError(f"Failed to extract frames from video. Error is {e}.")
-
-                if not self.enable_bucket:
-                    pixel_values = torch.from_numpy(pixel_values).permute(0, 3, 1, 2).contiguous()
-                    pixel_values = pixel_values / 255.
-                    del video_reader
-                else:
-                    pixel_values = pixel_values
-
-                if not self.enable_bucket:
-                    pixel_values = self.video_transforms(pixel_values)
-                
-                # Random use no text generation
-                if random.random() < self.text_drop_ratio:
-                    text = ''
+            
+            # Read pixel_values using unified function
+            pixel_values = self._read_video_frames(video_dir, batch_index, idx, apply_transforms=True, is_mask=False)
+            
+            # Random use no text generation
+            if random.random() < self.text_drop_ratio:
+                text = ''
 
             # Process ref file (can be video, image, or directory)
             ref_file_path = data_info.get('ref', '')
@@ -1117,10 +1144,33 @@ class ImageVideoRefDataset(Dataset):
                     target_size = (pixel_values.shape[2], pixel_values.shape[3])  # (H, W) from (F, C, H, W)
                 else:
                     target_size = (pixel_values.shape[1], pixel_values.shape[2])  # (H, W) from (F, H, W, C)
-                ref_pixel_values = self._process_ref_file(ref_file_path, idx, data_type='video', target_size=target_size)
+                ref_pixel_values = self._ref_preprocess(ref_file_path, idx, data_type='video', target_size=target_size)
 
-            return pixel_values, ref_pixel_values, text, "video", video_dir
+            bg_mask = None
+            if 'mask' in data_info and data_info['mask']:
+                mask_file_path = data_info['mask']
+                if self.data_root is None:
+                    mask_video_dir = mask_file_path
+                else:
+                    mask_video_dir = os.path.join(self.data_root, mask_file_path)
+                
+                # Use unified video reading function with mask processing
+                bg_mask = self._read_video_frames(mask_video_dir, batch_index, idx, apply_transforms=True, is_mask=True)
 
+            fg = None
+            if 'fg' in data_info and data_info['fg']:
+                fg_file_path = data_info['fg']
+                if self.data_root is None:
+                    fg_video_dir = fg_file_path
+                else:
+                    fg_video_dir = os.path.join(self.data_root, fg_file_path)
+                
+                # Use unified video reading function
+                fg = self._read_video_frames(fg_video_dir, batch_index, idx, apply_transforms=True, is_mask=False)
+
+            return pixel_values, ref_pixel_values, text, "video", video_dir, bg_mask, fg
+        
+        # image
         else:
             image_path, text = data_info['file_path'], data_info['text']
             if self.data_root is not None:
@@ -1147,9 +1197,48 @@ class ImageVideoRefDataset(Dataset):
                     target_size = (pixel_values.shape[2], pixel_values.shape[3])  # (H, W) from (F, C, H, W)
                 else:
                     target_size = (pixel_values.shape[1], pixel_values.shape[2])  # (H, W) from (F, H, W, C)
-                ref_pixel_values = self._process_ref_file(ref_file_path, idx, data_type='image', target_size=target_size)
+                ref_pixel_values = self._ref_preprocess(ref_file_path, idx, data_type='image', target_size=target_size)
 
-            return pixel_values, ref_pixel_values, text, 'image', image_path
+            bg_mask = None
+            if 'mask' in data_info and data_info['mask']:
+                mask_file_path = data_info['mask']
+                if self.data_root is not None:
+                    mask_file_path = os.path.join(self.data_root, mask_file_path)
+                mask_image = Image.open(mask_file_path).convert('RGB')
+                if not self.enable_bucket:
+                    bg_mask = self.image_transforms(mask_image).unsqueeze(0)
+                else:
+                    bg_mask = np.expand_dims(np.array(mask_image), 0)
+                
+                # Apply invert and binarization to mask
+                if not self.enable_bucket:
+                    # bg_mask shape: [1, C, H, W], values in [-1, 1]
+                    # 1. Invert: -x
+                    bg_mask = -bg_mask
+                    # 2. Binarize: convert to [0, 1], then threshold at 0.5
+                    bg_mask = (bg_mask + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                    bg_mask = (bg_mask > 0.5).float()
+                    # Convert back to [-1, 1] range
+                    bg_mask = bg_mask * 2.0 - 1.0
+                else:
+                    # bg_mask shape: [1, H, W, C], values in [0, 255]
+                    # 1. Invert: 255 - x
+                    bg_mask = 255 - bg_mask
+                    # 2. Binarize: threshold at 127.5
+                    bg_mask = (bg_mask > 127.5).astype(np.float32) * 255.0
+
+            fg = None
+            if 'fg' in data_info and data_info['fg']:
+                fg_file_path = data_info['fg']
+                if self.data_root is not None:
+                    fg_file_path = os.path.join(self.data_root, fg_file_path)
+                fg_image = Image.open(fg_file_path).convert('RGB')
+                if not self.enable_bucket:
+                    fg = self.image_transforms(fg_image).unsqueeze(0)
+                else:
+                    fg = np.expand_dims(np.array(fg_image), 0)
+
+            return pixel_values, ref_pixel_values, text, 'image', image_path, bg_mask, fg
             
     def __len__(self):
         return self.length
@@ -1165,7 +1254,7 @@ class ImageVideoRefDataset(Dataset):
                 if data_type_local != data_type:
                     raise ValueError("data_type_local != data_type")
 
-                pixel_values, ref_pixel_values, name, data_type, file_path = self.get_batch(idx)
+                pixel_values, ref_pixel_values, name, data_type, file_path, bg_mask, fg = self.get_batch(idx)
 
                 # Randomly shuffle frames of ref_pixel_values
                 if ref_pixel_values.shape[0] > 1:
@@ -1177,6 +1266,12 @@ class ImageVideoRefDataset(Dataset):
                 sample["text"] = name
                 sample["data_type"] = data_type
                 sample["idx"] = idx
+
+                # probability to replace with None
+                if bg_mask is not None:
+                    sample["bg_mask"] = bg_mask
+                if fg is not None:
+                    sample["fg"] = fg
 
                 if self.return_file_name:
                     sample["file_name"] = os.path.basename(file_path)
