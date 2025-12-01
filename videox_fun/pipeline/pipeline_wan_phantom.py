@@ -473,8 +473,8 @@ class WanFunPhantomPipeline(DiffusionPipeline):
         height: int = 480,
         width: int = 720,
         subject_ref_images: Union[torch.FloatTensor] = None,
-        validation_mask: Optional[torch.FloatTensor] = None,
-        validation_fg: Optional[torch.FloatTensor] = None,
+        bg_mask: Optional[torch.FloatTensor] = None,
+        fg: Optional[torch.FloatTensor] = None,
         num_frames: int = 49,
         num_inference_steps: int = 50,
         timesteps: Optional[List[int]] = None,
@@ -610,19 +610,19 @@ class WanFunPhantomPipeline(DiffusionPipeline):
                         encoded_frames.append(encoded_frame)
                     subject_ref_images_latentes = torch.cat(encoded_frames, dim=2)  # [B, C_latent, F, H_latent, W_latent]
 
-        # Process validation_mask and validation_fg
+        # Process bg_mask and fg
         masked_fg_latent = None
         bg_mask_downsampled = None
-        if validation_mask is not None and validation_fg is not None:
+        if bg_mask is not None and fg is not None:
             with torch.no_grad():
-                # validation_mask: [B, F, C, H, W], values in [-1, 1]
-                # validation_fg: [B, F, C, H, W], values in [-1, 1]
+                # bg_mask: [B, F, C, H, W], values in [-1, 1]
+                # fg: [B, F, C, H, W], values in [-1, 1]
                 
                 # Invert and binarize mask: [-1, 1] -> {0, 1}
-                mask_binary = ((1.0 - validation_mask) > 0.0).float()
+                mask_binary = ((1.0 - bg_mask) > 0.0).float()
                 
                 # Apply mask to fg: where mask=1 keep fg, where mask=0 use black (-1)
-                masked_fg = validation_fg * mask_binary + (-1.0) * (1.0 - mask_binary)
+                masked_fg = fg * mask_binary + (-1.0) * (1.0 - mask_binary)
                 
                 # Encode masked_fg with VAE: [B, F, C, H, W] -> [B, C, F, H, W]
                 masked_fg = rearrange(masked_fg, "b f c h w -> b c f h w").to(device=device, dtype=weight_dtype)
@@ -660,19 +660,6 @@ class WanFunPhantomPipeline(DiffusionPipeline):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 if hasattr(self.scheduler, "scale_model_input"):
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                    
-                # Apply masked_fg_latent replacement if available
-                if masked_fg_latent is not None and bg_mask_downsampled is not None:
-                    # Prepare mask for replacement: [B, 1, latent_f, latent_h, latent_w] -> [B, C, latent_f, latent_h, latent_w]
-                    mask_for_replacement = bg_mask_downsampled[:, 0:1, :, :, :].expand_as(masked_fg_latent)
-                    
-                    if do_classifier_free_guidance:
-                        # Only replace the conditional part (second half)
-                        batch_size = latent_model_input.shape[0] // 2
-                        latent_model_input[batch_size:] = latent_model_input[batch_size:] * (1.0 - mask_for_replacement) + masked_fg_latent * mask_for_replacement
-                    else:
-                        # Replace directly
-                        latent_model_input = latent_model_input * (1.0 - mask_for_replacement) + masked_fg_latent * mask_for_replacement
 
                 if subject_ref_images is not None:
                     subject_ref = subject_ref_images_latentes

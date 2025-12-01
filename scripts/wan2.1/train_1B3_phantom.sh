@@ -6,10 +6,10 @@ export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
 export PYTHONWARNINGS="ignore::FutureWarning"
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=4,5
 
 LEARNING_RATE=1e-04
-BATCH_SIZE=8
+BATCH_SIZE=6
 MAX_TRAIN_STEPS=5000
 CHECKPOINTING_STEPS=1000
 RESUME_FROM_CHECKPOINT="models/Personalized_Model/phantom-1.3B"
@@ -64,7 +64,7 @@ accelerate launch scripts/wan2.1/train_phantom.py \
   --uniform_sampling \
   --boundary_type="full" \
   --train_mode="normal" \
-  --trainable_modules 'self_attn' \
+  --trainable_modules '.' \
   --report_model_info \
   --report_to="wandb" \
   --tracker_project_name="phantom_1B3-256p" \

@@ -373,8 +373,8 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                         width       = val_width,
                         generator   = generator,
                         subject_ref_images = ref_video_input,
-                        validation_mask = mask_input,
-                        validation_fg = fg_input
+                        bg_mask = mask_input,
+                        fg = fg_input,
                     ).videos
 
                     # save as gif if single frame, otherwise save as mp4
@@ -2461,12 +2461,6 @@ def main():
                     # zt = (1 - texp) * x + texp * z1
                     sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
                     noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
-                    
-                    # Replace noisy_latents with masked_fg_latent where bg_mask_downsampled == 1
-                    if masked_fg_latent is not None and bg_mask_downsampled is not None:
-                        mask_for_replacement = bg_mask_downsampled[:, 0:1, :, :, :]  # [B, 1, latent_f, latent_h, latent_w]
-                        mask_for_replacement = mask_for_replacement.expand_as(noisy_latents)  # [B, 16, latent_f, latent_h, latent_w]
-                        noisy_latents = noisy_latents * (1.0 - mask_for_replacement) + masked_fg_latent * mask_for_replacement
 
                     # Add noise
                     target = noise - latents
@@ -2631,7 +2625,6 @@ def main():
                                 
                                 gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
                                 full_ref_decoded = vae_decoder.decode(full_ref.to(vae_decoder.dtype)).sample
-                                noisy_latents_decoded = vae_decoder.decode(noisy_latents.to(vae_decoder.dtype)).sample
                                 
                                 # Decode masked_fg if it exists
                                 masked_fg_decoded = None
@@ -2647,7 +2640,6 @@ def main():
                                 gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
                                 gt = (pixel_values / 2 + 0.5).clamp(0, 1).cpu().float().permute(0,2,1,3,4)
                                 full_ref_decoded = (full_ref_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
-                                noisy_latents_decoded = (noisy_latents_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
                                 
                                 # Align frame counts for full_ref_decoded
                                 if full_ref_decoded.shape[2] < gt.shape[2]:
@@ -2658,8 +2650,8 @@ def main():
                                 else:
                                     full_ref_decoded = full_ref_decoded[:, :, :gt.shape[2], :, :]
                                 
-                                # Build comparison list: [gt, gt_decoded, full_ref_decoded, noisy_latents_decoded, fg, bg_mask, masked_fg]
-                                comparison_list = [gt.cpu().float(), gt_decoded, full_ref_decoded, noisy_latents_decoded]
+                                # Build comparison list: [gt, gt_decoded, full_ref_decoded, fg, bg_mask, masked_fg]
+                                comparison_list = [gt.cpu().float(), gt_decoded, full_ref_decoded]
                                 
                                 # Add fg if exists
                                 if fg is not None:
