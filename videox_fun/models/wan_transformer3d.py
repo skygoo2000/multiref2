@@ -823,9 +823,23 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         x = [u.flatten(2).transpose(1, 2) for u in x]
         if self.ref_conv is not None and full_ref is not None:
-            full_ref = self.ref_conv(full_ref).flatten(2).transpose(1, 2)
-            grid_sizes = torch.stack([torch.tensor([u[0] + 1, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+            if full_ref.dim() > 4:
+                # full_ref shape: [B, 16, F, H, W]
+                full_ref_frames_num = full_ref.size(2)
+                full_ref_list = []
+                for f in range(full_ref_frames_num):
+                    frame = full_ref[:, :, f, :, :]  # [B, 16, H, W]
+                    frame_conv = self.ref_conv(frame)
+                    full_ref_list.append(frame_conv)  # [B, model_dim(1536), H/2, H/2]
+                full_ref = torch.stack(full_ref_list, dim=2)
+                full_ref = full_ref.flatten(2).transpose(1, 2)  # [B, ref_seq_len, model_dim(1536)]
+                grid_sizes = torch.stack([torch.tensor([u[0] + full_ref_frames_num, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+            else:
+                full_ref = self.ref_conv(full_ref).flatten(2).transpose(1, 2)
+                grid_sizes = torch.stack([torch.tensor([u[0] + 1, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+                full_ref_frames_num = None
             seq_len += full_ref.size(1)
+
             x = [torch.concat([_full_ref.unsqueeze(0), u], dim=1) for _full_ref, u in zip(full_ref, x)]
             if t.dim() != 1 and t.size(1) < seq_len:
                 pad_size = seq_len - t.size(1)
@@ -1025,7 +1039,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         if self.ref_conv is not None and full_ref is not None:
             full_ref_length = full_ref.size(1)
             x = x[:, full_ref_length:]
-            grid_sizes = torch.stack([torch.tensor([u[0] - 1, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+
+            if full_ref_frames_num is not None:
+                grid_sizes = torch.stack([torch.tensor([u[0] - full_ref_frames_num, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+            else:
+                grid_sizes = torch.stack([torch.tensor([u[0] - 1, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
 
         if subject_ref is not None:
             subject_ref_length = subject_ref.size(1)
