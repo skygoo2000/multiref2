@@ -300,6 +300,52 @@ def process_pose_params(cam_params, width=672, height=384, original_pose_width=1
     plucker_embedding = rearrange(plucker_embedding, "b f c h w -> b f h w c")[0]
     return plucker_embedding
 
+def pose_dict_to_matrix(pose_dict):
+    """
+    Convert pose dictionary with x, y, z, rx, ry, rz to 4x4 homogeneous transformation matrix.
+    Rotations are in radians.
+    
+    Args:
+        pose_dict: Dictionary with keys 'x', 'y', 'z', 'rx', 'ry', 'rz'
+    
+    Returns:
+        4x4 numpy array representing the homogeneous transformation matrix
+    """
+    x, y, z = pose_dict['x'], pose_dict['y'], pose_dict['z']
+    rx, ry, rz = pose_dict['rx'], pose_dict['ry'], pose_dict['rz']
+    
+    # Rotation matrices for each axis
+    # Rotation around X axis
+    Rx = np.array([
+        [1, 0, 0],
+        [0, np.cos(rx), -np.sin(rx)],
+        [0, np.sin(rx), np.cos(rx)]
+    ])
+    
+    # Rotation around Y axis
+    Ry = np.array([
+        [np.cos(ry), 0, np.sin(ry)],
+        [0, 1, 0],
+        [-np.sin(ry), 0, np.cos(ry)]
+    ])
+    
+    # Rotation around Z axis
+    Rz = np.array([
+        [np.cos(rz), -np.sin(rz), 0],
+        [np.sin(rz), np.cos(rz), 0],
+        [0, 0, 1]
+    ])
+    
+    # Combined rotation matrix (order: Rz * Ry * Rx)
+    R = Rz @ Ry @ Rx
+    
+    # Create 4x4 homogeneous transformation matrix
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = R
+    T[:3, 3] = [x, y, z]
+    
+    return T
+
 class ImageVideoSampler(BatchSampler):
     """A sampler wrapper for grouping images with similar aspect ratio into a same batch.
 
@@ -865,7 +911,7 @@ class ImageVideoRefDataset(Dataset):
         video_length_drop_end=1.0,
         enable_inpaint=False,
         return_file_name=False,
-        num_ref_frames=4,
+        num_ref_frames=None,
     ):
         # Loading annotations from files
         print(f"loading annotations from {ann_path} ...")
@@ -979,10 +1025,13 @@ class ImageVideoRefDataset(Dataset):
     def _ref_preprocess(self, ref_file_path, idx, data_type='image', target_size=None):
         """
         Process reference file which can be: image, video, or directory of images.
-        Returns ref_pixel_values in appropriate format based on enable_bucket setting.
+        Returns all ref_pixel_values without sampling (sampling will be done in training script).
         
         Args:
             target_size: Optional tuple (height, width) to resize to. If provided, uses this size directly.
+        
+        Returns:
+            ref_pixel_values: processed reference frames (all frames, no sampling)
         """
         # Get full path to ref file
         if self.data_root is None:
@@ -1008,7 +1057,7 @@ class ImageVideoRefDataset(Dataset):
             if len(image_files) == 0:
                 raise ValueError(f"No image files found in directory: {ref_file_id}")
             
-            # Process all images in the directory
+            # Load all images (no sampling)
             ref_frames_list = []
             for img_path in image_files:
                 if not self.enable_bucket:
@@ -1050,24 +1099,21 @@ class ImageVideoRefDataset(Dataset):
             # Check if ref file is image or video by extension
             ref_file_ext = ref_file_path.lower().split('.')[-1]
             if ref_file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
-                # Process as image
+                # Process as image - single frame
                 ref_image = Image.open(ref_file_id).convert('RGB')
                 if not self.enable_bucket:
                     return self.image_transforms(ref_image).unsqueeze(0)  # Add frame dimension
                 else:
                     return np.expand_dims(np.array(ref_image), 0)  # Add frame dimension
             else:
-                # Process as video - sample frames uniformly
+                # Process as video - load all frames (no sampling)
                 with VideoReader_contextmanager(ref_file_id, num_threads=2) as ref_video_reader:
                     total_frames = len(ref_video_reader)
-                    
-                    if total_frames <= self.num_ref_frames:
-                        ref_batch_index = list(range(total_frames))
-                    else:
-                        ref_batch_index = np.linspace(0, total_frames - 1, self.num_ref_frames, dtype=int)
+                    # Load all frames
+                    ref_frames_indices = list(range(total_frames))
                     
                     try:
-                        sample_args = (ref_video_reader, ref_batch_index)
+                        sample_args = (ref_video_reader, ref_frames_indices)
                         ref_frames = func_timeout(
                             VIDEO_READER_TIMEOUT, get_video_reader_batch, args=sample_args
                         )
@@ -1168,7 +1214,52 @@ class ImageVideoRefDataset(Dataset):
                 # Use unified video reading function
                 fg = self._read_video_frames(fg_video_dir, batch_index, idx, apply_transforms=True, is_mask=False)
 
-            return pixel_values, ref_pixel_values, text, "video", video_dir, bg_mask, fg
+            # Load pose data if available
+            ref_pose = None
+            video_pose = None
+            if 'pose' in data_info and data_info['pose']:
+                pose_file_path = data_info['pose']
+                if self.data_root is None:
+                    pose_file_full_path = pose_file_path
+                else:
+                    pose_file_full_path = os.path.join(self.data_root, pose_file_path)
+                
+                try:
+                    with open(pose_file_full_path, 'r') as f:
+                        pose_data = json.load(f)
+                    
+                    # Process video pose
+                    if 'video' in pose_data:
+                        video_pose_list = []
+                        for frame_idx in batch_index:
+                            if frame_idx < len(pose_data['video']):
+                                pose_matrix = pose_dict_to_matrix(pose_data['video'][frame_idx])
+                                video_pose_list.append(pose_matrix)
+                        if video_pose_list:
+                            video_pose = np.stack(video_pose_list, axis=0)  # [F, 4, 4]
+                    
+                    # Process ref pose - load all ref pose frames (sampling will be done in training script)
+                    # Check if ref is empty (using first frame of video as ref)
+                    if not ref_file_path or ref_file_path.strip() == '':
+                        # Use first frame of video pose as ref pose
+                        if video_pose is not None:
+                            ref_pose = video_pose[0:1]  # [1, 4, 4]
+                    else:
+                        # Load all ref pose frames from pose file (no sampling)
+                        if 'ref' in pose_data:
+                            ref_pose_list = []
+                            for frame_idx in range(len(pose_data['ref'])):
+                                pose_matrix = pose_dict_to_matrix(pose_data['ref'][frame_idx])
+                                ref_pose_list.append(pose_matrix)
+                            if ref_pose_list:
+                                ref_pose = np.stack(ref_pose_list, axis=0)  # [F, 4, 4]
+                
+                except Exception as e:
+                    print(f"Warning: Failed to load pose from {pose_file_full_path}: {e}")
+                    ref_pose = None
+                    video_pose = None
+
+            return pixel_values, ref_pixel_values, text, "video", video_dir, bg_mask, fg, ref_pose, video_pose
         
         # image
         else:
@@ -1238,7 +1329,11 @@ class ImageVideoRefDataset(Dataset):
                 else:
                     fg = np.expand_dims(np.array(fg_image), 0)
 
-            return pixel_values, ref_pixel_values, text, 'image', image_path, bg_mask, fg
+            # For images, pose is not applicable
+            ref_pose = None
+            video_pose = None
+
+            return pixel_values, ref_pixel_values, text, 'image', image_path, bg_mask, fg, ref_pose, video_pose
             
     def __len__(self):
         return self.length
@@ -1254,12 +1349,15 @@ class ImageVideoRefDataset(Dataset):
                 if data_type_local != data_type:
                     raise ValueError("data_type_local != data_type")
 
-                pixel_values, ref_pixel_values, name, data_type, file_path, bg_mask, fg = self.get_batch(idx)
+                pixel_values, ref_pixel_values, name, data_type, file_path, bg_mask, fg, ref_pose, video_pose = self.get_batch(idx)
 
-                # Randomly shuffle frames of ref_pixel_values
-                if ref_pixel_values.shape[0] > 1:
-                    perm = torch.randperm(ref_pixel_values.shape[0])
-                    ref_pixel_values = ref_pixel_values[perm]
+                # # Randomly shuffle frames of ref_pixel_values
+                # if ref_pixel_values.shape[0] > 1:
+                #     perm = torch.randperm(ref_pixel_values.shape[0])
+                #     ref_pixel_values = ref_pixel_values[perm]
+                #     # Also shuffle ref_pose if it exists
+                #     if ref_pose is not None:
+                #         ref_pose = ref_pose[perm.numpy()]
 
                 sample["pixel_values"] = pixel_values
                 sample["ref_pixel_values"] = ref_pixel_values
@@ -1272,6 +1370,10 @@ class ImageVideoRefDataset(Dataset):
                     sample["bg_mask"] = bg_mask
                 if fg is not None:
                     sample["fg"] = fg
+                if ref_pose is not None:
+                    sample["ref_pose"] = ref_pose
+                if video_pose is not None:
+                    sample["video_pose"] = video_pose
 
                 if self.return_file_name:
                     sample["file_name"] = os.path.basename(file_path)
