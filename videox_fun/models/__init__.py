@@ -23,7 +23,7 @@ from .wan_transformer3d import (Wan2_2Transformer3DModel, WanRMSNorm,
                                 WanSelfAttention, WanTransformer3DModel)
 from .wan_transformer3d_ref import Wan2_2RefTransformer3DModel
 from .wan_transformer3d_s2v import Wan2_2Transformer3DModel_S2V
-from .multiref_transformer3d import MultiRefTransformer3DModel
+from .multiref_transformer3d import MultiRefTransformer3DModel, CroodRefTransformer3DModel
 from .wan_vae import AutoencoderKLWan, AutoencoderKLWan_
 from .wan_vae3_8 import AutoencoderKLWan2_2_, AutoencoderKLWan3_8
 

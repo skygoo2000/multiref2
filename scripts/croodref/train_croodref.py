@@ -78,7 +78,8 @@ from videox_fun.data.dataset_image_video import (ImageVideoControlDataset,
                                                  process_pose_params)
 from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel,
                                WanTransformer3DModel)
-from videox_fun.pipeline import WanFunControlPipeline
+from videox_fun.models.multiref_transformer3d import CroodRefTransformer3DModel
+from videox_fun.pipeline import WanFunCroodRefPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import (create_network, merge_lora,
                                          unmerge_lora)
@@ -128,7 +129,7 @@ def sample_ref_frames(total_frames, num_ref_frames_to_use=6, rng=None):
         rng: Random number generator (optional)
     
     Returns:
-        List of frame indices to sample
+        List of frame indices to sample (as Python int)
     """
     if total_frames <= num_ref_frames_to_use:
         return list(range(total_frames))
@@ -147,7 +148,8 @@ def sample_ref_frames(total_frames, num_ref_frames_to_use=6, rng=None):
                     random_idx = np.random.randint(max(segment_start + 1, 1), segment_end + 1)
                 else:
                     random_idx = rng.integers(max(segment_start + 1, 1), segment_end + 1)
-                ref_batch_index.append(random_idx)
+                # Convert np.int64 to Python int to avoid CUDA indexing issues
+                ref_batch_index.append(int(random_idx))
         
         return ref_batch_index
 
@@ -155,389 +157,513 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
     
     logger.info("Running validation... ")
 
-    try:
-        # Set validation dimensions
-        if args.validation_size is not None:
-            val_height, val_width, val_frames = args.validation_size
-            logger.info(f"Using custom validation size: {val_height}x{val_width}, {val_frames} frames")
-        else:
-            val_height = val_width = args.video_sample_size
-            val_frames = args.video_sample_n_frames
-            logger.info(f"Using default validation size: {val_height}x{val_width}, {val_frames} frames")
-        
-        scheduler = FlowMatchEulerDiscreteScheduler(
-            **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
-        )
-        transformer3d_val = accelerator.unwrap_model(transformer3d)
-        
-        # Use WanFunControlPipeline following pipeline_wan_fun_control.py logic
-        # Note: clip_image_encoder is not used in our training, so we create a dummy one
-        from videox_fun.models import CLIPModel
-        clip_image_encoder = CLIPModel.from_pretrained(
-            os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
-        ).to(accelerator.device, dtype=weight_dtype).eval()
-        
-        pipeline = WanFunControlPipeline(
-            vae=accelerator.unwrap_model(vae).to(weight_dtype), 
-            text_encoder=accelerator.unwrap_model(text_encoder),
-            tokenizer=tokenizer,
-            transformer=transformer3d_val,
-            scheduler=scheduler,
-            clip_image_encoder=clip_image_encoder,
-        )
+    # Set validation dimensions
+    if args.validation_size is not None:
+        val_height, val_width, val_frames = args.validation_size
+        logger.info(f"Using custom validation size: {val_height}x{val_width}, {val_frames} frames")
+    else:
+        val_height = val_width = args.video_sample_size
+        val_frames = args.video_sample_n_frames
+        logger.info(f"Using default validation size: {val_height}x{val_width}, {val_frames} frames")
+    
+    scheduler = FlowMatchEulerDiscreteScheduler(
+        **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
+    )
+    transformer3d_val = accelerator.unwrap_model(transformer3d)
+    
+    # Use WanFunCroodRefPipeline
+    # Load clip_image_encoder for validation pipeline
+    from videox_fun.models import CLIPModel
+    clip_image_encoder = CLIPModel.from_pretrained(
+        os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
+    ).to(accelerator.device, dtype=weight_dtype).eval()
+    
+    pipeline = WanFunCroodRefPipeline(
+        vae=accelerator.unwrap_model(vae).to(weight_dtype), 
+        text_encoder=accelerator.unwrap_model(text_encoder),
+        tokenizer=tokenizer,
+        transformer=transformer3d_val,
+        clip_image_encoder=clip_image_encoder,
+        scheduler=scheduler,
+    )
 
-        pipeline = pipeline.to(accelerator.device)
+    pipeline = pipeline.to(accelerator.device)
 
-        if args.seed is None:
-            generator = None
-        else:
-            generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+    if args.seed is None:
+        generator = None
+    else:
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-        images = []
-        for i in range(len(args.validation_prompts)):
-            with torch.no_grad():
-                os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
+    images = []
+    for i in range(len(args.validation_prompts)):
+        with torch.no_grad():
+            os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
 
-                # Load validation reference if provided
-                validation_ref = None
-                if args.validation_ref_path is not None:
+            # Load validation reference if provided
+            validation_ref = None
+            ref_frame_indices = None
+            if args.validation_ref_path is not None:
+                
+                ref_path = args.validation_ref_path
+                logger.info(f"Loading validation reference from: {ref_path}")
+                
+                # Check if ref_path is a directory
+                if os.path.isdir(ref_path):
+                    # Load all images from directory
+                    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+                    image_files = []
+                    for ext in image_extensions:
+                        image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext}')))
+                        image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext.upper()}')))
                     
-                    ref_path = args.validation_ref_path
-                    logger.info(f"Loading validation reference from: {ref_path}")
-                    
-                    # Check if ref_path is a directory
-                    if os.path.isdir(ref_path):
-                        # Load all images from directory
-                        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
-                        image_files = []
-                        for ext in image_extensions:
-                            image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext}')))
-                            image_files.extend(glob.glob(os.path.join(ref_path, f'*{ext.upper()}')))
+                    if len(image_files) == 0:
+                        logger.warning(f"No image files found in directory: {ref_path}")
+                        validation_ref = None
+                    else:
+                        logger.info(f"Found {len(image_files)} images in directory")
                         
-                        if len(image_files) == 0:
-                            logger.warning(f"No image files found in directory: {ref_path}")
-                            validation_ref = None
-                        else:
-                            logger.info(f"Found {len(image_files)} images in directory")
+                        ref_list = []
+                        sample_size = [val_height, val_width]
+                        for img_path in image_files:
+                            frame_latent = get_image_latent(ref_image=img_path, sample_size=sample_size, padding=False) # [1, C, 1, H, W]
+                            ref_list.append(frame_latent)
+                        
+                        # Concatenate all frames: list of [1, C, 1, H, W] -> [1, C, F, H, W]
+                        validation_ref = torch.cat(ref_list, dim=2)
+                        logger.info(f"Loaded reference from directory with {len(image_files)} frames, shape: {validation_ref.shape}")
+                        
+                        ref_frame_indices = list(range(len(image_files)))
+                else:
+                    # Check if ref is image or video by extension
+                    ref_ext = ref_path.lower().split('.')[-1]
+                    if ref_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
+                        sample_size = [val_height, val_width]
+                        validation_ref = get_image_latent(ref_image=ref_path, sample_size=sample_size, padding=False) # [1, C, 1, H, W]
+                        logger.info(f"Loaded reference image with shape: {validation_ref.shape}")
+                        
+                        ref_frame_indices = [0]
+                    else:
+                        # Load as video
+                        try:
+                            vr = VideoReader(ref_path)
+                            total_frames = len(vr)
+                            
+                            # Use same sampling logic as poseref: always take first frame, then sample from segments
+                            if total_frames <= num_ref_frames_in_vid:
+                                frame_indices = list(range(total_frames))
+                            else:
+                                # Always take the first frame
+                                frame_indices = [0]
+                                
+                                if num_ref_frames_in_vid > 1:
+                                    segment_boundaries = np.linspace(0, total_frames - 1, num_ref_frames_in_vid, dtype=int)
+                                    for j in range(1, num_ref_frames_in_vid):
+                                        segment_start = segment_boundaries[j - 1]
+                                        segment_end = segment_boundaries[j]
+                                        if segment_start >= segment_end:
+                                            segment_end = min(segment_start + 1, total_frames - 1)
+                                        random_idx = np.random.randint(max(segment_start + 1, 1), segment_end + 1)
+                                        frame_indices.append(random_idx)
+                            
+                            ref_frame_indices = frame_indices
                             
                             ref_list = []
                             sample_size = [val_height, val_width]
-                            for img_path in image_files:
-                                frame_latent = get_image_latent(ref_image=img_path, sample_size=sample_size, padding=False) # [1, C, 1, H, W]
-                                ref_list.append(frame_latent)
+                            for idx in frame_indices:
+                                frame = vr[idx].asnumpy()
+                                frame_pil = Image.fromarray(frame)
+                                
+                                # Resize and pad the frame to match validation size (following train_poseref.py)
+                                frame_pil = padding_image(frame_pil, sample_size[1], sample_size[0])
+                                frame_pil = frame_pil.resize((sample_size[1], sample_size[0]))
+                                
+                                # Convert to tensor (returns [1, C, 1, H, W])
+                                frame_tensor = torch.from_numpy(np.array(frame_pil))
+                                frame_tensor = frame_tensor.unsqueeze(0).permute([3, 0, 1, 2]).unsqueeze(0) / 255
+                                # Squeeze the frame dimension: [1, C, 1, H, W] -> [1, C, H, W]
+                                frame_tensor = frame_tensor.squeeze(2)
+                                ref_list.append(frame_tensor)
                             
-                            # Concatenate all frames: list of [1, C, 1, H, W] -> [1, C, F, H, W]
-                            validation_ref = torch.cat(ref_list, dim=2)
-                            logger.info(f"Loaded reference from directory with {len(image_files)} frames, shape: {validation_ref.shape}")
+                            # Concatenate all frames: list of [1, C, H, W] -> [1, C, F, H, W]
+                            validation_ref = torch.cat([f.unsqueeze(2) for f in ref_list], dim=2)
+                            logger.info(f"Loaded reference video with {len(frame_indices)} sampled frames, shape: {validation_ref.shape}")
                             
-                            # Save validation reference as gif
-                            os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
-                            save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                        except Exception as e:
+                            logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
+                            validation_ref = None
+                            ref_frame_indices = None
+            
+            # Load validation ref_coordmap if provided (must be loaded right after validation_ref)
+            validation_ref_coordmap = None
+            if args.validation_ref_coordmap_path is not None:
+                ref_coordmap_path = args.validation_ref_coordmap_path
+                logger.info(f"Loading validation ref_coordmap from: {ref_coordmap_path}")
+                try:
+                    vr = VideoReader(ref_coordmap_path)
+                    total_frames = len(vr)
+                    
+                    # Use the SAME frame indices as ref
+                    if ref_frame_indices is not None:
+                        frame_indices = ref_frame_indices
+                        logger.info(f"Using same frame indices as ref: {frame_indices}")
                     else:
-                        # Check if ref is image or video by extension
-                        ref_ext = ref_path.lower().split('.')[-1]
-                        if ref_ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']:
-                            sample_size = [val_height, val_width]
-                            validation_ref = get_image_latent(ref_image=ref_path, sample_size=sample_size, padding=False) # [1, C, 1, H, W]
-                            logger.info(f"Loaded reference image with shape: {validation_ref.shape}")
-                            
-                            # Save validation reference image as gif (single frame)
-                            os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
-                            save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
-                        else:
-                            # Load as video
-                            try:
-                                vr = VideoReader(ref_path)
-                                total_frames = len(vr)
-                                
-                                # Use same sampling logic as poseref: always take first frame, then sample from segments
-                                if total_frames <= num_ref_frames_in_vid:
-                                    frame_indices = list(range(total_frames))
-                                else:
-                                    # Always take the first frame
-                                    frame_indices = [0]
-                                    
-                                    if num_ref_frames_in_vid > 1:
-                                        segment_boundaries = np.linspace(0, total_frames - 1, num_ref_frames_in_vid, dtype=int)
-                                        for j in range(1, num_ref_frames_in_vid):
-                                            segment_start = segment_boundaries[j - 1]
-                                            segment_end = segment_boundaries[j]
-                                            if segment_start >= segment_end:
-                                                segment_end = min(segment_start + 1, total_frames - 1)
-                                            random_idx = np.random.randint(max(segment_start + 1, 1), segment_end + 1)
-                                            frame_indices.append(random_idx)
-                                
-                                ref_list = []
-                                sample_size = [val_height, val_width]
-                                for idx in frame_indices:
-                                    frame = vr[idx].asnumpy()
-                                    frame_pil = Image.fromarray(frame)
-                                    
-                                    # Resize and pad the frame to match validation size (following train_poseref.py)
-                                    frame_pil = padding_image(frame_pil, sample_size[1], sample_size[0])
-                                    frame_pil = frame_pil.resize((sample_size[1], sample_size[0]))
-                                    
-                                    # Convert to tensor (returns [1, C, 1, H, W])
-                                    frame_tensor = torch.from_numpy(np.array(frame_pil))
-                                    frame_tensor = frame_tensor.unsqueeze(0).permute([3, 0, 1, 2]).unsqueeze(0) / 255
-                                    # Squeeze the frame dimension: [1, C, 1, H, W] -> [1, C, H, W]
-                                    frame_tensor = frame_tensor.squeeze(2)
-                                    ref_list.append(frame_tensor)
-                                
-                                # Concatenate all frames: list of [1, C, H, W] -> [1, C, F, H, W]
-                                validation_ref = torch.cat([f.unsqueeze(2) for f in ref_list], dim=2)
-                                logger.info(f"Loaded reference video with {len(frame_indices)} sampled frames, shape: {validation_ref.shape}")
-                                
-                                # Save validation reference as gif
-                                os.makedirs(os.path.join(args.output_dir, f"validation/step-{global_step}"), exist_ok=True)
-                                # save_videos_grid expects torch.Tensor input
-                                save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
-                                
-                            except Exception as e:
-                                logger.warning(f"Failed to load reference video: {e}, will use generated first frame instead")
-                                validation_ref = None
+                        # ref_frame_indices must be provided when using ref_coordmap
+                        raise ValueError("ref_frame_indices is None, but ref_coordmap requires the same frame indices as ref")
+                    
+                    ref_coordmap_frames = []
+                    for idx in frame_indices:
+                        frame = vr[idx].asnumpy()
+                        frame_pil = Image.fromarray(frame)
+                        # Resize to validation size
+                        frame_pil = frame_pil.resize((val_width, val_height))
+                        ref_coordmap_frames.append(np.array(frame_pil))
+                    
+                    # Stack to [F, H, W, C]
+                    validation_ref_coordmap = np.stack(ref_coordmap_frames, axis=0)
+                    # Convert to torch and normalize to [0, 1]
+                    validation_ref_coordmap = torch.from_numpy(validation_ref_coordmap).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
+                    validation_ref_coordmap = validation_ref_coordmap.unsqueeze(0)  # [1, F, C, H, W]
+                    logger.info(f"Loaded validation ref_coordmap with shape: {validation_ref_coordmap.shape}")
+                except Exception as e:
+                    logger.warning(f"Failed to load validation ref_coordmap: {e}")
+                    validation_ref_coordmap = None
+            
+            # Save concatenated ref.gif (validation_ref + validation_ref_coordmap)
+            if validation_ref is not None:
+                os.makedirs(os.path.join(args.output_dir, f"validation"), exist_ok=True)
                 
-                # Load validation fg (control_video) if provided
-                validation_fg = None
-                validation_bg_mask = None
-                if args.validation_fg_path is not None:
-                    fg_path = args.validation_fg_path
-                    logger.info(f"Loading validation fg from: {fg_path}")
-                    try:
-                        vr = VideoReader(fg_path)
-                        total_frames = len(vr)
-                        # Sample frames to match val_frames
-                        if total_frames <= val_frames:
-                            frame_indices = list(range(total_frames))
-                        else:
-                            frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
-                        
-                        fg_frames = []
-                        for idx in frame_indices:
-                            frame = vr[idx].asnumpy()
-                            frame_pil = Image.fromarray(frame)
-                            # Resize to validation size
-                            frame_pil = frame_pil.resize((val_width, val_height))
-                            fg_frames.append(np.array(frame_pil))
-                        
-                        # Stack to [F, H, W, C]
-                        validation_fg = np.stack(fg_frames, axis=0)
-                        # Convert to torch and normalize to [-1, 1]
-                        validation_fg = torch.from_numpy(validation_fg).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
-                        validation_fg = validation_fg * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-                        validation_fg = validation_fg.unsqueeze(0)  # [1, F, C, H, W]
-                        logger.info(f"Loaded validation fg with shape: {validation_fg.shape}")
-                    except Exception as e:
-                        logger.warning(f"Failed to load validation fg: {e}")
-                        validation_fg = None
+                if validation_ref_coordmap is not None:
+                    # Assert frame counts match
+                    ref_frames = validation_ref.shape[2]  # [1, C, F, H, W]
+                    coordmap_frames = validation_ref_coordmap.shape[1]  # [1, F, C, H, W]
+                    assert ref_frames == coordmap_frames, \
+                        f"Frame count mismatch: validation_ref has {ref_frames} frames but validation_ref_coordmap has {coordmap_frames} frames"
+                    
+                    # Convert validation_ref_coordmap from [1, F, C, H, W] to [1, C, F, H, W]
+                    validation_ref_coordmap_reformat = validation_ref_coordmap.permute(0, 2, 1, 3, 4)  # [1, C, F, H, W]
+                    
+                    # Use comparison_list to concatenate ref and coordmap
+                    comparison_list = [validation_ref, validation_ref_coordmap_reformat]
+                    ref_and_coordmap = torch.cat(comparison_list, dim=0)  # [2, C, F, H, W]
+                    save_videos_grid(ref_and_coordmap, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                    logger.info(f"Saved validation ref.gif with ref+coordmap concatenated, shape: {ref_and_coordmap.shape}")
+                else:
+                    # Only save validation_ref if coordmap is not available
+                    save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                    logger.info(f"Saved validation ref.gif with ref only, shape: {validation_ref.shape}")
+            
+            # Load validation fg (control_video) if provided
+            validation_fg = None
+            validation_bg_mask = None
+            if args.validation_fg_path is not None:
+                fg_path = args.validation_fg_path
+                logger.info(f"Loading validation fg from: {fg_path}")
+                try:
+                    vr = VideoReader(fg_path)
+                    total_frames = len(vr)
+                    # Sample frames to match val_frames
+                    if total_frames <= val_frames:
+                        frame_indices = list(range(total_frames))
+                    else:
+                        frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
+                    
+                    fg_frames = []
+                    for idx in frame_indices:
+                        frame = vr[idx].asnumpy()
+                        frame_pil = Image.fromarray(frame)
+                        # Resize to validation size
+                        frame_pil = frame_pil.resize((val_width, val_height))
+                        fg_frames.append(np.array(frame_pil))
+                    
+                    # Stack to [F, H, W, C]
+                    validation_fg = np.stack(fg_frames, axis=0)
+                    # Convert to torch and normalize to [0, 1]
+                    validation_fg = torch.from_numpy(validation_fg).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
+                    validation_fg = validation_fg.unsqueeze(0)  # [1, F, C, H, W]
+                    logger.info(f"Loaded validation fg with shape: {validation_fg.shape}")
+                except Exception as e:
+                    logger.warning(f"Failed to load validation fg: {e}")
+                    validation_fg = None
+            
+            # Load validation bg_mask if provided
+            if args.validation_bg_mask_path is not None:
+                bg_mask_path = args.validation_bg_mask_path
+                logger.info(f"Loading validation bg_mask from: {bg_mask_path}")
+                try:
+                    vr = VideoReader(bg_mask_path)
+                    total_frames = len(vr)
+                    # Sample frames to match val_frames
+                    if total_frames <= val_frames:
+                        frame_indices = list(range(total_frames))
+                    else:
+                        frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
+                    
+                    bg_mask_frames = []
+                    for idx in frame_indices:
+                        frame = vr[idx].asnumpy()
+                        frame_pil = Image.fromarray(frame)
+                        # Resize to validation size
+                        frame_pil = frame_pil.resize((val_width, val_height))
+                        bg_mask_frames.append(np.array(frame_pil))
+                    
+                    # Stack to [F, H, W, C]
+                    validation_bg_mask = np.stack(bg_mask_frames, axis=0)
+                    # Convert to torch and normalize to [0, 1]
+                    validation_bg_mask = torch.from_numpy(validation_bg_mask).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
+                    validation_bg_mask = validation_bg_mask.unsqueeze(0)  # [1, F, C, H, W]
+                    logger.info(f"Loaded validation bg_mask with shape: {validation_bg_mask.shape}")
+                except Exception as e:
+                    logger.warning(f"Failed to load validation bg_mask: {e}")
+                    validation_bg_mask = None
+            
+            # Load validation bgvideo if provided
+            validation_bgvideo = None
+            if args.validation_bgvideo_path is not None:
+                bgvideo_path = args.validation_bgvideo_path
+                logger.info(f"Loading validation bgvideo from: {bgvideo_path}")
+                try:
+                    vr = VideoReader(bgvideo_path)
+                    total_frames = len(vr)
+                    # Sample frames to match val_frames
+                    if total_frames <= val_frames:
+                        frame_indices = list(range(total_frames))
+                    else:
+                        frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
+                    
+                    bgvideo_frames = []
+                    for idx in frame_indices:
+                        frame = vr[idx].asnumpy()
+                        frame_pil = Image.fromarray(frame)
+                        # Resize to validation size
+                        frame_pil = frame_pil.resize((val_width, val_height))
+                        bgvideo_frames.append(np.array(frame_pil))
+                    
+                    # Stack to [F, H, W, C]
+                    validation_bgvideo = np.stack(bgvideo_frames, axis=0)
+                    # Convert to torch and normalize to [0, 1]
+                    validation_bgvideo = torch.from_numpy(validation_bgvideo).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
+                    validation_bgvideo = validation_bgvideo.unsqueeze(0)  # [1, F, C, H, W]
+                    logger.info(f"Loaded validation bgvideo with shape: {validation_bgvideo.shape}")
+                except Exception as e:
+                    logger.warning(f"Failed to load validation bgvideo: {e}")
+                    validation_bgvideo = None
+            
+            # Load validation fg_coordmap if provided
+            validation_fg_coordmap = None
+            if args.validation_fg_coordmap_path is not None:
+                fg_coordmap_path = args.validation_fg_coordmap_path
+                logger.info(f"Loading validation fg_coordmap from: {fg_coordmap_path}")
+                try:
+                    vr = VideoReader(fg_coordmap_path)
+                    total_frames = len(vr)
+                    # Sample frames to match val_frames
+                    if total_frames <= val_frames:
+                        frame_indices = list(range(total_frames))
+                    else:
+                        frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
+                    
+                    fg_coordmap_frames = []
+                    for idx in frame_indices:
+                        frame = vr[idx].asnumpy()
+                        frame_pil = Image.fromarray(frame)
+                        # Resize to validation size
+                        frame_pil = frame_pil.resize((val_width, val_height))
+                        fg_coordmap_frames.append(np.array(frame_pil))
+                    
+                    # Stack to [F, H, W, C]
+                    validation_fg_coordmap = np.stack(fg_coordmap_frames, axis=0)
+                    # Convert to torch and normalize to [0, 1]
+                    validation_fg_coordmap = torch.from_numpy(validation_fg_coordmap).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
+                    validation_fg_coordmap = validation_fg_coordmap.unsqueeze(0)  # [1, F, C, H, W]
+                    logger.info(f"Loaded validation fg_coordmap with shape: {validation_fg_coordmap.shape}")
+                except Exception as e:
+                    logger.warning(f"Failed to load validation fg_coordmap: {e}")
+                    validation_fg_coordmap = None
+            
+            # Load validation GT video for start_image if provided
+            validation_gt = None
+            if args.validation_gt_path is not None:
+                gt_path = args.validation_gt_path
+                logger.info(f"Loading validation GT from: {gt_path}")
+                try:
+                    vr = VideoReader(gt_path)
+                    total_frames = len(vr)
+                    # Sample frames to match val_frames
+                    if total_frames <= val_frames:
+                        frame_indices = list(range(total_frames))
+                    else:
+                        frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
+                    
+                    gt_frames = []
+                    for idx in frame_indices:
+                        frame = vr[idx].asnumpy()
+                        frame_pil = Image.fromarray(frame)
+                        # Resize to validation size
+                        frame_pil = frame_pil.resize((val_width, val_height))
+                        gt_frames.append(np.array(frame_pil))
+                    
+                    # Stack to [F, H, W, C]
+                    validation_gt = np.stack(gt_frames, axis=0)
+                    # Convert to torch and normalize to [0, 1]
+                    validation_gt = torch.from_numpy(validation_gt).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
+                    validation_gt = validation_gt.unsqueeze(0)  # [1, F, C, H, W]
+                    logger.info(f"Loaded validation GT with shape: {validation_gt.shape}")
+                except Exception as e:
+                    logger.warning(f"Failed to load validation GT: {e}")
+                    validation_gt = None
+            
+            # Generate with reference if provided
+            if validation_ref is not None:
+                # Prepare ref_image: validation_ref is [1, C, F, H, W]
+                # For WanFunCroodRefPipeline, ref_image expects [B, C, F, H, W]
+                ref_image_input = validation_ref.to(device=accelerator.device, dtype=weight_dtype)
                 
-                # Load validation bg_mask if provided
-                if args.validation_bg_mask_path is not None:
-                    bg_mask_path = args.validation_bg_mask_path
-                    logger.info(f"Loading validation bg_mask from: {bg_mask_path}")
-                    try:
-                        vr = VideoReader(bg_mask_path)
-                        total_frames = len(vr)
-                        # Sample frames to match val_frames
-                        if total_frames <= val_frames:
-                            frame_indices = list(range(total_frames))
-                        else:
-                            frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
-                        
-                        bg_mask_frames = []
-                        for idx in frame_indices:
-                            frame = vr[idx].asnumpy()
-                            frame_pil = Image.fromarray(frame)
-                            # Resize to validation size
-                            frame_pil = frame_pil.resize((val_width, val_height))
-                            bg_mask_frames.append(np.array(frame_pil))
-                        
-                        # Stack to [F, H, W, C]
-                        validation_bg_mask = np.stack(bg_mask_frames, axis=0)
-                        # Convert to torch and normalize to [-1, 1]
-                        validation_bg_mask = torch.from_numpy(validation_bg_mask).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
-                        validation_bg_mask = validation_bg_mask * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-                        validation_bg_mask = validation_bg_mask.unsqueeze(0)  # [1, F, C, H, W]
-                        logger.info(f"Loaded validation bg_mask with shape: {validation_bg_mask.shape}")
-                    except Exception as e:
-                        logger.warning(f"Failed to load validation bg_mask: {e}")
-                        validation_bg_mask = None
+                # Prepare ref_coordmap if provided
+                ref_coordmap_input = None
+                if validation_ref_coordmap is not None:
+                    # validation_ref_coordmap is [1, F, C, H, W]
+                    ref_coordmap_input = validation_ref_coordmap.to(device=accelerator.device, dtype=weight_dtype)
+                    logger.info(f"Ref coordmap input shape: {ref_coordmap_input.shape}")
                 
-                # Load validation GT video for start_image if provided
-                validation_gt = None
-                if args.validation_gt_path is not None:
-                    gt_path = args.validation_gt_path
-                    logger.info(f"Loading validation GT from: {gt_path}")
-                    try:
-                        vr = VideoReader(gt_path)
-                        total_frames = len(vr)
-                        # Sample frames to match val_frames
-                        if total_frames <= val_frames:
-                            frame_indices = list(range(total_frames))
-                        else:
-                            frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
-                        
-                        gt_frames = []
-                        for idx in frame_indices:
-                            frame = vr[idx].asnumpy()
-                            frame_pil = Image.fromarray(frame)
-                            # Resize to validation size
-                            frame_pil = frame_pil.resize((val_width, val_height))
-                            gt_frames.append(np.array(frame_pil))
-                        
-                        # Stack to [F, H, W, C]
-                        validation_gt = np.stack(gt_frames, axis=0)
-                        # Convert to torch and normalize to [-1, 1]
-                        validation_gt = torch.from_numpy(validation_gt).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
-                        validation_gt = validation_gt * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-                        validation_gt = validation_gt.unsqueeze(0)  # [1, F, C, H, W]
-                        logger.info(f"Loaded validation GT with shape: {validation_gt.shape}")
-                    except Exception as e:
-                        logger.warning(f"Failed to load validation GT: {e}")
-                        validation_gt = None
+                # Prepare fg_coordmap if provided
+                fg_coordmap_input = None
+                if validation_fg_coordmap is not None:
+                    # validation_fg_coordmap is [1, F, C, H, W]
+                    fg_coordmap_input = validation_fg_coordmap.to(device=accelerator.device, dtype=weight_dtype)
+                    logger.info(f"FG coordmap input shape: {fg_coordmap_input.shape}")
                 
-                # Generate with reference if provided
-                if validation_ref is not None:
-                    # Prepare ref_image: validation_ref is [1, C, F, H, W], need to convert to proper format
-                    # For WanFunControlPipeline, ref_image expects [B, C, F, H, W]
-                    ref_video_input = validation_ref.to(device=accelerator.device, dtype=weight_dtype)
-                    
-                    # Prepare control_video: fg as control_video
-                    # validation_fg is [1, F, C, H, W], need to convert to [B, C, F, H, W]
-                    if validation_fg is not None:
-                        fg_input = validation_fg.to(device=accelerator.device, dtype=weight_dtype)
-                        
-                        # Process fg with bg_mask if provided
-                        if validation_bg_mask is not None:
-                            bg_mask_input = validation_bg_mask.to(device=accelerator.device, dtype=weight_dtype)
-                            
-                            # Convert bg_mask from [-1, 1] to [0, 1] for masking
-                            mask_binary = (bg_mask_input + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-                            mask_binary = 1 - mask_binary # [0, 1] -> [1, 0]
-                            
-                            # Apply mask to fg: where mask=1 keep fg, where mask=0 use black (-1)
-                            fg_input = fg_input * mask_binary + (-1.0) * (1.0 - mask_binary)
-                            
-                            logger.info(f"Applied bg_mask to fg, masked_fg shape: {fg_input.shape}")
-                        
-                        # Rearrange from [B, F, C, H, W] to [B, C, F, H, W]
-                        control_video_input = fg_input.permute(0, 2, 1, 3, 4)
-                        logger.info(f"Control video input shape: {control_video_input.shape}")
-                    else:
-                        control_video_input = None
-                    
-                    # Prepare start_image from first frame of GT video if provided
-                    start_image_input = None
-                    if validation_gt is not None:
-                        # validation_gt is [1, F, C, H, W], need to convert to [B, C, F, H, W]
-                        gt_input = validation_gt.to(device=accelerator.device, dtype=weight_dtype)
-                        # Rearrange from [B, F, C, H, W] to [B, C, F, H, W]
-                        gt_input = gt_input.permute(0, 2, 1, 3, 4)
-                        # Extract first frame: [1, C, 1, H, W]
-                        start_image_input = gt_input[:, :, 0:1, :, :]
-                        logger.info(f"Start image input shape (from GT): {start_image_input.shape}")
-                    else:
-                        # Fallback to ref_video_input first frame
-                        start_image_input = ref_video_input[:, :, 0:1, :, :]
-                        logger.info(f"Start image input shape (from ref): {start_image_input.shape}")
-                    
-                    sample_with_ref = pipeline(
-                        args.validation_prompts[i],
-                        num_frames = val_frames,
-                        negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走", 
-                        height      = val_height,
-                        width       = val_width,
-                        generator   = generator,
-                        ref_image   = ref_video_input,  # validation_ref as ref_image for full_ref
-                        control_video = control_video_input,  # fg as control_video
-                        start_image = start_image_input,  # first frame of ref as start_image
-                    ).videos
+                # Prepare bg_mask if provided (for masking fg_coordmap in pipeline)
+                bg_mask_input = None
+                if validation_bg_mask is not None:
+                    # validation_bg_mask is [1, F, C, H, W]
+                    bg_mask_input = validation_bg_mask.to(device=accelerator.device, dtype=weight_dtype)
+                    logger.info(f"BG mask input shape: {bg_mask_input.shape}")
+                
+                # Prepare bg_video if provided
+                bg_video_input = None
+                if validation_bgvideo is not None:
+                    # validation_bgvideo is [1, F, C, H, W]
+                    bg_video_input = validation_bgvideo.to(device=accelerator.device, dtype=weight_dtype)
+                    logger.info(f"BG video input shape: {bg_video_input.shape}")
+                
+                # Prepare start_image from first frame of GT video if provided
+                start_image_input = None
+                if validation_gt is not None:
+                    # validation_gt is [1, F, C, H, W], need to convert to [B, C, 1, H, W]
+                    gt_input = validation_gt.to(device=accelerator.device, dtype=weight_dtype)
+                    # Rearrange from [B, F, C, H, W] to [B, C, F, H, W]
+                    gt_input = gt_input.permute(0, 2, 1, 3, 4)
+                    # Extract first frame: [1, C, 1, H, W]
+                    start_image_input = gt_input[:, :, 0:1, :, :]
+                    logger.info(f"Start image input shape (from GT): {start_image_input.shape}")
+                
+                sample_with_ref = pipeline(
+                    args.validation_prompts[i],
+                    num_frames = val_frames,
+                    negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走", 
+                    height      = val_height,
+                    width       = val_width,
+                    generator   = generator,
+                    ref_image   = ref_image_input,      # validation_ref as ref_image
+                    ref_coordmap = ref_coordmap_input,  # validation_ref_coordmap
+                    fg_coordmap = fg_coordmap_input,    # validation_fg_coordmap
+                    bg_mask     = bg_mask_input,        # validation_bg_mask (for masking fg_coordmap)
+                    bg_video    = bg_video_input,       # validation_bgvideo
+                    start_image = start_image_input,    # first frame of GT
+                ).videos
 
-                    # save as gif if single frame, otherwise save as mp4
-                    if sample_with_ref.shape[2] == 1:
-                        save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.gif"), fps=24)
-                    else:
-                        save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=24)
+                # save as gif if single frame, otherwise save as mp4
+                if sample_with_ref.shape[2] == 1:
+                    save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.gif"), fps=24)
+                else:
+                    save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=24)
 
-                    # frame mismatch
-                    ref_frames = validation_ref.shape[2]
-                    sample_frames = sample_with_ref.shape[2]
+                # frame mismatch
+                ref_frames = validation_ref.shape[2]
+                sample_frames = sample_with_ref.shape[2]
+                
+                if ref_frames != sample_frames:
+                    B, C, F_ref, H, W = validation_ref.shape
+                    validation_ref_reshaped = validation_ref.view(B * C, 1, F_ref, H * W)
+                    validation_ref_interpolated = torch.nn.functional.interpolate(
+                        validation_ref_reshaped,
+                        size=(sample_frames, H * W),
+                        mode='nearest'
+                    )
+                    validation_ref = validation_ref_interpolated.view(B, C, sample_frames, H, W)
+                
+                # spatial mismatch
+                ref_h, ref_w = validation_ref.shape[3], validation_ref.shape[4]
+                sample_h, sample_w = sample_with_ref.shape[3], sample_with_ref.shape[4]
+                
+                if ref_h != sample_h or ref_w != sample_w:
+                    # Keep ratio resize + center crop
+                    scale = max(ref_h / sample_h, ref_w / sample_w)
+                    new_h, new_w = int(sample_h * scale), int(sample_w * scale)
                     
-                    if ref_frames != sample_frames:
-                        B, C, F_ref, H, W = validation_ref.shape
-                        validation_ref_reshaped = validation_ref.view(B * C, 1, F_ref, H * W)
-                        validation_ref_interpolated = torch.nn.functional.interpolate(
-                            validation_ref_reshaped,
-                            size=(sample_frames, H * W),
-                            mode='nearest'
-                        )
-                        validation_ref = validation_ref_interpolated.view(B, C, sample_frames, H, W)
+                    # Resize
+                    sample_resized = F.interpolate(
+                        sample_with_ref.view(-1, sample_with_ref.shape[1], sample_h, sample_w),
+                        size=(new_h, new_w), mode='bilinear', align_corners=False
+                    )
+                    sample_resized = sample_resized.view(sample_with_ref.shape[0], sample_with_ref.shape[1], sample_with_ref.shape[2], new_h, new_w)
                     
-                    # spatial mismatch
-                    ref_h, ref_w = validation_ref.shape[3], validation_ref.shape[4]
-                    sample_h, sample_w = sample_with_ref.shape[3], sample_with_ref.shape[4]
+                    # Center crop to match ref size
+                    start_h = max(0, (new_h - ref_h) // 2)
+                    start_w = max(0, (new_w - ref_w) // 2)
+                    end_h = start_h + ref_h
+                    end_w = start_w + ref_w
+                    sample_with_ref = sample_resized[:, :, :, start_h:end_h, start_w:end_w]
+                
+                # Prepare comparison visualization
+                # Use fg_coordmap for visualization if available, otherwise use zeros
+                if fg_coordmap_input is not None:
+                    # fg_coordmap_input is [1, F, C, H, W], convert to [1, C, F, H, W]
+                    # Already in [0, 1] range, no conversion needed
+                    viz_fg_coordmap = fg_coordmap_input.permute(0, 2, 1, 3, 4)
+                else:
+                    viz_fg_coordmap = torch.zeros((1, 3, val_frames, val_height, val_width), device=accelerator.device, dtype=weight_dtype)
+                
+                comparison_list = [validation_ref, sample_with_ref, viz_fg_coordmap.cpu()]
+                
+                # Add validation_gt if available
+                if validation_gt is not None:
+                    # validation_gt is [1, F, C, H, W], convert to [1, C, F, H, W]
+                    # Already in [0, 1] range, no conversion needed
+                    validation_gt_reformat = validation_gt.permute(0, 2, 1, 3, 4)
+                    comparison_list.append(validation_gt_reformat.cpu())
+                
+                comparison_video = torch.cat(comparison_list, dim=0)  # [3 or 4, C, F, H, W]
+                if comparison_video.shape[2] == 1:
+                    comparison_frame = comparison_video[0, :, 0, :, :].permute(1, 2, 0).clamp(0, 1) * 255
+                    comparison_frame = comparison_frame.cpu().numpy().astype('uint8')
+                    Image.fromarray(comparison_frame).save(os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.png"))
+                else:
+                    save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=24)
+
+                if i == 0: # Log only the first prompt's result
+                    log_dict = {}
                     
-                    if ref_h != sample_h or ref_w != sample_w:
-                        # Keep ratio resize + center crop
-                        scale = max(ref_h / sample_h, ref_w / sample_w)
-                        new_h, new_w = int(sample_h * scale), int(sample_w * scale)
-                        
-                        # Resize
-                        sample_resized = F.interpolate(
-                            sample_with_ref.view(-1, sample_with_ref.shape[1], sample_h, sample_w),
-                            size=(new_h, new_w), mode='bilinear', align_corners=False
-                        )
-                        sample_resized = sample_resized.view(sample_with_ref.shape[0], sample_with_ref.shape[1], sample_with_ref.shape[2], new_h, new_w)
-                        
-                        # Center crop to match ref size
-                        start_h = max(0, (new_h - ref_h) // 2)
-                        start_w = max(0, (new_w - ref_w) // 2)
-                        end_h = start_h + ref_h
-                        end_w = start_w + ref_w
-                        sample_with_ref = sample_resized[:, :, :, start_h:end_h, start_w:end_w]
+                    # Prepare comparison for logging
+                    log_comparison = comparison_video.clone().detach().clamp(0, 1) * 255
+                    log_comparison = log_comparison.permute(0, 2, 1, 3, 4).to(torch.uint8)  # [3 or 4, F, C, H, W]
+                    caption = f"{args.validation_prompts[i].split('.')[0]}..."
+
+                    if args.report_to == "wandb":
+                        log_dict["validation/comparison"] = wandb.Video(log_comparison.cpu(), fps=24, format="gif", caption=caption)
+                    else: # Tensorboard
+                        log_dict["validation/comparison"] = log_comparison
                     
-                    if control_video_input is None:
-                        control_video_input = torch.zeros((1, 3, val_frames, val_height, val_width), device=accelerator.device, dtype=weight_dtype)
+                    accelerator.log(log_dict, step=global_step)
 
-                    control_video_input = (control_video_input + 1.0) / 2.0
-                    comparison_list = [validation_ref, sample_with_ref, control_video_input.cpu()]
-                    comparison_video = torch.cat(comparison_list, dim=0)  # [3, C, F, H, W]
-                    if comparison_video.shape[2] == 1:
-                        comparison_frame = comparison_video[0, :, 0, :, :].permute(1, 2, 0).clamp(0, 1) * 255
-                        comparison_frame = comparison_frame.cpu().numpy().astype('uint8')
-                        Image.fromarray(comparison_frame).save(os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.png"))
-                    else:
-                        save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=24)
+    del pipeline
+    del transformer3d_val
+    del clip_image_encoder
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
-                    if i == 0: # Log only the first prompt's result
-                        log_dict = {}
-                        
-                        # Prepare comparison for logging
-                        log_comparison = comparison_video.clone().detach().clamp(0, 1) * 255
-                        log_comparison = log_comparison.permute(0, 2, 1, 3, 4).to(torch.uint8)  # [2, F, C, H, W]
-                        caption = f"{args.validation_prompts[i].split('.')[0]}..."
-
-                        if args.report_to == "wandb":
-                            log_dict["validation/comparison"] = wandb.Video(log_comparison.cpu(), fps=24, format="gif", caption=caption)
-                        else: # Tensorboard
-                            log_dict["validation/comparison"] = log_comparison
-                        
-                        accelerator.log(log_dict, step=global_step)
-
-        del pipeline
-        del transformer3d_val
-        del clip_image_encoder
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-        return images
-    except Exception as e:
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        print(f"Eval error with info {e}")
-        return None
+    return images
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -613,6 +739,24 @@ def parse_args():
         type=str,
         default=None,
         help=("Path to background mask video used for validation."),
+    )
+    parser.add_argument(
+        "--validation_bgvideo_path",
+        type=str,
+        default=None,
+        help=("Path to background video used for validation."),
+    )
+    parser.add_argument(
+        "--validation_ref_coordmap_path",
+        type=str,
+        default=None,
+        help=("Path to reference coordmap video used for validation."),
+    )
+    parser.add_argument(
+        "--validation_fg_coordmap_path",
+        type=str,
+        default=None,
+        help=("Path to foreground coordmap video used for validation."),
     )
     parser.add_argument(
         "--validation_gt_path",
@@ -1190,15 +1334,14 @@ def main():
             additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
         )
         vae.eval()
-        # Commented out: Clip Image Encoder no longer needed
-        # if args.train_mode != "normal":
-        #     clip_image_encoder = CLIPModel.from_pretrained(
-        #         os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
-        #     )
-        #     clip_image_encoder = clip_image_encoder.eval()
+        # Get Clip Image Encoder
+        clip_image_encoder = CLIPModel.from_pretrained(
+            os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
+        )
+        clip_image_encoder = clip_image_encoder.eval()
             
-    # Get Transformer
-    transformer3d = WanTransformer3DModel.from_pretrained(
+    # Get Transformer (use CroodRefTransformer3DModel for croodref training)
+    transformer3d = CroodRefTransformer3DModel.from_pretrained(
         os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
         transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
     ).to(weight_dtype)
@@ -1207,9 +1350,7 @@ def main():
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     transformer3d.requires_grad_(False)
-    # Commented out: clip_image_encoder no longer used
-    # if args.train_mode != "normal":
-    #     clip_image_encoder.requires_grad_(False)
+    clip_image_encoder.requires_grad_(False)
 
     if args.transformer_path is not None:
         print(f"From checkpoint: {args.transformer_path}")
@@ -1254,12 +1395,12 @@ def main():
         if zero_stage == 3:
             raise NotImplementedError("FSDP does not support EMA.")
 
-        ema_transformer3d = WanTransformer3DModel.from_pretrained(
+        ema_transformer3d = CroodRefTransformer3DModel.from_pretrained(
             os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
             transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
         ).to(weight_dtype)
 
-        ema_transformer3d = EMAModel(ema_transformer3d.parameters(), model_cls=WanTransformer3DModel, model_config=ema_transformer3d.config)
+        ema_transformer3d = EMAModel(ema_transformer3d.parameters(), model_cls=CroodRefTransformer3DModel, model_config=ema_transformer3d.config)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -1316,12 +1457,12 @@ def main():
             def load_model_hook(models, input_dir):
                 if args.use_ema:
                     ema_path = os.path.join(input_dir, "transformer_ema")
-                    _, ema_kwargs = WanTransformer3DModel.load_config(ema_path, return_unused_kwargs=True)
-                    load_model = WanTransformer3DModel.from_pretrained(
+                    _, ema_kwargs = CroodRefTransformer3DModel.load_config(ema_path, return_unused_kwargs=True)
+                    load_model = CroodRefTransformer3DModel.from_pretrained(
                         input_dir, subfolder="transformer_ema",
                         transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs'])
                     )
-                    load_model = EMAModel(load_model.parameters(), model_cls=WanTransformer3DModel, model_config=load_model.config)
+                    load_model = EMAModel(load_model.parameters(), model_cls=CroodRefTransformer3DModel, model_config=load_model.config)
                     load_model.load_state_dict(ema_kwargs)
 
                     ema_transformer3d.load_state_dict(load_model.state_dict())
@@ -1333,7 +1474,7 @@ def main():
                     model = models.pop()
 
                     # load diffusers style into model
-                    load_model = WanTransformer3DModel.from_pretrained(
+                    load_model = CroodRefTransformer3DModel.from_pretrained(
                         input_dir, subfolder="transformer"
                     )
                     model.register_to_config(**load_model.config)
@@ -1440,7 +1581,7 @@ def main():
         args.training_with_video_token_length = False
         args.random_hw_adapt = False
 
-    # Get the dataset
+    # Get the dataset - using ImageVideoRefDataset which handles ref, bg_mask, fg, coordmap
     train_dataset = ImageVideoRefDataset(
         args.train_data_meta, args.train_data_dir,
         video_sample_size=args.video_sample_size, video_sample_stride=args.video_sample_stride, video_sample_n_frames=args.video_sample_n_frames, 
@@ -1448,7 +1589,6 @@ def main():
         image_sample_size=args.image_sample_size,
         enable_bucket=args.enable_bucket,
         enable_inpaint=True if args.train_mode != "normal" else False,
-        num_ref_frames=4,
     )
 
     def worker_init_fn(_seed):
@@ -1527,9 +1667,11 @@ def main():
             new_examples["text"]         = []
             # Used in Ref Mode
             new_examples["ref_pixel_values"] = []
-            # Used for bg_mask and fg
             new_examples["bg_mask"] = []
             new_examples["fg"] = []
+            new_examples["bg"] = []
+            new_examples["ref_coordmap"] = []
+            new_examples["fg_coordmap"] = []
 
             # Get downsample ratio in image and videos
             pixel_value     = examples[0]["pixel_values"]
@@ -1704,6 +1846,45 @@ def main():
                 else:
                     new_examples["fg"].append(None)
                 
+                # Append bg if exists
+                bg = example.get("bg", None)
+                if bg is not None:
+                    if isinstance(bg, np.ndarray):
+                        bg = torch.from_numpy(bg).permute(0, 3, 1, 2).contiguous()
+                        bg = bg / 255.
+                    elif isinstance(bg, torch.Tensor):
+                        if bg.dtype == torch.uint8:
+                            bg = bg.float() / 255.
+                    new_examples["bg"].append(transform(bg))
+                else:
+                    new_examples["bg"].append(None)
+                
+                # Append ref_coordmap if exists
+                ref_coordmap = example.get("ref_coordmap", None)
+                if ref_coordmap is not None:
+                    if isinstance(ref_coordmap, np.ndarray):
+                        ref_coordmap = torch.from_numpy(ref_coordmap).permute(0, 3, 1, 2).contiguous()
+                        ref_coordmap = ref_coordmap / 255.
+                    elif isinstance(ref_coordmap, torch.Tensor):
+                        if ref_coordmap.dtype == torch.uint8:
+                            ref_coordmap = ref_coordmap.float() / 255.
+                    new_examples["ref_coordmap"].append(transform(ref_coordmap))
+                else:
+                    new_examples["ref_coordmap"].append(None)
+                
+                # Append fg_coordmap if exists
+                fg_coordmap = example.get("fg_coordmap", None)
+                if fg_coordmap is not None:
+                    if isinstance(fg_coordmap, np.ndarray):
+                        fg_coordmap = torch.from_numpy(fg_coordmap).permute(0, 3, 1, 2).contiguous()
+                        fg_coordmap = fg_coordmap / 255.
+                    elif isinstance(fg_coordmap, torch.Tensor):
+                        if fg_coordmap.dtype == torch.uint8:
+                            fg_coordmap = fg_coordmap.float() / 255.
+                    new_examples["fg_coordmap"].append(transform(fg_coordmap))
+                else:
+                    new_examples["fg_coordmap"].append(None)
+                
                 new_examples["text"].append(example["text"])
                 # Magvae needs the number of frames to be 4n + 1.
                 batch_video_length = int(
@@ -1781,15 +1962,56 @@ def main():
             else:
                 new_examples.pop("fg")
             
-            # Random dropout for bg_mask and fg (10% chance to drop both)
+            # Stack bg if they exist
+            if all(example is not None for example in new_examples["bg"]):
+                new_examples["bg"] = torch.stack([example[:batch_video_length] for example in new_examples["bg"]])
+            else:
+                new_examples.pop("bg")
+            
+            # Stack ref_coordmap if they exist (handle different frame counts by cycling)
+            if all(example is not None for example in new_examples["ref_coordmap"]):
+                # Find the maximum number of frames in ref_coordmap
+                max_ref_coordmap_frames = max(ref.size(0) for ref in new_examples["ref_coordmap"])
+                
+                # Cycle shorter ref_coordmap sequences to match the longest one
+                aligned_ref_coordmap = []
+                for ref_coord in new_examples["ref_coordmap"]:
+                    ref_frames = ref_coord.size(0)
+                    if ref_frames < max_ref_coordmap_frames:
+                        # Calculate how many times to repeat + remainder
+                        repeat_times = max_ref_coordmap_frames // ref_frames
+                        remainder = max_ref_coordmap_frames % ref_frames
+                        
+                        # Create cycled sequence: repeat full cycles + partial cycle for remainder
+                        if remainder > 0:
+                            cycled_ref_coord = torch.cat([ref_coord.repeat(repeat_times, 1, 1, 1), ref_coord[:remainder]], dim=0)
+                        else:
+                            cycled_ref_coord = ref_coord.repeat(repeat_times, 1, 1, 1)
+                    else:
+                        cycled_ref_coord = ref_coord
+                    aligned_ref_coordmap.append(cycled_ref_coord)
+                
+                new_examples["ref_coordmap"] = torch.stack(aligned_ref_coordmap)
+            else:
+                new_examples.pop("ref_coordmap")
+            
+            # Stack fg_coordmap if they exist
+            if all(example is not None for example in new_examples["fg_coordmap"]):
+                new_examples["fg_coordmap"] = torch.stack([example[:batch_video_length] for example in new_examples["fg_coordmap"]])
+            else:
+                new_examples.pop("fg_coordmap")
+            
+            # Random dropout
             if rng is None:
                 if np.random.rand() < 0.1:
                     new_examples.pop("fg", None)
                     new_examples.pop("bg_mask", None)
+                    new_examples.pop("fg_coordmap", None)
             else:
                 if rng.random() < 0.1:
                     new_examples.pop("fg", None)
                     new_examples.pop("bg_mask", None)
+                    new_examples.pop("fg_coordmap", None)
 
             # Encode prompts when enable_text_encoder_in_dataloader=True
             if args.enable_text_encoder_in_dataloader:
@@ -1862,9 +2084,7 @@ def main():
     vae.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
     if not args.enable_text_encoder_in_dataloader:
         text_encoder.to(accelerator.device if not args.low_vram else "cpu")
-    # Commented out: clip_image_encoder no longer used
-    # if args.train_mode != "normal":
-    #     clip_image_encoder.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
+    clip_image_encoder.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -2052,11 +2272,15 @@ def main():
                 # Sample ref_pixel_values for each sample in batch
                 batch_size = ref_pixel_values.shape[0]
                 sampled_ref_pixel_values = []
+                ref_batch_indices = []  # Store indices for ref_coordmap sampling
                 for b in range(batch_size):
                     ref_total_frames = ref_pixel_values.shape[1]  # Number of frames in ref
                     # Sample frames using segment sampling
                     ref_batch_index = sample_ref_frames(ref_total_frames, num_ref_frames_to_use, rng=rng)
-                    sampled_ref_pixel_values.append(ref_pixel_values[b, ref_batch_index])
+                    ref_batch_indices.append(ref_batch_index)
+                    # Convert list of indices to tensor for safe indexing
+                    ref_batch_index_tensor = torch.tensor(ref_batch_index, dtype=torch.long)
+                    sampled_ref_pixel_values.append(ref_pixel_values[b, ref_batch_index_tensor])
                 
                 # Stack sampled refs - handle different frame counts by cycling shorter ones
                 max_ref_frames = max(ref.size(0) for ref in sampled_ref_pixel_values)
@@ -2078,6 +2302,38 @@ def main():
                     aligned_ref_pixel_values.append(cycled_ref)
                 
                 ref_pixel_values = torch.stack(aligned_ref_pixel_values)  # [B, F_sampled, C, H, W]
+                
+                # Sample ref_coordmap using the SAME indices as ref_pixel_values
+                ref_coordmap = None
+                if batch.get("ref_coordmap") is not None:
+                    ref_coordmap_values = batch["ref_coordmap"].to(weight_dtype)  # [B, F, C, H, W]
+                    
+                    # Use the SAME sampling indices as ref_pixel_values
+                    sampled_ref_coordmap = []
+                    for b in range(batch_size):
+                        # Use the same ref_batch_index that was used for ref_pixel_values
+                        ref_batch_index_tensor = torch.tensor(ref_batch_indices[b], dtype=torch.long)
+                        sampled_ref_coordmap.append(ref_coordmap_values[b, ref_batch_index_tensor])
+                    
+                    # Stack sampled refs - handle different frame counts by cycling shorter ones
+                    aligned_ref_coordmap = []
+                    for ref_coord in sampled_ref_coordmap:
+                        ref_frames = ref_coord.size(0)
+                        if ref_frames < max_ref_frames:
+                            # Calculate how many times to repeat + remainder
+                            repeat_times = max_ref_frames // ref_frames
+                            remainder = max_ref_frames % ref_frames
+                            
+                            # Create cycled sequence: repeat full cycles + partial cycle for remainder
+                            if remainder > 0:
+                                cycled_ref_coord = torch.cat([ref_coord.repeat(repeat_times, 1, 1, 1), ref_coord[:remainder]], dim=0)
+                            else:
+                                cycled_ref_coord = ref_coord.repeat(repeat_times, 1, 1, 1)
+                        else:
+                            cycled_ref_coord = ref_coord
+                        aligned_ref_coordmap.append(cycled_ref_coord)
+                    
+                    ref_coordmap = torch.stack(aligned_ref_coordmap)  # [B, F_sampled, C, H, W]
                 
                 if args.train_mode == "control_camera_ref":
                     control_camera_values = batch["control_camera_values"].to(weight_dtype)
@@ -2150,9 +2406,17 @@ def main():
                         bg_mask = batch["bg_mask"].to(weight_dtype)
                         bg_mask = bg_mask[:, :temp_n_frames, :, :]
                     
+                    if batch.get("bg") is not None:
+                        bg = batch["bg"].to(weight_dtype)
+                        bg = bg[:, :temp_n_frames, :, :]
+                    
                     if batch.get("fg") is not None:
                         fg = batch["fg"].to(weight_dtype)
                         fg = fg[:, :temp_n_frames, :, :]
+                    
+                    if batch.get("fg_coordmap") is not None:
+                        fg_coordmap = batch["fg_coordmap"].to(weight_dtype)
+                        fg_coordmap = fg_coordmap[:, :temp_n_frames, :, :]
                     
                 # Keep all node same token length to accelerate the traning when resolution grows.
                 if args.keep_all_node_same_token_length:
@@ -2181,13 +2445,22 @@ def main():
                         bg_mask = batch["bg_mask"].to(weight_dtype)
                         bg_mask = bg_mask[:, :actual_video_length, :, :]
                     
+                    if batch.get("bg") is not None:
+                        bg = batch["bg"].to(weight_dtype)
+                        bg = bg[:, :actual_video_length, :, :]
+                    
                     if batch.get("fg") is not None:
                         fg = batch["fg"].to(weight_dtype)
                         fg = fg[:, :actual_video_length, :, :]
+                    
+                    if batch.get("fg_coordmap") is not None:
+                        fg_coordmap = batch["fg_coordmap"].to(weight_dtype)
+                        fg_coordmap = fg_coordmap[:, :actual_video_length, :, :]
 
                 if args.low_vram:
                     torch.cuda.empty_cache()
                     vae.to(accelerator.device)
+                    clip_image_encoder.to(accelerator.device)
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to("cpu")
 
@@ -2237,58 +2510,87 @@ def main():
                     else:
                         full_ref = ref_latents  # [B, C, F, H, W]
                     
-                    # Generate masked_fg and encode it (following train_poseref.py logic)
-                    masked_fg_latent = None
+                    # Encode ref_coordmap as ref_coordmap_latents
+                    ref_coordmap_latents = None
+                    if ref_coordmap is not None:
+                        # Process ref_coordmap with the same logic as ref_pixel_values
+                        def _batch_encode_vae_ref_coordmap(ref_coordmap_values):
+                            ref_coordmap_values = rearrange(ref_coordmap_values, "b f c h w -> b c f h w")
+                            bs = args.vae_mini_batch
+                            new_ref_coordmap_latents = []
+                            for i in range(0, ref_coordmap_values.shape[0], bs):
+                                ref_coordmap_values_bs = ref_coordmap_values[i : i + bs]
+                                ref_coordmap_latents_list = []
+                                for frame_idx in range(ref_coordmap_values_bs.shape[2]):
+                                    single_frame = ref_coordmap_values_bs[:, :, frame_idx:frame_idx+1, :, :]
+                                    frame_latent = vae.encode(single_frame)[0]
+                                    frame_latent = frame_latent.sample()
+                                    ref_coordmap_latents_list.append(frame_latent)
+                                ref_coordmap_latents_bs = torch.cat(ref_coordmap_latents_list, dim=2)
+                                new_ref_coordmap_latents.append(ref_coordmap_latents_bs)
+                            return torch.cat(new_ref_coordmap_latents, dim = 0)
+                        
+                        ref_coordmap_latents = _batch_encode_vae_ref_coordmap(ref_coordmap)
+                        
+                        # Process ref_coordmap_latents similar to full_ref
+                        if ref_coordmap_latents.size(2) == 1:
+                            ref_coordmap_latents = ref_coordmap_latents.squeeze(2)  # [B, C, H, W]
+                        # else: keep as [B, C, F, H, W]
+                    
+                    
+                    # Mode 0: first_frame only; Mode 1: first_frame + bgvideo[1:]; Mode 2: bgvideo
+                    if rng is None:
+                        mode = np.random.choice([0, 1, 2], p=[1/3, 1/3, 1/3])
+                    else:
+                        mode = rng.choice([0, 1, 2], p=[1/3, 1/3, 1/3])
+                    
+                    if mode == 1 and batch.get("bg") is not None:
+                        # Mode 1: first_frame + bgvideo[1:]
+                        first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
+                        bg = batch["bg"].to(weight_dtype)
+                        
+                        # Check if bg has more than 1 frame
+                        if bg.shape[1] > 1:
+                            bg_rest = bg[:, 1:, :, :, :]  # [B, F-1, C, H, W]
+                            combined = torch.cat([first_frame, bg_rest], dim=1)  # [B, F, C, H, W]
+                            appearance_latents = _batch_encode_vae(combined)
+                        else:
+                            # If bg only has 1 frame, fall back to mode 0
+                            start_image_latentes = _batch_encode_vae(first_frame)
+                            appearance_latents = torch.zeros_like(latents)
+                            if latents.size()[2] != 1:
+                                appearance_latents[:, :, :1] = start_image_latentes
+                    elif mode == 2 and batch.get("bg") is not None:
+                        # Mode 2: Complete bgvideo
+                        bg = batch["bg"].to(weight_dtype)
+                        appearance_latents = _batch_encode_vae(bg)
+                    else:
+                        # Fallback: if bg doesn't exist, use mode 0
+                        first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
+                        start_image_latentes = _batch_encode_vae(first_frame)  # [B, 16, 1, H/8, W/8]
+                        appearance_latents = torch.zeros_like(latents)
+                        if latents.size()[2] != 1:
+                            appearance_latents[:, :, :1] = start_image_latentes
+                                            
+                    fg_coordmap_latent = None
+                    if batch.get("fg_coordmap") is not None:
+                        fg_coordmap = batch["fg_coordmap"].to(weight_dtype)  # [B, F, C, H, W]
+                        
+                        if batch.get("bg_mask") is not None:
+                            bg_mask = batch["bg_mask"].to(weight_dtype)  # [B, F, C, H, W]
+                            mask_binary = (bg_mask + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                            fg_coordmap = fg_coordmap * mask_binary + (-1.0) * (1.0 - mask_binary)
+                        
+                        # Encode fg_coordmap (with mask applied)
+                        fg_coordmap_latent = _batch_encode_vae(fg_coordmap)
+                    
+                    # Downsample bg_mask to latent space
                     bg_mask_downsampled = None
-                    if batch.get("bg_mask") is not None and batch.get("fg") is not None:
+                    if batch.get("bg_mask") is not None:
                         bg_mask = batch["bg_mask"].to(weight_dtype)  # [B, F, C, H, W]
-                        fg = batch["fg"].to(weight_dtype)  # [B, F, C, H, W]
-                        
-                        B, F_frames, C, H, W = fg.shape
-                        
-                        # Apply ColorJitter transform to fg
-                        fg_transform = transforms.Compose([
-                            transforms.Lambda(lambda x: (x + 1.0) / 2.0),  # [-1, 1] -> [0, 1]
-                            transforms.ColorJitter(
-                                brightness=0.3,
-                                contrast=0.3,
-                                saturation=0.3,
-                                hue=0.2
-                            ),
-                            transforms.Lambda(lambda x: x * 2.0 - 1.0),  # [0, 1] -> [-1, 1]
-                        ])
-                        
-                        # Apply transform to fg
-                        fg_flat = fg_transform(fg.view(B * F_frames, C, H, W))
-                        fg = fg_flat.view(B, F_frames, C, H, W)
-                        
-                        # Convert bg_mask from [-1, 1] to [0, 1] for masking
-                        mask_binary = (bg_mask + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-                        
-                        # Apply mask to fg: where mask=1 keep fg, where mask=0 use black (-1)
-                        masked_fg = fg * mask_binary + (-1.0) * (1.0 - mask_binary)
-                        
-                        # Data augmentation: downsample and upsample
-                        masked_fg_downsampled = torch.nn.functional.interpolate(
-                            masked_fg.view(B * F_frames, C, H, W),
-                            size=(H // 3, W // 2),
-                            mode='bilinear'
-                        )
-                        masked_fg = torch.nn.functional.interpolate(
-                            masked_fg_downsampled,
-                            size=(H, W),
-                            mode='bilinear',
-                            align_corners=False
-                        ).view(B, F_frames, C, H, W)
-                        
-                        # Encode masked_fg using the same function as pixel_values
-                        masked_fg_latent = _batch_encode_vae(masked_fg)  # [B, 16, (F-1)/4+1, H/8, W/8]
-                        
-                        # Downsample bg_mask to latent space
-                        # Take only the first channel (assuming all channels are the same for mask)
                         bg_mask_single_channel = bg_mask[:, :, 0:1, :, :]  # [B, F, 1, H, W]
                         bg_mask_for_downsample = rearrange(bg_mask_single_channel, "b f c h w -> b c f h w")
-                        _, _, latent_f, latent_h, latent_w = masked_fg_latent.shape
+                        _, _, latent_f, latent_h, latent_w = latents.shape  # Use latents shape
                         bg_mask_downsampled = torch.nn.functional.interpolate(
                             bg_mask_for_downsample,
                             size=(latent_f, latent_h, latent_w),
@@ -2296,42 +2598,11 @@ def main():
                         )  # [B, 1, latent_f, latent_h, latent_w]
                         bg_mask_downsampled = ((bg_mask_downsampled + 1.0) / 2.0 > 0.5).float()  # [B, 1, latent_f, latent_h, latent_w], values in {0, 1}
                     
-                    # Encode fg as control_latents (without dropout if masked_fg is used)
-                    control_latents = None
-                    if masked_fg_latent is not None:
-                        # Use masked_fg_latent as control_latents
-                        control_latents = masked_fg_latent
-                    elif batch.get("fg") is not None:
-                        fg = batch["fg"].to(weight_dtype)
-                        control_latents = _batch_encode_vae(fg)
-                        
-                        if not args.enable_bucket:
-                            if rng is None:
-                                dropout_mask = torch.rand(control_latents.shape[0], device=control_latents.device) < 0.1
-                            else:
-                                dropout_mask = torch.from_numpy(rng.random(control_latents.shape[0]) < 0.1).to(control_latents.device)
-                        
-                            if dropout_mask.any():
-                                control_latents = control_latents.clone()
-                                control_latents[dropout_mask] = 0.0
-                    
-                    # Prepare start_image_latentes_conv_in from first frame of GT
-                    # Extract first frame from pixel_values: [B, F, C, H, W]
-                    first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
-                    
-                    # Encode first frame
-                    start_image_latentes = _batch_encode_vae(first_frame)  # [B, 16, 1, H/8, W/8]
-                    
-                    # Create start_image_latentes_conv_in with same shape as latents
-                    start_image_latentes_conv_in = torch.zeros_like(latents)
-                    if latents.size()[2] != 1:
-                        start_image_latentes_conv_in[:, :, :1] = start_image_latentes
-                    
                     mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
-                    if control_latents is None:
-                        control_latents = torch.cat([mask, start_image_latentes_conv_in], dim=1)
+                    if fg_coordmap_latent is None:
+                        control_latents = torch.cat([mask, appearance_latents], dim=1)
                     else:
-                        control_latents = torch.cat([control_latents, start_image_latentes_conv_in], dim=1)
+                        control_latents = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
                                                 
                 # wait for latents = vae.encode(pixel_values) to complete
                 if vae_stream_1 is not None:
@@ -2339,6 +2610,7 @@ def main():
 
                 if args.low_vram:
                     vae.to('cpu')
+                    clip_image_encoder.to('cpu')
                     torch.cuda.empty_cache()
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to(accelerator.device)
@@ -2412,19 +2684,24 @@ def main():
                     target_shape[1]
                 )
 
+                # Encode clip features using dummy black image
                 with torch.no_grad():
-                    clip_fea = torch.zeros(bsz, 257, 1280, device=latents.device, dtype=weight_dtype)
+                    clip_image_dummy = Image.new("RGB", (512, 512), color=(0, 0, 0))
+                    clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(accelerator.device, weight_dtype)
+                    clip_fea = clip_image_encoder([clip_image_dummy[:, None, :, :]])
+                    clip_fea = torch.zeros_like(clip_fea).expand(bsz, -1, -1)
 
                 # Predict the noise residual
-                with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
+                with torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
                     noise_pred = transformer3d(
                         x=noisy_latents,
                         context=prompt_embeds,
                         t=timesteps,
                         seq_len=seq_len,
                         y=control_latents,  # fg encoded as control_latents
-                        clip_fea=clip_fea,  # dummy clip features for model compatibility
+                        clip_fea=clip_fea,  # clip features from dummy black image
                         full_ref=full_ref if args.add_full_ref_image_in_self_attention else None,
+                        full_ref_crood=ref_coordmap_latents if args.add_full_ref_image_in_self_attention else None,
                     )
                 
                 def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
@@ -2576,19 +2853,60 @@ def main():
                             else:
                                 full_ref_decoded = full_ref_decoded[:, :, :gt.shape[2], :, :]
                             
-                            # Build comparison list: [gt, gt_decoded, full_ref_decoded, fg_decoded, bg_mask]
+                            # Build comparison list: [gt, gt_decoded, full_ref_decoded, ref_coordmap_decoded, fg_decoded, fg_coordmap_decoded, bg_decoded]
                             comparison_list = [gt.cpu().float(), gt_decoded, full_ref_decoded]
                             
-                            # Add fg_decoded if exists
+                            # Add ref_coordmap_decoded if exists
+                            if ref_coordmap_latents is not None:
+                                # Decode ref_coordmap_latents
+                                ref_coordmap_decoded_frames = []
+                                if ref_coordmap_latents.dim() == 4:
+                                    # Single frame: [B, C, H, W]
+                                    ref_coordmap_decoded = vae_decoder.decode(ref_coordmap_latents.to(vae_decoder.dtype)).sample
+                                    ref_coordmap_decoded = (ref_coordmap_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                    # Align frame count with gt
+                                    if ref_coordmap_decoded.shape[2] < gt.shape[2]:
+                                        last_frame = ref_coordmap_decoded[:, :, -1:, :, :]
+                                        repeat_times = gt.shape[2] - ref_coordmap_decoded.shape[2]
+                                        repeated_frames = last_frame.repeat(1, 1, repeat_times, 1, 1)
+                                        ref_coordmap_decoded = torch.cat([ref_coordmap_decoded, repeated_frames], dim=2)
+                                    else:
+                                        ref_coordmap_decoded = ref_coordmap_decoded[:, :, :gt.shape[2], :, :]
+                                    comparison_list.append(ref_coordmap_decoded)
+                                else:
+                                    # Multiple frames: [B, C, F, H, W]
+                                    for frame_idx in range(ref_coordmap_latents.shape[2]):
+                                        frame = ref_coordmap_latents[:, :, frame_idx:frame_idx+1, :, :]
+                                        decoded_frame = vae_decoder.decode(frame.to(vae_decoder.dtype)).sample
+                                        ref_coordmap_decoded_frames.append(decoded_frame)
+                                    ref_coordmap_decoded = torch.cat(ref_coordmap_decoded_frames, dim=2)
+                                    ref_coordmap_decoded = (ref_coordmap_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                    # Align frame count with gt
+                                    if ref_coordmap_decoded.shape[2] < gt.shape[2]:
+                                        last_frame = ref_coordmap_decoded[:, :, -1:, :, :]
+                                        repeat_times = gt.shape[2] - ref_coordmap_decoded.shape[2]
+                                        repeated_frames = last_frame.repeat(1, 1, repeat_times, 1, 1)
+                                        ref_coordmap_decoded = torch.cat([ref_coordmap_decoded, repeated_frames], dim=2)
+                                    else:
+                                        ref_coordmap_decoded = ref_coordmap_decoded[:, :, :gt.shape[2], :, :]
+                                    comparison_list.append(ref_coordmap_decoded)
+                            
+                            # Add fg_decoded if exists (decoded from control_latents[:, :16])
                             if fg_decoded is not None:
                                 fg_decoded = (fg_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
                                 comparison_list.append(fg_decoded)
                             
-                            # Add bg_mask if exists
-                            if batch.get("bg_mask") is not None:
-                                bg_mask_vis = batch["bg_mask"].to(weight_dtype)
-                                bg_mask_vis = (bg_mask_vis / 2 + 0.5).clamp(0, 1).cpu().permute(0, 2, 1, 3, 4).float()
-                                comparison_list.append(bg_mask_vis)
+                            # Add fg_coordmap_decoded if exists
+                            if fg_coordmap_latent is not None:
+                                fg_coordmap_decoded = vae_decoder.decode(fg_coordmap_latent.to(vae_decoder.dtype)).sample
+                                fg_coordmap_decoded = (fg_coordmap_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                comparison_list.append(fg_coordmap_decoded)
+                            
+                            # Add bg_decoded (appearance_latents decoded) if exists
+                            if batch.get("bg") is not None:
+                                bg_decoded = vae_decoder.decode(appearance_latents.to(vae_decoder.dtype)).sample
+                                bg_decoded = (bg_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                comparison_list.append(bg_decoded)
                             
                             # Stack vertically
                             comparison = torch.cat(comparison_list, dim=3)  # stack in height dimension
@@ -2643,7 +2961,7 @@ def main():
                 
                 train_loss = 0.0
             
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "num_ref": num_ref_frames_to_use}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:

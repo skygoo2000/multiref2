@@ -1122,14 +1122,21 @@ class ImageVideoRefDataset(Dataset):
                         ref_frames_list = []
                         for i in range(len(ref_frames)):
                             frame = ref_frames[i]
-                            resized_frame = resize_frame(frame, minor_side)
-                            frame_pil = Image.fromarray(resized_frame)
+                            # Use target_size if provided for exact sizing
+                            if target_size is not None:
+                                resized_frame = resize_frame(frame, minor_side)
+                                frame_pil = Image.fromarray(resized_frame)
+                                # Resize to exact target_size
+                                frame_pil = frame_pil.resize((target_size[1], target_size[0]), Image.BILINEAR)
+                            else:
+                                resized_frame = resize_frame(frame, minor_side)
+                                frame_pil = Image.fromarray(resized_frame)
                             
                             if not self.enable_bucket:
                                 ref_frame = self.image_transforms(frame_pil)
                                 ref_frames_list.append(ref_frame)
                             else:
-                                ref_frames_list.append(resized_frame)
+                                ref_frames_list.append(np.array(frame_pil))
                         
                         if not self.enable_bucket:
                             return torch.stack(ref_frames_list)  # [F, C, H, W]
@@ -1203,6 +1210,21 @@ class ImageVideoRefDataset(Dataset):
                 # Use unified video reading function with mask processing
                 bg_mask = self._read_video_frames(mask_video_dir, batch_index, idx, apply_transforms=True, is_mask=True)
 
+            bg = None
+            if 'bg' in data_info and data_info['bg']:
+                bg_file_path = data_info['bg']
+                if self.data_root is None:
+                    bg_video_dir = bg_file_path
+                else:
+                    bg_video_dir = os.path.join(self.data_root, bg_file_path)
+                
+                try:
+                    # Use unified video reading function
+                    bg = self._read_video_frames(bg_video_dir, batch_index, idx, apply_transforms=True, is_mask=False)
+                except Exception as e:
+                    print(f"Warning: Failed to load bg from {bg_video_dir}: {e}")
+                    bg = None
+
             fg = None
             if 'fg' in data_info and data_info['fg']:
                 fg_file_path = data_info['fg']
@@ -1259,7 +1281,44 @@ class ImageVideoRefDataset(Dataset):
                     ref_pose = None
                     video_pose = None
 
-            return pixel_values, ref_pixel_values, text, "video", video_dir, bg_mask, fg, ref_pose, video_pose
+            # Load ref_coordmap if available
+            ref_coordmap = None
+            if 'ref_coordmap' in data_info and data_info['ref_coordmap']:
+                ref_coordmap_file_path = data_info['ref_coordmap']
+                if self.data_root is None:
+                    ref_coordmap_video_dir = ref_coordmap_file_path
+                else:
+                    ref_coordmap_video_dir = os.path.join(self.data_root, ref_coordmap_file_path)
+                
+                try:
+                    # Use _ref_preprocess to load ALL frames (same as ref_pixel_values)
+                    # Get target size from pixel_values
+                    if not self.enable_bucket:
+                        target_size = (pixel_values.shape[2], pixel_values.shape[3])  # (H, W) from (F, C, H, W)
+                    else:
+                        target_size = (pixel_values.shape[1], pixel_values.shape[2])  # (H, W) from (F, H, W, C)
+                    ref_coordmap = self._ref_preprocess(ref_coordmap_video_dir, idx, data_type='video', target_size=target_size)
+                except Exception as e:
+                    print(f"Warning: Failed to load ref_coordmap from {ref_coordmap_video_dir}: {e}")
+                    ref_coordmap = None
+
+            # Load fg_coordmap if available
+            fg_coordmap = None
+            if 'fg_coordmap' in data_info and data_info['fg_coordmap']:
+                fg_coordmap_file_path = data_info['fg_coordmap']
+                if self.data_root is None:
+                    fg_coordmap_video_dir = fg_coordmap_file_path
+                else:
+                    fg_coordmap_video_dir = os.path.join(self.data_root, fg_coordmap_file_path)
+                
+                try:
+                    # Use unified video reading function
+                    fg_coordmap = self._read_video_frames(fg_coordmap_video_dir, batch_index, idx, apply_transforms=True, is_mask=False)
+                except Exception as e:
+                    print(f"Warning: Failed to load fg_coordmap from {fg_coordmap_video_dir}: {e}")
+                    fg_coordmap = None
+
+            return pixel_values, ref_pixel_values, text, "video", video_dir, bg_mask, bg, fg, ref_pose, video_pose, ref_coordmap, fg_coordmap
         
         # image
         else:
@@ -1318,6 +1377,21 @@ class ImageVideoRefDataset(Dataset):
                     # 2. Binarize: threshold at 127.5
                     bg_mask = (bg_mask > 127.5).astype(np.float32) * 255.0
 
+            bg = None
+            if 'bg' in data_info and data_info['bg']:
+                bg_file_path = data_info['bg']
+                if self.data_root is not None:
+                    bg_file_path = os.path.join(self.data_root, bg_file_path)
+                try:
+                    bg_image = Image.open(bg_file_path).convert('RGB')
+                    if not self.enable_bucket:
+                        bg = self.image_transforms(bg_image).unsqueeze(0)
+                    else:
+                        bg = np.expand_dims(np.array(bg_image), 0)
+                except Exception as e:
+                    print(f"Warning: Failed to load bg from {bg_file_path}: {e}")
+                    bg = None
+
             fg = None
             if 'fg' in data_info and data_info['fg']:
                 fg_file_path = data_info['fg']
@@ -1333,7 +1407,11 @@ class ImageVideoRefDataset(Dataset):
             ref_pose = None
             video_pose = None
 
-            return pixel_values, ref_pixel_values, text, 'image', image_path, bg_mask, fg, ref_pose, video_pose
+            # For images, coordmap is not applicable
+            ref_coordmap = None
+            fg_coordmap = None
+
+            return pixel_values, ref_pixel_values, text, 'image', image_path, bg_mask, bg, fg, ref_pose, video_pose, ref_coordmap, fg_coordmap
             
     def __len__(self):
         return self.length
@@ -1349,7 +1427,7 @@ class ImageVideoRefDataset(Dataset):
                 if data_type_local != data_type:
                     raise ValueError("data_type_local != data_type")
 
-                pixel_values, ref_pixel_values, name, data_type, file_path, bg_mask, fg, ref_pose, video_pose = self.get_batch(idx)
+                pixel_values, ref_pixel_values, name, data_type, file_path, bg_mask, bg, fg, ref_pose, video_pose, ref_coordmap, fg_coordmap = self.get_batch(idx)
 
                 # # Randomly shuffle frames of ref_pixel_values
                 # if ref_pixel_values.shape[0] > 1:
@@ -1368,12 +1446,18 @@ class ImageVideoRefDataset(Dataset):
                 # probability to replace with None
                 if bg_mask is not None:
                     sample["bg_mask"] = bg_mask
+                if bg is not None:
+                    sample["bg"] = bg
                 if fg is not None:
                     sample["fg"] = fg
                 if ref_pose is not None:
                     sample["ref_pose"] = ref_pose
                 if video_pose is not None:
                     sample["video_pose"] = video_pose
+                if ref_coordmap is not None:
+                    sample["ref_coordmap"] = ref_coordmap
+                if fg_coordmap is not None:
+                    sample["fg_coordmap"] = fg_coordmap
 
                 if self.return_file_name:
                     sample["file_name"] = os.path.basename(file_path)

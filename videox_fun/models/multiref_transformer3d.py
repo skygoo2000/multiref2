@@ -748,3 +748,556 @@ class MultiRefTransformer3DModel(WanTransformer3DModel):
                 self.teacache.reset()
         return x
 
+
+class CroodRefTransformer3DModel(WanTransformer3DModel):
+    r"""
+    CroodRef Transformer3D model inherited from WanTransformer3DModel.
+    """
+
+    @register_to_config
+    def __init__(
+        self,
+        model_type='i2v',
+        patch_size=(1, 2, 2),
+        text_len=512,
+        in_dim=16,
+        dim=2048,
+        ffn_dim=8192,
+        freq_dim=256,
+        text_dim=4096,
+        out_dim=16,
+        num_heads=16,
+        num_layers=32,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=True,
+        eps=1e-6,
+        in_channels=16,
+        hidden_size=2048,
+        add_control_adapter=False,
+        in_dim_control_adapter=24,
+        downscale_factor_control_adapter=8,
+        add_ref_conv=False,
+        in_dim_ref_conv=16,
+        cross_attn_type=None,
+    ):
+        r"""
+        Initialize the CroodRef diffusion model backbone.
+
+        Args:
+            model_type (`str`, *optional*, defaults to 't2v'):
+                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video)
+            patch_size (`tuple`, *optional*, defaults to (1, 2, 2)):
+                3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
+            text_len (`int`, *optional*, defaults to 512):
+                Fixed length for text embeddings
+            in_dim (`int`, *optional*, defaults to 16):
+                Input video channels (C_in)
+            dim (`int`, *optional*, defaults to 2048):
+                Hidden dimension of the transformer
+            ffn_dim (`int`, *optional*, defaults to 8192):
+                Intermediate dimension in feed-forward network
+            freq_dim (`int`, *optional*, defaults to 256):
+                Dimension for sinusoidal time embeddings
+            text_dim (`int`, *optional*, defaults to 4096):
+                Input dimension for text embeddings
+            out_dim (`int`, *optional*, defaults to 16):
+                Output video channels (C_out)
+            num_heads (`int`, *optional*, defaults to 16):
+                Number of attention heads
+            num_layers (`int`, *optional*, defaults to 32):
+                Number of transformer blocks
+            window_size (`tuple`, *optional*, defaults to (-1, -1)):
+                Window size for local attention (-1 indicates global attention)
+            qk_norm (`bool`, *optional*, defaults to True):
+                Enable query/key normalization
+            cross_attn_norm (`bool`, *optional*, defaults to False):
+                Enable cross-attention normalization
+            eps (`float`, *optional*, defaults to 1e-6):
+                Epsilon value for normalization layers
+        """
+
+        super().__init__(
+            model_type=model_type,
+            patch_size=patch_size,
+            text_len=text_len,
+            in_dim=in_dim,
+            dim=dim,
+            ffn_dim=ffn_dim,
+            freq_dim=freq_dim,
+            text_dim=text_dim,
+            out_dim=out_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            window_size=window_size,
+            qk_norm=qk_norm,
+            cross_attn_norm=cross_attn_norm,
+            eps=eps,
+            in_channels=in_channels,
+            hidden_size=hidden_size,
+            add_control_adapter=False,
+            in_dim_control_adapter=in_dim_control_adapter,
+            downscale_factor_control_adapter=downscale_factor_control_adapter,
+            add_ref_conv=False,
+            in_dim_ref_conv=in_dim_ref_conv,
+            cross_attn_type=cross_attn_type,  # Let parent class decide based on model_type
+        )
+
+        # Remove components not used in CroodRef
+        if hasattr(self, "control_adapter"):
+            del self.control_adapter
+        if hasattr(self, "ref_conv"):
+            del self.ref_conv
+
+    @classmethod
+    def from_pretrained(
+        cls, pretrained_model_path, subfolder=None, transformer_additional_kwargs={},
+        low_cpu_mem_usage=False, torch_dtype=torch.bfloat16
+    ):
+        if subfolder is not None:
+            pretrained_model_path = os.path.join(pretrained_model_path, subfolder)
+        print(f"loaded CroodRefTransformer3DModel from {pretrained_model_path} ...")
+
+        config_file = os.path.join(pretrained_model_path, 'config.json')
+        if not os.path.isfile(config_file):
+            raise RuntimeError(f"{config_file} does not exist")
+        with open(config_file, "r") as f:
+            config = json.load(f)
+
+        from diffusers.utils import WEIGHTS_NAME
+        model_file = os.path.join(pretrained_model_path, WEIGHTS_NAME)
+        model_file_safetensors = model_file.replace(".bin", ".safetensors")
+
+        if "dict_mapping" in transformer_additional_kwargs.keys():
+            for key in transformer_additional_kwargs["dict_mapping"]:
+                transformer_additional_kwargs[transformer_additional_kwargs["dict_mapping"][key]] = config[key]
+
+        if low_cpu_mem_usage:
+            try:
+                import re
+
+                from diffusers import __version__ as diffusers_version
+                from diffusers.models.modeling_utils import \
+                    load_model_dict_into_meta
+                from diffusers.utils import is_accelerate_available
+                if is_accelerate_available():
+                    import accelerate
+                
+                # Instantiate model with empty weights
+                with accelerate.init_empty_weights():
+                    model = cls.from_config(config, **transformer_additional_kwargs)
+
+                param_device = "cpu"
+                if os.path.exists(model_file):
+                    state_dict = torch.load(model_file, map_location="cpu")
+                elif os.path.exists(model_file_safetensors):
+                    from safetensors.torch import load_file, safe_open
+                    state_dict = load_file(model_file_safetensors)
+                else:
+                    from safetensors.torch import load_file, safe_open
+                    model_files_safetensors = glob.glob(os.path.join(pretrained_model_path, "*.safetensors"))
+                    state_dict = {}
+                    print(model_files_safetensors)
+                    for _model_file_safetensors in model_files_safetensors:
+                        _state_dict = load_file(_model_file_safetensors)
+                        for key in _state_dict:
+                            state_dict[key] = _state_dict[key]
+
+                if diffusers_version >= "0.33.0":
+                    # Diffusers has refactored `load_model_dict_into_meta` since version 0.33.0 in this commit:
+                    # https://github.com/huggingface/diffusers/commit/f5929e03060d56063ff34b25a8308833bec7c785.
+                    load_model_dict_into_meta(
+                        model,
+                        state_dict,
+                        dtype=torch_dtype,
+                        model_name_or_path=pretrained_model_path,
+                    )
+                else:
+                    model._convert_deprecated_attention_blocks(state_dict)
+                    # move the params from meta device to cpu
+                    missing_keys = set(model.state_dict().keys()) - set(state_dict.keys())
+                    if len(missing_keys) > 0:
+                        raise ValueError(
+                            f"Cannot load {cls} from {pretrained_model_path} because the following keys are"
+                            f" missing: \n {', '.join(missing_keys)}. \n Please make sure to pass"
+                            " `low_cpu_mem_usage=False` and `device_map=None` if you want to randomly initialize"
+                            " those weights or else make sure your checkpoint file is correct."
+                        )
+
+                    unexpected_keys = load_model_dict_into_meta(
+                        model,
+                        state_dict,
+                        device=param_device,
+                        dtype=torch_dtype,
+                        model_name_or_path=pretrained_model_path,
+                    )
+
+                    if cls._keys_to_ignore_on_load_unexpected is not None:
+                        for pat in cls._keys_to_ignore_on_load_unexpected:
+                            unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
+
+                    if len(unexpected_keys) > 0:
+                        print(
+                            f"Some weights of the model checkpoint were not used when initializing {cls.__name__}: \n {[', '.join(unexpected_keys)]}"
+                        )
+                
+                return model
+            except Exception as e:
+                print(
+                    f"The low_cpu_mem_usage mode is not work because {e}. Use low_cpu_mem_usage=False instead."
+                )
+        
+        model = cls.from_config(config, **transformer_additional_kwargs)
+        if os.path.exists(model_file):
+            state_dict = torch.load(model_file, map_location="cpu")
+        elif os.path.exists(model_file_safetensors):
+            from safetensors.torch import load_file, safe_open
+            state_dict = load_file(model_file_safetensors)
+        else:
+            from safetensors.torch import load_file, safe_open
+            model_files_safetensors = glob.glob(os.path.join(pretrained_model_path, "*.safetensors"))
+            state_dict = {}
+            for _model_file_safetensors in model_files_safetensors:
+                _state_dict = load_file(_model_file_safetensors)
+                for key in _state_dict:
+                    state_dict[key] = _state_dict[key]
+        
+        if model.state_dict()['patch_embedding.weight'].size() != state_dict['patch_embedding.weight'].size():
+            model.state_dict()['patch_embedding.weight'][:, :state_dict['patch_embedding.weight'].size()[1], :, :] = state_dict['patch_embedding.weight'][:, :model.state_dict()['patch_embedding.weight'].size()[1], :, :]
+            model.state_dict()['patch_embedding.weight'][:, state_dict['patch_embedding.weight'].size()[1]:, :, :] = 0
+            state_dict['patch_embedding.weight'] = model.state_dict()['patch_embedding.weight']
+        
+        tmp_state_dict = {} 
+        for key in state_dict:
+            # Skip ref_conv and control_adapter for CroodRef
+            if key.startswith('ref_conv.') or key.startswith('control_adapter.'):
+                print(key, "Skipping ref_conv/control_adapter for CroodRef")
+                continue
+            if key in model.state_dict().keys() and model.state_dict()[key].size() == state_dict[key].size():
+                tmp_state_dict[key] = state_dict[key]
+            else:
+                print(key, "Size don't match, skip")
+                
+        state_dict = tmp_state_dict
+
+        m, u = model.load_state_dict(state_dict, strict=False)
+        print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
+        print(m)
+        
+        params = [p.numel() if "." in n else 0 for n, p in model.named_parameters()]
+        print(f"### All Parameters: {sum(params) / 1e6} M")
+
+        params = [p.numel() if "attn1." in n else 0 for n, p in model.named_parameters()]
+        print(f"### attn1 Parameters: {sum(params) / 1e6} M")
+        
+        model = model.to(torch_dtype)
+        return model
+
+    def forward(
+        self,
+        x,
+        t,
+        context,
+        seq_len,
+        clip_fea=None,
+        y=None,
+        full_ref=None,
+        full_ref_crood=None,
+        subject_ref=None,
+        cond_flag=True,
+    ):
+        r"""
+        Forward pass through the CroodRef diffusion model
+
+        Args:
+            x (List[Tensor]):
+                List of input video tensors, each with shape [C_in, F, H, W]
+            t (Tensor):
+                Diffusion timesteps tensor of shape [B]
+            context (List[Tensor]):
+                List of text embeddings each with shape [L, C]
+            seq_len (`int`):
+                Maximum sequence length for positional encoding
+            clip_fea (Tensor, *optional*):
+                CLIP image features for image-to-video mode
+            y (List[Tensor], *optional*):
+                Conditional video inputs, 32 channels
+            full_ref (Tensor, *optional*):
+                Full reference frames, 16 channels
+            full_ref_crood (Tensor, *optional*):
+                Coordinate map for full reference frames, 16 channels
+            subject_ref (Tensor, *optional*):
+                Subject reference frames
+            cond_flag (`bool`, *optional*, defaults to True):
+                Flag to indicate whether to forward the condition input
+
+        Returns:
+            List[Tensor]:
+                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+        """
+        # Wan2.2 don't need a clip.
+        # if self.model_type == 'i2v':
+        #     assert clip_fea is not None and y is not None
+        # params
+        device = self.patch_embedding.weight.device
+        dtype = x.dtype if not isinstance(x, list) else x[0].dtype
+        if self.freqs.device != device and torch.device(type="meta") != device:
+            self.freqs = self.freqs.to(device)
+
+        if y is not None:
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+        
+        # Process full_ref and full_ref_crood through patch_embedding
+        full_ref_length = 0
+        full_ref_frames_num = 0
+        if full_ref is not None:
+            # Prepare full_ref_crood: concat with zeros to make it 32 channels (to match format)
+            if full_ref_crood is not None:
+                # full_ref_crood is 16 channels, concat with zeros to make 32
+                full_ref_crood_zero = torch.zeros_like(full_ref_crood)
+                full_ref_crood = torch.cat([full_ref_crood, full_ref_crood_zero], dim=1)
+            else:
+                # If no full_ref_crood, create zeros
+                full_ref_crood = torch.zeros(full_ref.size(0), 32, *full_ref.shape[2:], 
+                                               device=full_ref.device, dtype=full_ref.dtype)
+            
+            full_ref_combined = torch.cat([full_ref, full_ref_crood], dim=1)  # [B, 48, F, H, W] or [B, 48, H, W]
+            
+            # Process full_ref_combined through patch_embedding (similar to subject_ref)
+            full_ref_embedded = self.patch_embedding(full_ref_combined).flatten(2).transpose(1, 2)  # [B, seq_len, model_dim]
+            
+            if full_ref_combined.dim() > 4:
+                full_ref_frames_num = full_ref_combined.size(2)
+            else:
+                full_ref_frames_num = 1
+            
+            # Save full_ref_length for later removal
+            full_ref_length = full_ref_embedded.size(1)
+            seq_len += full_ref_length
+        
+        # embeddings: process x (now 48 channels if y is provided)
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+
+        grid_sizes = torch.stack(
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+
+        x = [u.flatten(2).transpose(1, 2) for u in x] # [B, seq_len, model_dim]
+        
+        # Concat full_ref_embedded in front of x
+        if full_ref is not None:
+            # Update grid_sizes to include full_ref frames
+            grid_sizes = torch.stack([torch.tensor([u[0] + full_ref_frames_num, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+            x = [torch.concat([_full_ref.unsqueeze(0), u], dim=1) for _full_ref, u in zip(full_ref_embedded, x)]
+            if t.dim() != 1 and t.size(1) < seq_len:
+                pad_size = seq_len - t.size(1)
+                last_elements = t[:, -1].unsqueeze(1)
+                padding = last_elements.repeat(1, pad_size)
+                t = torch.cat([padding, t], dim=1)
+
+        if subject_ref is not None:
+            subject_ref_frames = subject_ref.size(2)
+            subject_ref = self.patch_embedding(subject_ref).flatten(2).transpose(1, 2)
+            grid_sizes = torch.stack([torch.tensor([u[0] + subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+            seq_len += subject_ref.size(1)
+            x = [torch.concat([u, _subject_ref.unsqueeze(0)], dim=1) for _subject_ref, u in zip(subject_ref, x)]
+            if t.dim() != 1 and t.size(1) < seq_len:
+                pad_size = seq_len - t.size(1)
+                last_elements = t[:, -1].unsqueeze(1)
+                padding = last_elements.repeat(1, pad_size)
+                t = torch.cat([t, padding], dim=1)
+        
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        if self.sp_world_size > 1:
+            seq_len = int(math.ceil(seq_len / self.sp_world_size)) * self.sp_world_size
+        assert seq_lens.max() <= seq_len
+        x = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                      dim=1) for u in x
+        ])
+
+        # time embeddings
+        with amp.autocast('cuda',dtype=torch.float32):
+            if t.dim() != 1:
+                if t.size(1) < seq_len:
+                    pad_size = seq_len - t.size(1)
+                    last_elements = t[:, -1].unsqueeze(1)
+                    padding = last_elements.repeat(1, pad_size)
+                    t = torch.cat([t, padding], dim=1)
+                bt = t.size(0)
+                ft = t.flatten()
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim,
+                                            ft).unflatten(0, (bt, seq_len)).float())
+                e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+            else:
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim, t).float())
+                e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+
+            # assert e.dtype == torch.float32 and e0.dtype == torch.float32
+            # e0 = e0.to(dtype)
+            # e = e.to(dtype)
+
+        # context
+        context_lens = None
+        context = self.text_embedding(
+            torch.stack([
+                torch.cat(
+                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]))
+
+        if clip_fea is not None:
+            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context = torch.concat([context_clip, context], dim=1)
+
+        # Context Parallel
+        if self.sp_world_size > 1:
+            x = torch.chunk(x, self.sp_world_size, dim=1)[self.sp_world_rank]
+            if t.dim() != 1:
+                e0 = torch.chunk(e0, self.sp_world_size, dim=1)[self.sp_world_rank]
+                e = torch.chunk(e, self.sp_world_size, dim=1)[self.sp_world_rank]
+        
+        # TeaCache
+        if self.teacache is not None:
+            if cond_flag:
+                if t.dim() != 1:
+                    modulated_inp = e0[:, -1, :]
+                else:
+                    modulated_inp = e0
+                skip_flag = self.teacache.cnt < self.teacache.num_skip_start_steps
+                if skip_flag:
+                    self.should_calc = True
+                    self.teacache.accumulated_rel_l1_distance = 0
+                else:
+                    if cond_flag:
+                        rel_l1_distance = self.teacache.compute_rel_l1_distance(self.teacache.previous_modulated_input, modulated_inp)
+                        self.teacache.accumulated_rel_l1_distance += self.teacache.rescale_func(rel_l1_distance)
+                    if self.teacache.accumulated_rel_l1_distance < self.teacache.rel_l1_thresh:
+                        self.should_calc = False
+                    else:
+                        self.should_calc = True
+                        self.teacache.accumulated_rel_l1_distance = 0
+                self.teacache.previous_modulated_input = modulated_inp
+                self.teacache.should_calc = self.should_calc
+            else:
+                self.should_calc = self.teacache.should_calc
+        
+        # TeaCache
+        if self.teacache is not None:
+            if not self.should_calc:
+                previous_residual = self.teacache.previous_residual_cond if cond_flag else self.teacache.previous_residual_uncond
+                x = x + previous_residual.to(x.device)[-x.size()[0]:,]
+            else:
+                ori_x = x.clone().cpu() if self.teacache.offload else x.clone()
+
+                for block in self.blocks:
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+
+                        def create_custom_forward(module):
+                            def custom_forward(*inputs):
+                                return module(*inputs)
+
+                            return custom_forward
+                        ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x,
+                            e0,
+                            seq_lens,
+                            grid_sizes,
+                            self.freqs,
+                            context,
+                            context_lens,
+                            dtype,
+                            t,
+                            **ckpt_kwargs,
+                        )
+                    else:
+                        # arguments
+                        kwargs = dict(
+                            e=e0,
+                            seq_lens=seq_lens,
+                            grid_sizes=grid_sizes,
+                            freqs=self.freqs,
+                            context=context,
+                            context_lens=context_lens,
+                            dtype=dtype,
+                            t=t  
+                        )
+                        x = block(x, **kwargs)
+                    
+                if cond_flag:
+                    self.teacache.previous_residual_cond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
+                else:
+                    self.teacache.previous_residual_uncond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
+        else:
+            for block in self.blocks:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+
+                        return custom_forward
+                    ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        x,
+                        e0,
+                        seq_lens,
+                        grid_sizes,
+                        self.freqs,
+                        context,
+                        context_lens,
+                        dtype,
+                        t,
+                        **ckpt_kwargs,
+                    )
+                else:
+                    # arguments
+                    kwargs = dict(
+                        e=e0,
+                        seq_lens=seq_lens,
+                        grid_sizes=grid_sizes,
+                        freqs=self.freqs,
+                        context=context,
+                        context_lens=context_lens,
+                        dtype=dtype,
+                        t=t  
+                    )
+                    x = block(x, **kwargs)
+
+        # head
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+
+                return custom_forward
+            ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+            x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.head), x, e, **ckpt_kwargs)
+        else:
+            x = self.head(x, e)
+
+        if self.sp_world_size > 1:
+            x = self.all_gather(x, dim=1)
+
+        # Remove full_ref tokens from output (use saved full_ref_length and full_ref_frames_num)
+        if full_ref_length > 0:
+            x = x[:, full_ref_length:]
+            grid_sizes = torch.stack([torch.tensor([u[0] - full_ref_frames_num, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+
+        if subject_ref is not None:
+            subject_ref_length = subject_ref.size(1)
+            x = x[:, :-subject_ref_length]
+            grid_sizes = torch.stack([torch.tensor([u[0] - subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+
+        # unpatchify
+        x = self.unpatchify(x, grid_sizes)
+        x = torch.stack(x)
+        if self.teacache is not None and cond_flag:
+            self.teacache.cnt += 1
+            if self.teacache.cnt == self.teacache.num_steps:
+                self.teacache.reset()
+        return x
