@@ -1,5 +1,5 @@
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-Fun-V1.1-1.3B-Control"
-export DATASET_NAME="/data/zekai/texverse/Google/Google10k"
+export DATASET_NAME="datasets/Google"
 export DATASET_META_NAME="$DATASET_NAME/train.json"
 # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
 export NCCL_IB_DISABLE=1
@@ -14,26 +14,23 @@ MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=1000
 RESUME_FROM_CHECKPOINT="latest"
 
-OUTPUT_DIR="ckpts/1223_croodref1B3_Google7k_lr${LEARNING_RATE}_fullattn"
+OUTPUT_DIR="ckpts/1226_croodref1B3_Google14k_lr${LEARNING_RATE}_fullattn"
 
 VALIDATION_STEPS=200
-VALIDATION_PROMPTS="2 of Jenga Classic Game."
-VALIDATION_REF_PATH="$DATASET_NAME/ref/sample_000343.mp4"
-VALIDATION_FG_PATH="$DATASET_NAME/fgvideo/sample_000343.mp4"
-VALIDATION_BG_MASK_PATH="$DATASET_NAME/mask/sample_000343.mp4"
-VALIDATION_BGVIDEO_PATH="$DATASET_NAME/bgvideo/sample_000343.mp4"
-VALIDATION_REF_COORDMAP_PATH="$DATASET_NAME/ref_coordmap/sample_000343.mp4"
-VALIDATION_FG_COORDMAP_PATH="$DATASET_NAME/fg_coordmap/sample_000343.mp4"
-VALIDATION_GT_PATH="$DATASET_NAME/video/sample_000343.mp4"
+VALIDATION_PROMPTS="a small, chibi-style figurine with light purple hair in twin ponytails, elf ears, and a blue scarf."
+VALIDATION_REF_PATH="samples/sam3/furiren/ref.mp4"
+VALIDATION_REF_COORDMAP_PATH="samples/sam3/furiren/ref_coordmap.mp4"
+VALIDATION_FG_COORDMAP_PATH="samples/sam3/furiren/fg_coordmap.mp4"
+VALIDATION_GT_PATH="samples/sam3/furiren/furiren_gt.mp4"
 VALIDATION_SIZE="192 336 49"  # height width frames
 
 ## fsdp stage3
-# accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "FULL_SHARD" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False scripts/croodref/train_croodref.py \
+# accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "FULL_SHARD" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False sscripts/coordref/train_coordref.py \
 
 ## deepspeed zero2
-# accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/croodref/train_croodref.py \
+# accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/coordref/train_coordref.py \
 
-accelerate launch --mixed_precision="bf16" scripts/croodref/train_croodref.py \
+accelerate launch --mixed_precision="bf16" scripts/coordref/train_coordref.py \
   --config_path="config/wan2.1/wan_civitai.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
@@ -52,9 +49,6 @@ accelerate launch --mixed_precision="bf16" scripts/croodref/train_croodref.py \
   --validation_steps=$VALIDATION_STEPS \
   --validation_prompts "$VALIDATION_PROMPTS" \
   --validation_ref_path $VALIDATION_REF_PATH \
-  --validation_fg_path $VALIDATION_FG_PATH \
-  --validation_bg_mask_path $VALIDATION_BG_MASK_PATH \
-  --validation_bgvideo_path $VALIDATION_BGVIDEO_PATH \
   --validation_ref_coordmap_path $VALIDATION_REF_COORDMAP_PATH \
   --validation_fg_coordmap_path $VALIDATION_FG_COORDMAP_PATH \
   --validation_gt_path $VALIDATION_GT_PATH \

@@ -2538,13 +2538,16 @@ def main():
                         # else: keep as [B, C, F, H, W]
                     
                     
-                    # Mode 0: first_frame only; Mode 1: first_frame + bgvideo[1:]; Mode 2: bgvideo
+                    # Mode 0: first_frame only; Mode 1: first_frame + bgvideo[1:]; Mode 2: bgvideo; Mode 3: none
                     if rng is None:
-                        mode = np.random.choice([0, 1, 2], p=[1/3, 1/3, 1/3])
+                        mode = np.random.choice([0, 1, 2, 3], p=[0.2/3, 0.2/3, 0.2/3, 0.8])
                     else:
-                        mode = rng.choice([0, 1, 2], p=[1/3, 1/3, 1/3])
+                        mode = rng.choice([0, 1, 2, 3], p=[0.2/3, 0.2/3, 0.2/3, 0.8])
                     
-                    if mode == 1 and batch.get("bg") is not None:
+                    if mode == 3:
+                        # Mode 3: empty
+                        appearance_latents = torch.zeros_like(latents)
+                    elif mode == 1 and batch.get("bg") is not None:
                         # Mode 1: first_frame + bgvideo[1:]
                         first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
                         bg = batch["bg"].to(weight_dtype)

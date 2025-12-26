@@ -1285,10 +1285,6 @@ class ImageVideoRefDataset(Dataset):
             ref_coordmap = None
             if 'ref_coordmap' in data_info and data_info['ref_coordmap']:
                 ref_coordmap_file_path = data_info['ref_coordmap']
-                if self.data_root is None:
-                    ref_coordmap_video_dir = ref_coordmap_file_path
-                else:
-                    ref_coordmap_video_dir = os.path.join(self.data_root, ref_coordmap_file_path)
                 
                 try:
                     # Use _ref_preprocess to load ALL frames (same as ref_pixel_values)
@@ -1297,9 +1293,10 @@ class ImageVideoRefDataset(Dataset):
                         target_size = (pixel_values.shape[2], pixel_values.shape[3])  # (H, W) from (F, C, H, W)
                     else:
                         target_size = (pixel_values.shape[1], pixel_values.shape[2])  # (H, W) from (F, H, W, C)
-                    ref_coordmap = self._ref_preprocess(ref_coordmap_video_dir, idx, data_type='video', target_size=target_size)
+                    # Pass relative path directly to _ref_preprocess (it will handle data_root joining)
+                    ref_coordmap = self._ref_preprocess(ref_coordmap_file_path, idx, data_type='video', target_size=target_size)
                 except Exception as e:
-                    print(f"Warning: Failed to load ref_coordmap from {ref_coordmap_video_dir}: {e}")
+                    print(f"Warning: Failed to load ref_coordmap from {ref_coordmap_file_path}: {e}")
                     ref_coordmap = None
 
             # Load fg_coordmap if available

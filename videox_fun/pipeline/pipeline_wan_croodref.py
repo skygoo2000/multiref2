@@ -303,6 +303,39 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
             latents = latents * self.scheduler.init_noise_sigma
         return latents
 
+    def prepare_control_latents(
+        self, control, control_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
+    ):
+        # resize the control to latents shape as we concatenate the control to the latents
+        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
+        # and half precision
+
+        if control is not None:
+            control = control.to(device=device, dtype=dtype)
+            bs = 1
+            new_control = []
+            for i in range(0, control.shape[0], bs):
+                control_bs = control[i : i + bs]
+                control_bs = self.vae.encode(control_bs)[0]
+                control_bs = control_bs.mode()
+                new_control.append(control_bs)
+            control = torch.cat(new_control, dim = 0)
+
+        if control_image is not None:
+            control_image = control_image.to(device=device, dtype=dtype)
+            bs = 1
+            new_control_pixel_values = []
+            for i in range(0, control_image.shape[0], bs):
+                control_pixel_values_bs = control_image[i : i + bs]
+                control_pixel_values_bs = self.vae.encode(control_pixel_values_bs)[0]
+                control_pixel_values_bs = control_pixel_values_bs.mode()
+                new_control_pixel_values.append(control_pixel_values_bs)
+            control_image_latents = torch.cat(new_control_pixel_values, dim = 0)
+        else:
+            control_image_latents = None
+
+        return control, control_image_latents
+
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         frames = self.vae.decode(latents.to(self.vae.dtype)).sample
         frames = (frames / 2 + 0.5).clamp(0, 1)
@@ -562,94 +595,144 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
         # NOTE: All input images/videos are expected to be in [0, 1] range, converted to [-1, 1] for VAE
         full_ref = None
         if ref_image is not None:
-            ref_image = (ref_image - 0.5) / 0.5  # [0, 1] -> [-1, 1]
-            with torch.no_grad():
-                if ref_image.dim() == 4:
-                    # Single frame case: [B, C, H, W]
-                    B, C, H, W = ref_image.shape
-                    # Encode with VAE - add frame dimension
-                    ref_image_latents = self.vae.encode(ref_image.unsqueeze(2).to(device=device, dtype=weight_dtype))[0].sample()
-                else:
-                    # Multi-frame case: [B, C, F, H, W]
-                    B, C, F, H, W = ref_image.shape
-                    # Encode frame by frame with VAE
-                    encoded_frames = []
-                    for f in range(F):
-                        frame = ref_image[:, :, f:f+1, :, :]  # [B, C, 1, H, W]
-                        encoded_frame = self.vae.encode(frame.to(device=device, dtype=weight_dtype))[0].sample()
-                        encoded_frames.append(encoded_frame)
-                    ref_image_latents = torch.cat(encoded_frames, dim=2)  # [B, C_latent, F, H_latent, W_latent]
-                
-                # Process full_ref
-                if ref_image_latents.size(2) == 1:
-                    full_ref = ref_image_latents.squeeze(2)  # [B, C, H, W]
-                else:
-                    full_ref = ref_image_latents  # [B, C, F, H, W]
+            # Handle both 4D and 5D inputs
+            if ref_image.dim() == 4:
+                # Single frame case: [B, C, H, W] -> [B, C, 1, H, W]
+                ref_image = ref_image.unsqueeze(2)
+                video_length = 1
+            else:
+                # Multi-frame case: [B, C, F, H, W]
+                video_length = ref_image.shape[2]
+            
+            ref_image = self.image_processor.preprocess(
+                rearrange(ref_image, "b c f h w -> (b f) c h w"), 
+                height=height, width=width
+            )
+            ref_image = ref_image.to(dtype=torch.float32)
+            ref_image = rearrange(ref_image, "(b f) c h w -> b c f h w", f=video_length)
+            
+            ref_image_latents = self.prepare_control_latents(
+                None,
+                ref_image,
+                batch_size,
+                height,
+                width,
+                weight_dtype,
+                device,
+                generator,
+                do_classifier_free_guidance
+            )[1]
+            
+            # Process full_ref
+            if ref_image_latents.size(2) == 1:
+                full_ref = ref_image_latents.squeeze(2)  # [B, C, H, W]
+            else:
+                full_ref = ref_image_latents  # [B, C, F, H, W]
 
         # 7. Process ref_coordmap
         ref_coordmap_latents = None
         if ref_coordmap is not None:
-            ref_coordmap = (ref_coordmap - 0.5) / 0.5  # [0, 1] -> [-1, 1]
-            with torch.no_grad():
-                # ref_coordmap: [B, F, C, H, W] -> [B, C, F, H, W]
-                ref_coordmap = rearrange(ref_coordmap, "b f c h w -> b c f h w").to(device=device, dtype=weight_dtype)
-                
-                # Encode frame by frame
-                B, C, F, H, W = ref_coordmap.shape
-                encoded_frames = []
-                for f in range(F):
-                    frame = ref_coordmap[:, :, f:f+1, :, :]  # [B, C, 1, H, W]
-                    encoded_frame = self.vae.encode(frame)[0].sample()
-                    encoded_frames.append(encoded_frame)
-                ref_coordmap_latents = torch.cat(encoded_frames, dim=2)  # [B, C_latent, F, H_latent, W_latent]
-                
-                # Process ref_coordmap_latents similar to full_ref
-                if ref_coordmap_latents.size(2) == 1:
-                    ref_coordmap_latents = ref_coordmap_latents.squeeze(2)  # [B, C, H, W]
-                # else: keep as [B, C, F, H, W]
+            # ref_coordmap: [B, F, C, H, W]
+            video_length = ref_coordmap.shape[1]
+            ref_coordmap = self.image_processor.preprocess(
+                rearrange(ref_coordmap, "b f c h w -> (b f) c h w"),
+                height=height, width=width
+            )
+            ref_coordmap = ref_coordmap.to(dtype=torch.float32)
+            ref_coordmap = rearrange(ref_coordmap, "(b f) c h w -> b c f h w", f=video_length)
+            
+            ref_coordmap_latents = self.prepare_control_latents(
+                None,
+                ref_coordmap,
+                batch_size,
+                height,
+                width,
+                weight_dtype,
+                device,
+                generator,
+                do_classifier_free_guidance
+            )[1]
+            
+            # Process ref_coordmap_latents similar to full_ref
+            if ref_coordmap_latents.size(2) == 1:
+                ref_coordmap_latents = ref_coordmap_latents.squeeze(2)  # [B, C, H, W]
+            # else: keep as [B, C, F, H, W]
 
         # 8. Process appearance_latents (start_image and/or bg_video)
         appearance_latents = torch.zeros_like(latents)
         # bg_video if provided
         if bg_video is not None:
-            bg_video = (bg_video - 0.5) / 0.5  # [0, 1] -> [-1, 1]
-            bg_video = rearrange(bg_video, "b f c h w -> b c f h w").to(device=device, dtype=weight_dtype)
-            with torch.no_grad():
-                bs = 1
-                new_bg_latents = []
-                for i in range(0, bg_video.shape[0], bs):
-                    bg_video_bs = bg_video[i : i + bs]
-                    bg_latent_bs = self.vae.encode(bg_video_bs)[0].sample()
-                    new_bg_latents.append(bg_latent_bs)
-                appearance_latents = torch.cat(new_bg_latents, dim=0)
+            video_length = bg_video.shape[1]  # [B, F, C, H, W]
+            bg_video = self.image_processor.preprocess(
+                rearrange(bg_video, "b f c h w -> (b f) c h w"),
+                height=height, width=width
+            )
+            bg_video = bg_video.to(dtype=torch.float32)
+            bg_video = rearrange(bg_video, "(b f) c h w -> b c f h w", f=video_length)
+            
+            appearance_latents = self.prepare_control_latents(
+                None,
+                bg_video,
+                batch_size,
+                height,
+                width,
+                weight_dtype,
+                device,
+                generator,
+                do_classifier_free_guidance
+            )[1]
         # override first frame with start_image if provided
         if start_image is not None:
-            start_image = (start_image - 0.5) / 0.5  # [0, 1] -> [-1, 1]
-            with torch.no_grad():
-                start_image_latents = self.vae.encode(start_image.to(device=device, dtype=weight_dtype))[0].sample()
-                if latents.size()[2] != 1:
-                    appearance_latents[:, :, :1] = start_image_latents
+            video_length = start_image.shape[2]
+            start_image = self.image_processor.preprocess(rearrange(start_image, "b c f h w -> (b f) c h w"), height=height, width=width)
+            start_image = start_image.to(dtype=torch.float32)
+            start_image = rearrange(start_image, "(b f) c h w -> b c f h w", f=video_length)
+            
+            start_image_latents = self.prepare_control_latents(
+                None,
+                start_image,
+                batch_size,
+                height,
+                width,
+                weight_dtype,
+                device,
+                generator,
+                do_classifier_free_guidance
+            )[1]
+            
+            if latents.size()[2] != 1:
+                appearance_latents[:, :, :1] = start_image_latents
 
         # 9. Process fg_coordmap with optional bg_mask
         fg_coordmap_latent = None
         if fg_coordmap is not None:
-            fg_coordmap = (fg_coordmap - 0.5) / 0.5  # [0, 1] -> [-1, 1]
+            video_length = fg_coordmap.shape[1]  # [B, F, C, H, W]
             
+            # Apply bg_mask before preprocessing if provided
             if bg_mask is not None:
                 # bg_mask is in [0, 1] range
                 mask_binary = 1.0 - (bg_mask > 0.5).float()  # mask=1 keep fg_coordmap, mask=0 use black
-                # mask=1 keep fg_coordmap, where mask=0 use black
-                fg_coordmap = fg_coordmap * mask_binary + (-1.0) * (1.0 - mask_binary)
+                # Apply mask: where mask=1 keep fg_coordmap, where mask=0 set to 0 (will become -1 after normalization)
+                fg_coordmap = fg_coordmap * mask_binary
             
-            fg_coordmap = rearrange(fg_coordmap, "b f c h w -> b c f h w").to(device=device, dtype=weight_dtype)
-            with torch.no_grad():
-                bs = 1
-                new_fg_latents = []
-                for i in range(0, fg_coordmap.shape[0], bs):
-                    fg_coordmap_bs = fg_coordmap[i : i + bs]
-                    fg_latent_bs = self.vae.encode(fg_coordmap_bs)[0].sample()
-                    new_fg_latents.append(fg_latent_bs)
-                fg_coordmap_latent = torch.cat(new_fg_latents, dim=0)
+            fg_coordmap = self.image_processor.preprocess(
+                rearrange(fg_coordmap, "b f c h w -> (b f) c h w"),
+                height=height, width=width
+            )
+            fg_coordmap = fg_coordmap.to(dtype=torch.float32)
+            fg_coordmap = rearrange(fg_coordmap, "(b f) c h w -> b c f h w", f=video_length)
+            
+            fg_coordmap_latent = self.prepare_control_latents(
+                None,
+                fg_coordmap,
+                batch_size,
+                height,
+                width,
+                weight_dtype,
+                device,
+                generator,
+                do_classifier_free_guidance
+            )[1]
 
         # 10. Combine fg_coordmap_latent and appearance_latents to form control_latents
         mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
@@ -695,7 +778,7 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                 # Prepare inputs for CFG
                 if do_classifier_free_guidance:
                     # Duplicate for unconditional and conditional
-                    control_latents_input = torch.cat([control_latents, control_latents], dim=0)
+                    control_latents_input = torch.cat([torch.zeros_like(control_latents), control_latents], dim=0)
                     clip_context_input = torch.cat([clip_context] * 2, dim=0)
                     
                     if full_ref is not None:
