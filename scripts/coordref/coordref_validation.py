@@ -466,14 +466,14 @@ def main():
             # Prepare start_image from first frame of GT video if provided
             start_image_input = None
             
-            # Priority 1: Use firstframe if specified in JSON
+            # Priority Use firstframe if specified in JSON
             if firstframe_path and os.path.exists(firstframe_path):
                 firstframe_image = load_first_frame_image(firstframe_path, args.height, args.width)
                 if firstframe_image is not None:
                     start_image_input = firstframe_image.to(device=device, dtype=weight_dtype)
                     print(f"Start image input from firstframe: {start_image_input.shape}")
             
-            # Priority 2: Extract from GT video if no firstframe and GT is available
+            # Extract from GT video if no firstframe and GT is available
             elif gt_video is not None:
                 gt_input = gt_video.to(device=device, dtype=weight_dtype)
                 # Rearrange from [B, F, C, H, W] to [B, C, F, H, W]

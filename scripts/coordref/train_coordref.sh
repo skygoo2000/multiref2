@@ -6,15 +6,15 @@ export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
 export PYTHONWARNINGS="ignore::FutureWarning"
-export CUDA_VISIBLE_DEVICES=1,2,3
+export CUDA_VISIBLE_DEVICES=6,7
 
 LEARNING_RATE=1e-04
 BATCH_SIZE=4
-MAX_TRAIN_STEPS=10000
+MAX_TRAIN_STEPS=4000
 CHECKPOINTING_STEPS=1000
 RESUME_FROM_CHECKPOINT="latest"
 
-OUTPUT_DIR="ckpts/1226_croodref1B3_Google14k_lr${LEARNING_RATE}_fullattn"
+OUTPUT_DIR="ckpts/1230_croodref1B3_Google14k_lr${LEARNING_RATE}_fullattn"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="a small, chibi-style figurine with light purple hair in twin ponytails, elf ears, and a blue scarf."
@@ -66,7 +66,6 @@ accelerate launch --mixed_precision="bf16" scripts/coordref/train_coordref.py \
   --enable_bucket \
   --uniform_sampling \
   --train_mode="control_ref" \
-  --add_full_ref_image_in_self_attention \
   --trainable_modules "." \
   --report_model_info \
   --report_to="wandb" \

@@ -760,7 +760,7 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         model_type='i2v',
         patch_size=(1, 2, 2),
         text_len=512,
-        in_dim=16,
+        in_dim=48,
         dim=2048,
         ffn_dim=8192,
         freq_dim=256,
@@ -772,7 +772,7 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         qk_norm=True,
         cross_attn_norm=True,
         eps=1e-6,
-        in_channels=16,
+        in_channels=48,
         hidden_size=2048,
         add_control_adapter=False,
         in_dim_control_adapter=24,
@@ -791,8 +791,8 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
                 3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
             text_len (`int`, *optional*, defaults to 512):
                 Fixed length for text embeddings
-            in_dim (`int`, *optional*, defaults to 16):
-                Input video channels (C_in)
+            in_dim (`int`, *optional*, defaults to 48):
+                Input video channels (C_in) - 48 for CroodRef (16 ref + 32 coordmap)
             dim (`int`, *optional*, defaults to 2048):
                 Hidden dimension of the transformer
             ffn_dim (`int`, *optional*, defaults to 8192):
@@ -848,6 +848,27 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
             del self.control_adapter
         if hasattr(self, "ref_conv"):
             del self.ref_conv
+        
+        # Save the original patch_embedding weights (16 channels from parent class)
+        original_patch_weight = self.patch_embedding.weight.data.clone()
+        original_patch_bias = self.patch_embedding.bias.data.clone() if self.patch_embedding.bias is not None else None
+        
+        # Force recreate patch_embedding with 48 channels for CroodRef
+        # This ensures patch_embedding always uses 48 channels regardless of loaded config
+        self.patch_embedding = nn.Conv3d(
+            48,  # Always 48 channels for CroodRef (16 ref + 32 coordmap)
+            dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=True
+        )
+        
+        with torch.no_grad():
+            original_channels = original_patch_weight.size(1)
+            self.patch_embedding.weight[:, :original_channels, :, :, :] = original_patch_weight
+            self.patch_embedding.weight[:, original_channels:, :, :, :] = 0
+            if original_patch_bias is not None:
+                self.patch_embedding.bias.copy_(original_patch_bias)
 
     @classmethod
     def from_pretrained(
@@ -962,10 +983,21 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
                 for key in _state_dict:
                     state_dict[key] = _state_dict[key]
         
-        if model.state_dict()['patch_embedding.weight'].size() != state_dict['patch_embedding.weight'].size():
-            model.state_dict()['patch_embedding.weight'][:, :state_dict['patch_embedding.weight'].size()[1], :, :] = state_dict['patch_embedding.weight'][:, :model.state_dict()['patch_embedding.weight'].size()[1], :, :]
-            model.state_dict()['patch_embedding.weight'][:, state_dict['patch_embedding.weight'].size()[1]:, :, :] = 0
-            state_dict['patch_embedding.weight'] = model.state_dict()['patch_embedding.weight']
+        if 'patch_embedding.weight' in state_dict:
+            pretrained_channels = state_dict['patch_embedding.weight'].size(1)
+            model_channels = model.state_dict()['patch_embedding.weight'].size(1)
+            
+            if pretrained_channels != model_channels:
+                print(f"### Expanding patch_embedding from {pretrained_channels} to {model_channels} channels")
+                new_weight = torch.zeros_like(model.state_dict()['patch_embedding.weight'])
+                new_weight[:, :pretrained_channels, :, :, :] = state_dict['patch_embedding.weight']
+                state_dict['patch_embedding.weight'] = new_weight
+                print(f"### First {pretrained_channels} channels copied from pretrained, remaining {model_channels - pretrained_channels} channels zero-initialized")
+            elif pretrained_channels == model_channels == 48:
+                # Both are 48 channels, load directly
+                print(f"### Loading patch_embedding with {model_channels} channels (no expansion needed)")
+        else:
+            raise ValueError(f"patch_embedding.weight not found in checkpoint")
         
         tmp_state_dict = {} 
         for key in state_dict:
@@ -1003,7 +1035,6 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         y=None,
         full_ref=None,
         full_ref_crood=None,
-        subject_ref=None,
         cond_flag=True,
     ):
         r"""
@@ -1026,8 +1057,6 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
                 Full reference frames, 16 channels
             full_ref_crood (Tensor, *optional*):
                 Coordinate map for full reference frames, 16 channels
-            subject_ref (Tensor, *optional*):
-                Subject reference frames
             cond_flag (`bool`, *optional*, defaults to True):
                 Flag to indicate whether to forward the condition input
 
@@ -1035,10 +1064,6 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
-        # Wan2.2 don't need a clip.
-        # if self.model_type == 'i2v':
-        #     assert clip_fea is not None and y is not None
-        # params
         device = self.patch_embedding.weight.device
         dtype = x.dtype if not isinstance(x, list) else x[0].dtype
         if self.freqs.device != device and torch.device(type="meta") != device:
@@ -1047,23 +1072,19 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
         
-        # Process full_ref and full_ref_crood through patch_embedding
         full_ref_length = 0
         full_ref_frames_num = 0
         if full_ref is not None:
-            # Prepare full_ref_crood: concat with zeros to make it 32 channels (to match format)
             if full_ref_crood is not None:
                 # full_ref_crood is 16 channels, concat with zeros to make 32
                 full_ref_crood_zero = torch.zeros_like(full_ref_crood)
                 full_ref_crood = torch.cat([full_ref_crood, full_ref_crood_zero], dim=1)
             else:
-                # If no full_ref_crood, create zeros
                 full_ref_crood = torch.zeros(full_ref.size(0), 32, *full_ref.shape[2:], 
                                                device=full_ref.device, dtype=full_ref.dtype)
             
             full_ref_combined = torch.cat([full_ref, full_ref_crood], dim=1)  # [B, 48, F, H, W] or [B, 48, H, W]
             
-            # Process full_ref_combined through patch_embedding (similar to subject_ref)
             full_ref_embedded = self.patch_embedding(full_ref_combined).flatten(2).transpose(1, 2)  # [B, seq_len, model_dim]
             
             if full_ref_combined.dim() > 4:
@@ -1071,11 +1092,9 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
             else:
                 full_ref_frames_num = 1
             
-            # Save full_ref_length for later removal
             full_ref_length = full_ref_embedded.size(1)
             seq_len += full_ref_length
         
-        # embeddings: process x (now 48 channels if y is provided)
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
 
         grid_sizes = torch.stack(
@@ -1083,9 +1102,8 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
 
         x = [u.flatten(2).transpose(1, 2) for u in x] # [B, seq_len, model_dim]
         
-        # Concat full_ref_embedded in front of x
+        # Concat full_ref in front of x
         if full_ref is not None:
-            # Update grid_sizes to include full_ref frames
             grid_sizes = torch.stack([torch.tensor([u[0] + full_ref_frames_num, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
             x = [torch.concat([_full_ref.unsqueeze(0), u], dim=1) for _full_ref, u in zip(full_ref_embedded, x)]
             if t.dim() != 1 and t.size(1) < seq_len:
@@ -1093,18 +1111,6 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
                 last_elements = t[:, -1].unsqueeze(1)
                 padding = last_elements.repeat(1, pad_size)
                 t = torch.cat([padding, t], dim=1)
-
-        if subject_ref is not None:
-            subject_ref_frames = subject_ref.size(2)
-            subject_ref = self.patch_embedding(subject_ref).flatten(2).transpose(1, 2)
-            grid_sizes = torch.stack([torch.tensor([u[0] + subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
-            seq_len += subject_ref.size(1)
-            x = [torch.concat([u, _subject_ref.unsqueeze(0)], dim=1) for _subject_ref, u in zip(subject_ref, x)]
-            if t.dim() != 1 and t.size(1) < seq_len:
-                pad_size = seq_len - t.size(1)
-                last_elements = t[:, -1].unsqueeze(1)
-                padding = last_elements.repeat(1, pad_size)
-                t = torch.cat([t, padding], dim=1)
         
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         if self.sp_world_size > 1:
@@ -1287,11 +1293,6 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         if full_ref_length > 0:
             x = x[:, full_ref_length:]
             grid_sizes = torch.stack([torch.tensor([u[0] - full_ref_frames_num, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
-
-        if subject_ref is not None:
-            subject_ref_length = subject_ref.size(1)
-            x = x[:, :-subject_ref_length]
-            grid_sizes = torch.stack([torch.tensor([u[0] - subject_ref_frames, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)

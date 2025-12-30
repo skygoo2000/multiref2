@@ -1133,23 +1133,6 @@ def parse_args():
             ' (default), `"control_ref"`, `"control_camera_ref"`.'
         ),
     )
-    # Commented out: control_ref_image no longer needed with ImageVideoRefDataset
-    # parser.add_argument(
-    #     "--control_ref_image",
-    #     type=str,
-    #     default="first_frame",
-    #     help=(
-    #         'The format of training data. Support `"first_frame"`'
-    #         ' (default), `"random"`.'
-    #     ),
-    # )
-    parser.add_argument(
-        "--add_full_ref_image_in_self_attention",
-        action="store_true",
-        help=(
-            'Whether enable add full ref image in self attention.'
-        ),
-    )
     parser.add_argument(
         "--weighting_scheme",
         type=str,
@@ -2001,17 +1984,6 @@ def main():
             else:
                 new_examples.pop("fg_coordmap")
             
-            # Random dropout
-            if rng is None:
-                if np.random.rand() < 0.1:
-                    new_examples.pop("fg", None)
-                    new_examples.pop("bg_mask", None)
-                    new_examples.pop("fg_coordmap", None)
-            else:
-                if rng.random() < 0.1:
-                    new_examples.pop("fg", None)
-                    new_examples.pop("bg_mask", None)
-                    new_examples.pop("fg_coordmap", None)
 
             # Encode prompts when enable_text_encoder_in_dataloader=True
             if args.enable_text_encoder_in_dataloader:
@@ -2465,6 +2437,77 @@ def main():
                         text_encoder.to("cpu")
 
                 with torch.no_grad():
+                    def augment_coordmap(coordmap_tensor, do_expand, border_size):
+                        """
+                        Apply border expansion or cropping augmentation to coordmap.
+                        Args:
+                            coordmap_tensor: [B, F, C, H, W] tensor
+                            do_expand: bool, True for expand, False for crop
+                            border_size: int, number of pixels to expand/crop (1-5)
+                        Returns:
+                            Augmented coordmap tensor with same shape
+                        """
+                        B, F, C, H, W = coordmap_tensor.shape
+                        augmented = []
+                        
+                        for b in range(B):
+                            frames = []
+                            for f in range(F):
+                                frame = coordmap_tensor[b, f]  # [C, H, W]
+                                
+                                if do_expand:
+                                    # Expand: pad with border values (replicate edge values)
+                                    frame_expanded = torch.nn.functional.pad(
+                                        frame, 
+                                        (border_size, border_size, border_size, border_size), 
+                                        mode='replicate'
+                                    )
+                                    # Resize back to original size
+                                    frame_aug = torch.nn.functional.interpolate(
+                                        frame_expanded.unsqueeze(0),
+                                        size=(H, W),
+                                        mode='bilinear',
+                                        align_corners=False
+                                    ).squeeze(0)
+                                else:
+                                    # Crop: remove border and resize
+                                    if H > 2 * border_size and W > 2 * border_size:
+                                        frame_cropped = frame[:, border_size:H-border_size, border_size:W-border_size]
+                                        # Resize back to original size
+                                        frame_aug = torch.nn.functional.interpolate(
+                                            frame_cropped.unsqueeze(0),
+                                            size=(H, W),
+                                            mode='bilinear',
+                                            align_corners=False
+                                        ).squeeze(0)
+                                    else:
+                                        # If image too small for crop, keep original
+                                        frame_aug = frame
+                                
+                                frames.append(frame_aug)
+                            
+                            augmented.append(torch.stack(frames))
+                        
+                        return torch.stack(augmented)
+                    
+                    # 10% coordmap augmentation
+                    if rng is None:
+                        apply_coordmap_aug = np.random.rand() < 0.1
+                    else:
+                        apply_coordmap_aug = rng.random() < 0.1
+                    
+                    if apply_coordmap_aug:
+                        # Randomly choose expand or crop
+                        if rng is None:
+                            coordmap_do_expand = np.random.choice([True, False])
+                            coordmap_border_size = np.random.randint(1, 6)  # 1-5 pixels
+                        else:
+                            coordmap_do_expand = rng.choice([True, False])
+                            coordmap_border_size = rng.integers(1, 6)  # 1-5 pixels
+                    else:
+                        coordmap_do_expand = None
+                        coordmap_border_size = None
+                    
                     # This way is quicker when batch grows up
                     def _batch_encode_vae(pixel_values):
                         pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
@@ -2513,6 +2556,9 @@ def main():
                     # Encode ref_coordmap as ref_coordmap_latents
                     ref_coordmap_latents = None
                     if ref_coordmap is not None:
+                        if apply_coordmap_aug:
+                            ref_coordmap = augment_coordmap(ref_coordmap, coordmap_do_expand, coordmap_border_size)
+                        
                         # Process ref_coordmap with the same logic as ref_pixel_values
                         def _batch_encode_vae_ref_coordmap(ref_coordmap_values):
                             ref_coordmap_values = rearrange(ref_coordmap_values, "b f c h w -> b c f h w")
@@ -2531,81 +2577,127 @@ def main():
                             return torch.cat(new_ref_coordmap_latents, dim = 0)
                         
                         ref_coordmap_latents = _batch_encode_vae_ref_coordmap(ref_coordmap)
-                        
-                        # Process ref_coordmap_latents similar to full_ref
-                        if ref_coordmap_latents.size(2) == 1:
-                            ref_coordmap_latents = ref_coordmap_latents.squeeze(2)  # [B, C, H, W]
-                        # else: keep as [B, C, F, H, W]
-                    
-                    
-                    # Mode 0: first_frame only; Mode 1: first_frame + bgvideo[1:]; Mode 2: bgvideo; Mode 3: none
-                    if rng is None:
-                        mode = np.random.choice([0, 1, 2, 3], p=[0.2/3, 0.2/3, 0.2/3, 0.8])
-                    else:
-                        mode = rng.choice([0, 1, 2, 3], p=[0.2/3, 0.2/3, 0.2/3, 0.8])
-                    
-                    if mode == 3:
-                        # Mode 3: empty
-                        appearance_latents = torch.zeros_like(latents)
-                    elif mode == 1 and batch.get("bg") is not None:
-                        # Mode 1: first_frame + bgvideo[1:]
-                        first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
-                        bg = batch["bg"].to(weight_dtype)
-                        
-                        # Check if bg has more than 1 frame
-                        if bg.shape[1] > 1:
-                            bg_rest = bg[:, 1:, :, :, :]  # [B, F-1, C, H, W]
-                            combined = torch.cat([first_frame, bg_rest], dim=1)  # [B, F, C, H, W]
-                            appearance_latents = _batch_encode_vae(combined)
+                    if ref_coordmap_latents.size(2) == 1:
+                        ref_coordmap_latents = ref_coordmap_latents.squeeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
+                
+                # 10% dropout
+                if full_ref is not None or ref_coordmap_latents is not None:
+                    batch_size = full_ref.size()[0] if full_ref is not None else ref_coordmap_latents.size()[0]
+                    for bs_index in range(batch_size):
+                        if rng is None:
+                            zero_init_ref = np.random.choice([0, 1], p=[0.90, 0.10])
                         else:
-                            # If bg only has 1 frame, fall back to mode 0
-                            start_image_latentes = _batch_encode_vae(first_frame)
-                            appearance_latents = torch.zeros_like(latents)
-                            if latents.size()[2] != 1:
-                                appearance_latents[:, :, :1] = start_image_latentes
-                    elif mode == 2 and batch.get("bg") is not None:
-                        # Mode 2: Complete bgvideo
-                        bg = batch["bg"].to(weight_dtype)
-                        appearance_latents = _batch_encode_vae(bg)
+                            zero_init_ref = rng.choice([0, 1], p=[0.90, 0.10])
+                        
+                        if zero_init_ref:
+                            # Zero out full_ref for this sample
+                            if full_ref is not None:
+                                if full_ref.dim() == 4:  # [B, C, H, W]
+                                    full_ref[bs_index] = full_ref[bs_index] * 0
+                                else:  # [B, C, F, H, W]
+                                    full_ref[bs_index] = full_ref[bs_index] * 0
+                            
+                            # Zero out ref_coordmap_latents for this sample
+                            if ref_coordmap_latents is not None:
+                                if ref_coordmap_latents.dim() == 4:  # [B, C, H, W]
+                                    ref_coordmap_latents[bs_index] = ref_coordmap_latents[bs_index] * 0
+                                else:  # [B, C, F, H, W]
+                                    ref_coordmap_latents[bs_index] = ref_coordmap_latents[bs_index] * 0
+                
+                # Mode 0: first_frame only; Mode 1: first_frame + bgvideo[1:]; Mode 2: bgvideo; Mode 3: none
+                if rng is None:
+                    mode = np.random.choice([0, 1, 2, 3], p=[0.2/3, 0.2/3, 0.2/3, 0.8])
+                else:
+                    mode = rng.choice([0, 1, 2, 3], p=[0.2/3, 0.2/3, 0.2/3, 0.8])
+                
+                if mode == 3:
+                    # Mode 3: empty
+                    appearance_latents = torch.zeros_like(latents)
+                elif mode == 1 and batch.get("bg") is not None:
+                    # Mode 1: first_frame + bgvideo[1:]
+                    first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
+                    bg = batch["bg"].to(weight_dtype)
+                    
+                    # Check if bg has more than 1 frame
+                    if bg.shape[1] > 1:
+                        bg_rest = bg[:, 1:, :, :, :]  # [B, F-1, C, H, W]
+                        combined = torch.cat([first_frame, bg_rest], dim=1)  # [B, F, C, H, W]
+                        appearance_latents = _batch_encode_vae(combined)
                     else:
-                        # Fallback: if bg doesn't exist, use mode 0
-                        first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
-                        start_image_latentes = _batch_encode_vae(first_frame)  # [B, 16, 1, H/8, W/8]
+                        # If bg only has 1 frame, fall back to mode 0
+                        start_image_latentes = _batch_encode_vae(first_frame)
                         appearance_latents = torch.zeros_like(latents)
                         if latents.size()[2] != 1:
                             appearance_latents[:, :, :1] = start_image_latentes
-                                            
-                    fg_coordmap_latent = None
-                    if batch.get("fg_coordmap") is not None:
-                        fg_coordmap = batch["fg_coordmap"].to(weight_dtype)  # [B, F, C, H, W]
+                elif mode == 2 and batch.get("bg") is not None:
+                    # Mode 2: Complete bgvideo
+                    bg = batch["bg"].to(weight_dtype)
+                    appearance_latents = _batch_encode_vae(bg)
+                else:
+                    # Fallback: if bg doesn't exist, use mode 0
+                    if batch.get("bg") is not None:
+                        if rng is None:
+                            use_bg_first_frame = np.random.choice([0, 1], p=[0.5, 0.5])
+                        else:
+                            use_bg_first_frame = rng.choice([0, 1], p=[0.5, 0.5])
                         
-                        if batch.get("bg_mask") is not None:
-                            bg_mask = batch["bg_mask"].to(weight_dtype)  # [B, F, C, H, W]
-                            mask_binary = (bg_mask + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-                            fg_coordmap = fg_coordmap * mask_binary + (-1.0) * (1.0 - mask_binary)
-                        
-                        # Encode fg_coordmap (with mask applied)
-                        fg_coordmap_latent = _batch_encode_vae(fg_coordmap)
+                        if use_bg_first_frame:
+                            bg = batch["bg"].to(weight_dtype)
+                            first_frame = bg[:, 0:1, :, :, :]  # [B, 1, C, H, W]
+                        else:
+                            first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
+                    else:
+                        first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
                     
-                    # Downsample bg_mask to latent space
-                    bg_mask_downsampled = None
+                    start_image_latentes = _batch_encode_vae(first_frame)  # [B, 16, 1, H/8, W/8]
+                    appearance_latents = torch.zeros_like(latents)
+                    if latents.size()[2] != 1:
+                        appearance_latents[:, :, :1] = start_image_latentes
+                
+                fg_coordmap_latent = None
+                if batch.get("fg_coordmap") is not None:
+                    fg_coordmap = batch["fg_coordmap"].to(weight_dtype)  # [B, F, C, H, W]
+                    
+                    if apply_coordmap_aug:
+                        fg_coordmap = augment_coordmap(fg_coordmap, coordmap_do_expand, coordmap_border_size)
+                    
                     if batch.get("bg_mask") is not None:
                         bg_mask = batch["bg_mask"].to(weight_dtype)  # [B, F, C, H, W]
-                        bg_mask_single_channel = bg_mask[:, :, 0:1, :, :]  # [B, F, 1, H, W]
-                        bg_mask_for_downsample = rearrange(bg_mask_single_channel, "b f c h w -> b c f h w")
-                        _, _, latent_f, latent_h, latent_w = latents.shape  # Use latents shape
-                        bg_mask_downsampled = torch.nn.functional.interpolate(
-                            bg_mask_for_downsample,
-                            size=(latent_f, latent_h, latent_w),
-                            mode='nearest'
-                        )  # [B, 1, latent_f, latent_h, latent_w]
-                        bg_mask_downsampled = ((bg_mask_downsampled + 1.0) / 2.0 > 0.5).float()  # [B, 1, latent_f, latent_h, latent_w], values in {0, 1}
+                        mask_binary = (bg_mask + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                        fg_coordmap = fg_coordmap * mask_binary + (-1.0) * (1.0 - mask_binary)
                     
-                    mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
-                    if fg_coordmap_latent is None:
-                        control_latents = torch.cat([mask, appearance_latents], dim=1)
-                    else:
-                        control_latents = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
+                    # Encode fg_coordmap (with mask applied)
+                    fg_coordmap_latent = _batch_encode_vae(fg_coordmap)
+                    
+                    # Apply 10% dropout
+                    for bs_index in range(fg_coordmap_latent.size()[0]):
+                        if rng is None:
+                            zero_init_fg_coordmap = np.random.choice([0, 1], p=[0.90, 0.10])
+                        else:
+                            zero_init_fg_coordmap = rng.choice([0, 1], p=[0.90, 0.10])
+                        
+                        if zero_init_fg_coordmap:
+                            fg_coordmap_latent[bs_index] = fg_coordmap_latent[bs_index] * 0
+                
+                # Downsample bg_mask to latent space
+                bg_mask_downsampled = None
+                if batch.get("bg_mask") is not None:
+                    bg_mask = batch["bg_mask"].to(weight_dtype)  # [B, F, C, H, W]
+                    bg_mask_single_channel = bg_mask[:, :, 0:1, :, :]  # [B, F, 1, H, W]
+                    bg_mask_for_downsample = rearrange(bg_mask_single_channel, "b f c h w -> b c f h w")
+                    _, _, latent_f, latent_h, latent_w = latents.shape  # Use latents shape
+                    bg_mask_downsampled = torch.nn.functional.interpolate(
+                        bg_mask_for_downsample,
+                        size=(latent_f, latent_h, latent_w),
+                        mode='nearest'
+                    )  # [B, 1, latent_f, latent_h, latent_w]
+                    bg_mask_downsampled = ((bg_mask_downsampled + 1.0) / 2.0 > 0.5).float()  # [B, 1, latent_f, latent_h, latent_w], values in {0, 1}
+                
+                mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
+                if fg_coordmap_latent is None:
+                    control_latents = torch.cat([mask, appearance_latents], dim=1)
+                else:
+                    control_latents = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
                                                 
                 # wait for latents = vae.encode(pixel_values) to complete
                 if vae_stream_1 is not None:
@@ -2701,10 +2793,10 @@ def main():
                         context=prompt_embeds,
                         t=timesteps,
                         seq_len=seq_len,
-                        y=control_latents,  # fg encoded as control_latents
+                        y=control_latents,
                         clip_fea=clip_fea,  # clip features from dummy black image
-                        full_ref=full_ref if args.add_full_ref_image_in_self_attention else None,
-                        full_ref_crood=ref_coordmap_latents if args.add_full_ref_image_in_self_attention else None,
+                        full_ref=full_ref,
+                        full_ref_crood=ref_coordmap_latents,
                     )
                 
                 def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):

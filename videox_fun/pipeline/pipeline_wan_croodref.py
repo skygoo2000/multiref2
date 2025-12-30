@@ -734,13 +734,6 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                 do_classifier_free_guidance
             )[1]
 
-        # 10. Combine fg_coordmap_latent and appearance_latents to form control_latents
-        mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
-        if fg_coordmap_latent is None:
-            control_latents = torch.cat([mask, appearance_latents], dim=1)
-        else:
-            control_latents = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
-
         if comfyui_progressbar:
             pbar.update(1)
 
@@ -777,21 +770,39 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
 
                 # Prepare inputs for CFG
                 if do_classifier_free_guidance:
-                    # Duplicate for unconditional and conditional
-                    control_latents_input = torch.cat([torch.zeros_like(control_latents), control_latents], dim=0)
+                    if fg_coordmap_latent is not None:
+                        fg_coordmap_zeros = torch.zeros_like(fg_coordmap_latent)
+                        fg_coordmap_input = torch.cat([fg_coordmap_latent, fg_coordmap_latent], dim=0)
+                    else:
+                        mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
+                        fg_coordmap_input = torch.cat([mask] * 2, dim=0)
+                    
+                    appearance_zeros = torch.zeros_like(appearance_latents)
+                    appearance_input = torch.cat([appearance_latents, appearance_latents], dim=0)
+                    
+                    # Combine them AFTER CFG processing
+                    control_latents_input = torch.cat([fg_coordmap_input, appearance_input], dim=1)
+                    
                     clip_context_input = torch.cat([clip_context] * 2, dim=0)
                     
                     if full_ref is not None:
-                        full_ref_input = torch.cat([torch.zeros_like(full_ref), full_ref], dim=0)
+                        full_ref_zeros = torch.zeros_like(full_ref)
+                        full_ref_input = torch.cat([full_ref, full_ref], dim=0)
                     else:
                         full_ref_input = None
                     
                     if ref_coordmap_latents is not None:
-                        ref_coordmap_input = torch.cat([torch.zeros_like(ref_coordmap_latents), ref_coordmap_latents], dim=0)
+                        ref_coordmap_zeros = torch.zeros_like(ref_coordmap_latents)
+                        ref_coordmap_input = torch.cat([ref_coordmap_latents, ref_coordmap_latents], dim=0)
                     else:
                         ref_coordmap_input = None
                 else:
-                    control_latents_input = control_latents
+                    # Non-CFG
+                    if fg_coordmap_latent is None:
+                        control_latents_input = torch.cat([torch.zeros_like(latents), appearance_latents], dim=1)
+                    else:
+                        control_latents_input = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
+                    
                     clip_context_input = clip_context
                     full_ref_input = full_ref
                     ref_coordmap_input = ref_coordmap_latents
@@ -814,8 +825,8 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
