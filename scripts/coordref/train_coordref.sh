@@ -1,12 +1,12 @@
 export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-Fun-V1.1-1.3B-Control"
 export DATASET_NAME="datasets/Google"
-export DATASET_META_NAME="$DATASET_NAME/google14k.json"
+export DATASET_META_NAME="$DATASET_NAME/mix28k.json"
 # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
 export PYTHONWARNINGS="ignore::FutureWarning"
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=4,5,6
 
 LEARNING_RATE=2e-05
 BATCH_SIZE=4
@@ -16,7 +16,7 @@ CHECKPOINTING_STEPS=1000
 TRANSFORMER_PATH=""
 RESUME_FROM_CHECKPOINT="latest" # higher priority than TRANSFORMER_PATH
 
-OUTPUT_DIR="ckpts/0110_croodref1B3_vid41k_lr${LEARNING_RATE}_fullattn_2fullref"
+OUTPUT_DIR="ckpts/0110_croodref1B3_vid41k_lr${LEARNING_RATE}_fullattn_2fullref_negrope"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="a small, chibi-style figurine is placed on a wooden table in a room with a window."
