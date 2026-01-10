@@ -300,9 +300,12 @@ def main():
     text_encoder = text_encoder.eval()
     
     # Load clip_image_encoder
-    clip_image_encoder = CLIPModel.from_pretrained(
-        os.path.join(args.model_name, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
-    ).to(device, dtype=weight_dtype).eval()
+    clip_image_encoder_path = os.path.join(args.model_name, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder'))
+    if os.path.exists(clip_image_encoder_path):
+        clip_image_encoder = CLIPModel.from_pretrained(clip_image_encoder_path).to(device, dtype=weight_dtype).eval()
+    else:
+        print(f"Warning: CLIPModel not found at {clip_image_encoder_path}, using None")
+        clip_image_encoder = None
     
     Chosen_Scheduler = {
         "Flow": FlowMatchEulerDiscreteScheduler,

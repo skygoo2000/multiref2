@@ -184,9 +184,12 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
     # Use WanFunCroodRefPipeline
     # Load clip_image_encoder for validation pipeline
     from videox_fun.models import CLIPModel
-    clip_image_encoder = CLIPModel.from_pretrained(
-        os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
-    ).to(accelerator.device, dtype=weight_dtype).eval()
+    clip_image_encoder_path = os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder'))
+    if os.path.exists(clip_image_encoder_path):
+        clip_image_encoder = CLIPModel.from_pretrained(clip_image_encoder_path).to(accelerator.device, dtype=weight_dtype).eval()
+    else:
+        logger.warning(f"CLIPModel not found at {clip_image_encoder_path}, using None")
+        clip_image_encoder = None
     
     pipeline = WanFunCroodRefPipeline(
         vae=accelerator.unwrap_model(vae).to(weight_dtype), 
@@ -1319,10 +1322,13 @@ def main():
         )
         vae.eval()
         # Get Clip Image Encoder
-        clip_image_encoder = CLIPModel.from_pretrained(
-            os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
-        )
-        clip_image_encoder = clip_image_encoder.eval()
+        clip_image_encoder_path = os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder'))
+        if os.path.exists(clip_image_encoder_path):
+            clip_image_encoder = CLIPModel.from_pretrained(clip_image_encoder_path)
+            clip_image_encoder = clip_image_encoder.eval()
+        else:
+            print(f"Warning: CLIPModel not found at {clip_image_encoder_path}, using None")
+            clip_image_encoder = None
             
     # Get Transformer (use CroodRefTransformer3DModel for croodref training)
     transformer3d = CroodRefTransformer3DModel.from_pretrained(
@@ -1334,9 +1340,10 @@ def main():
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     transformer3d.requires_grad_(False)
-    clip_image_encoder.requires_grad_(False)
+    if clip_image_encoder is not None:
+        clip_image_encoder.requires_grad_(False)
 
-    if args.transformer_path is not None:
+    if args.transformer_path is not None and args.transformer_path != "" and args.transformer_path.lower() != "none":
         print(f"From checkpoint: {args.transformer_path}")
         if args.transformer_path.endswith("safetensors"):
             from safetensors.torch import load_file, safe_open
@@ -2089,7 +2096,8 @@ def main():
     vae.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
     if not args.enable_text_encoder_in_dataloader:
         text_encoder.to(accelerator.device if not args.low_vram else "cpu")
-    clip_image_encoder.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
+    if clip_image_encoder is not None:
+        clip_image_encoder.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -2442,7 +2450,8 @@ def main():
                 if args.low_vram:
                     torch.cuda.empty_cache()
                     vae.to(accelerator.device)
-                    clip_image_encoder.to(accelerator.device)
+                    if clip_image_encoder is not None:
+                        clip_image_encoder.to(accelerator.device)
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to("cpu")
 
@@ -2723,7 +2732,8 @@ def main():
 
                 if args.low_vram:
                     vae.to('cpu')
-                    clip_image_encoder.to('cpu')
+                    if clip_image_encoder is not None:
+                        clip_image_encoder.to('cpu')
                     torch.cuda.empty_cache()
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to(accelerator.device)
@@ -2800,10 +2810,14 @@ def main():
 
                 # Encode clip features using dummy black image
                 with torch.no_grad():
-                    clip_image_dummy = Image.new("RGB", (512, 512), color=(0, 0, 0))
-                    clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(clip_image_encoder.device, weight_dtype)
-                    clip_fea = clip_image_encoder([clip_image_dummy[:, None, :, :]])
-                    clip_fea = torch.zeros_like(clip_fea).expand(bsz, -1, -1)
+                    if clip_image_encoder is not None:
+                        clip_image_dummy = Image.new("RGB", (512, 512), color=(0, 0, 0))
+                        clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(clip_image_encoder.device, weight_dtype)
+                        clip_fea = clip_image_encoder([clip_image_dummy[:, None, :, :]])
+                        clip_fea = torch.zeros_like(clip_fea).expand(bsz, -1, -1)
+                    else:
+                        # Create dummy clip features with expected shape [B, 1, dim]
+                        clip_fea = None
 
                 # Predict the noise residual
                 with torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=accelerator.device):

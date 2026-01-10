@@ -785,14 +785,17 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
             pbar.update(1)
 
         # 11. Prepare clip latent variables
-        if clip_image is not None:
+        if clip_image is not None and self.clip_image_encoder is not None:
             clip_image = TF.to_tensor(clip_image).sub_(0.5).div_(0.5).to(device, weight_dtype) 
             clip_context = self.clip_image_encoder([clip_image[:, None, :, :]])
         else:
-            clip_image_dummy = Image.new("RGB", (512, 512), color=(0, 0, 0))  
-            clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(device, weight_dtype) 
-            clip_context = self.clip_image_encoder([clip_image_dummy[:, None, :, :]])
-            clip_context = torch.zeros_like(clip_context)
+            if self.clip_image_encoder is not None:
+                clip_image_dummy = Image.new("RGB", (512, 512), color=(0, 0, 0))  
+                clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(device, weight_dtype) 
+                clip_context = self.clip_image_encoder([clip_image_dummy[:, None, :, :]])
+                clip_context = torch.zeros_like(clip_context)
+            else:
+                clip_context = None
 
         # 12. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -854,7 +857,10 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                     context_batched = negative_prompt_embeds + negative_prompt_embeds + prompt_embeds
                     
                     # Batch clip_fea
-                    clip_fea_batched = torch.cat([clip_context] * 3, dim=0)
+                    if clip_context is not None:
+                        clip_fea_batched = torch.cat([clip_context] * 3, dim=0)
+                    else:
+                        clip_fea_batched = None
                     
                     # Batch full_ref: [zeros, pos, pos]
                     if full_ref_input is not None:
@@ -904,7 +910,10 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                     else:
                         control_latents_input = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
                     
-                    clip_context_input = clip_context
+                    if clip_context is not None:
+                        clip_context_input = clip_context
+                    else:
+                        clip_context_input = None
                     
                     # broadcast to batch dimension
                     timestep = t.expand(latent_model_input.shape[0])

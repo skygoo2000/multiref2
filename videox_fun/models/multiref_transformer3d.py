@@ -1151,7 +1151,7 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
                 for u in context
             ]))
 
-        if clip_fea is not None:
+        if clip_fea is not None and hasattr(self, 'img_emb'):
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
