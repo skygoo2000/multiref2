@@ -12,6 +12,7 @@ import torch
 import torchvision
 from einops import rearrange
 from PIL import Image
+from decord import VideoReader
 
 
 def filter_kwargs(cls, kwargs):
@@ -241,26 +242,18 @@ def get_image_to_video_latent(validation_image_start, validation_image_end, vide
 def get_video_to_video_latent(input_video_path, video_length, sample_size, fps=None, validation_video_mask=None, ref_image=None):
     if input_video_path is not None:
         if isinstance(input_video_path, str):
-            cap = cv2.VideoCapture(input_video_path)
+            vr = VideoReader(input_video_path)
+            original_fps = vr.get_avg_fps()
+            frame_skip = 1 if fps is None else max(1, int(original_fps // fps))
+            
+            total_frames = len(vr)
+            frame_indices = list(range(0, total_frames, frame_skip))
+            
             input_video = []
-
-            original_fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_skip = 1 if fps is None else max(1,int(original_fps // fps))
-
-            frame_count = 0
-
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                if frame_count % frame_skip == 0:
-                    frame = cv2.resize(frame, (sample_size[1], sample_size[0]))
-                    input_video.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-                frame_count += 1
-
-            cap.release()
+            for idx in frame_indices:
+                frame = vr[idx].asnumpy()
+                frame = cv2.resize(frame, (sample_size[1], sample_size[0]))
+                input_video.append(frame)
         else:
             input_video = input_video_path
 

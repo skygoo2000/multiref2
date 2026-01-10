@@ -121,7 +121,7 @@ logger = get_logger(__name__, log_level="INFO")
 def sample_ref_frames(total_frames, num_ref_frames_to_use=6, rng=None):
     """
     Sample reference frames using the same logic as poseref.
-    Always takes the first frame, then samples uniformly from segments.
+    10% probability to sample only from the early portion of the sequence.
     
     Args:
         total_frames: Total number of frames available
@@ -133,25 +133,35 @@ def sample_ref_frames(total_frames, num_ref_frames_to_use=6, rng=None):
     """
     if total_frames <= num_ref_frames_to_use:
         return list(range(total_frames))
-    else:
-        # Always take the first frame
-        ref_batch_index = [0]
+    effective_total_frames = total_frames
+    prob = rng.random() if rng is not None else np.random.random()
+    
+    if prob < 0.1:
+        min_limit = 2 * num_ref_frames_to_use + 1
+        if total_frames > min_limit:
+            upper_bound = max(min_limit, total_frames // 3) 
+            effective_total_frames = upper_bound
+
+    ref_batch_index = [0]
+    
+    if num_ref_frames_to_use > 1:
+        segment_boundaries = np.linspace(0, effective_total_frames - 1, num_ref_frames_to_use, dtype=int)
         
-        if num_ref_frames_to_use > 1:
-            segment_boundaries = np.linspace(0, total_frames - 1, num_ref_frames_to_use, dtype=int)
-            for i in range(1, num_ref_frames_to_use):
-                segment_start = segment_boundaries[i - 1]
-                segment_end = segment_boundaries[i]
-                if segment_start >= segment_end:
-                    segment_end = min(segment_start + 1, total_frames - 1)
-                if rng is None:
-                    random_idx = np.random.randint(max(segment_start + 1, 1), segment_end + 1)
-                else:
-                    random_idx = rng.integers(max(segment_start + 1, 1), segment_end + 1)
-                # Convert np.int64 to Python int to avoid CUDA indexing issues
-                ref_batch_index.append(int(random_idx))
-        
-        return ref_batch_index
+        for i in range(1, num_ref_frames_to_use):
+            segment_start = segment_boundaries[i - 1]
+            segment_end = segment_boundaries[i]
+            
+            if segment_start >= segment_end:
+                segment_end = min(segment_start + 1, effective_total_frames - 1)
+            
+            if rng is None:
+                random_idx = np.random.randint(max(segment_start + 1, 1), segment_end + 1)
+            else:
+                random_idx = rng.integers(max(segment_start + 1, 1), segment_end + 1)
+            
+            ref_batch_index.append(int(random_idx))
+    
+    return ref_batch_index
 
 def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, accelerator, weight_dtype, global_step, num_ref_frames_in_vid=8):
     
@@ -183,8 +193,8 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
         text_encoder=accelerator.unwrap_model(text_encoder),
         tokenizer=tokenizer,
         transformer=transformer3d_val,
-        clip_image_encoder=clip_image_encoder,
         scheduler=scheduler,
+        clip_image_encoder=clip_image_encoder,
     )
 
     pipeline = pipeline.to(accelerator.device)
@@ -345,11 +355,11 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     # Use comparison_list to concatenate ref and coordmap
                     comparison_list = [validation_ref, validation_ref_coordmap_reformat]
                     ref_and_coordmap = torch.cat(comparison_list, dim=0)  # [2, C, F, H, W]
-                    save_videos_grid(ref_and_coordmap, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                    save_videos_grid(ref_and_coordmap, os.path.join(args.output_dir, f"validation/ref.gif"), fps=16)
                     logger.info(f"Saved validation ref.gif with ref+coordmap concatenated, shape: {ref_and_coordmap.shape}")
                 else:
                     # Only save validation_ref if coordmap is not available
-                    save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=24)
+                    save_videos_grid(validation_ref, os.path.join(args.output_dir, f"validation/ref.gif"), fps=16)
                     logger.info(f"Saved validation ref.gif with ref only, shape: {validation_ref.shape}")
             
             # Load validation fg (control_video) if provided
@@ -572,11 +582,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     start_image = start_image_input,    # first frame of GT
                 ).videos
 
-                # save as gif if single frame, otherwise save as mp4
-                if sample_with_ref.shape[2] == 1:
-                    save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.gif"), fps=24)
-                else:
-                    save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=24)
+                save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=16)
 
                 # frame mismatch
                 ref_frames = validation_ref.shape[2]
@@ -634,12 +640,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     comparison_list.append(validation_gt_reformat.cpu())
                 
                 comparison_video = torch.cat(comparison_list, dim=0)  # [3 or 4, C, F, H, W]
-                if comparison_video.shape[2] == 1:
-                    comparison_frame = comparison_video[0, :, 0, :, :].permute(1, 2, 0).clamp(0, 1) * 255
-                    comparison_frame = comparison_frame.cpu().numpy().astype('uint8')
-                    Image.fromarray(comparison_frame).save(os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.png"))
-                else:
-                    save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=24)
+                save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=16)
 
                 if i == 0: # Log only the first prompt's result
                     log_dict = {}
@@ -650,7 +651,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     caption = f"{args.validation_prompts[i].split('.')[0]}..."
 
                     if args.report_to == "wandb":
-                        log_dict["validation/comparison"] = wandb.Video(log_comparison.cpu(), fps=24, format="gif", caption=caption)
+                        log_dict["validation/comparison"] = wandb.Video(log_comparison.cpu(), fps=16, format="gif", caption=caption)
                     else: # Tensorboard
                         log_dict["validation/comparison"] = log_comparison
                     
@@ -1907,80 +1908,112 @@ def main():
             new_examples["pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["pixel_values"]])
             
             # Handle ref_pixel_values with different frame counts by cycling shorter ones
+            all_ref_counts = [ref.size(0) for ref in new_examples["ref_pixel_values"]]
+            if any(c is not None for c in new_examples.get("ref_coordmap", [])):
+                all_ref_counts += [c.size(0) for c in new_examples["ref_coordmap"] if c is not None]
+            target_max_ref_f = max(all_ref_counts) if all_ref_counts else 0
+
+            # ref_pixel_values
             if len(new_examples["ref_pixel_values"]) > 0:
-                # Find the maximum number of frames in ref_pixel_values
-                max_ref_frames = max(ref.size(0) for ref in new_examples["ref_pixel_values"])
-                
-                # Cycle shorter ref sequences to match the longest one
                 aligned_ref_pixel_values = []
                 for ref in new_examples["ref_pixel_values"]:
-                    ref_frames = ref.size(0)
-                    if ref_frames < max_ref_frames:
-                        # Calculate how many times to repeat + remainder
-                        repeat_times = max_ref_frames // ref_frames
-                        remainder = max_ref_frames % ref_frames
-                        
-                        # Create cycled sequence: repeat full cycles + partial cycle for remainder
-                        if remainder > 0:
-                            cycled_ref = torch.cat([ref.repeat(repeat_times, 1, 1, 1), ref[:remainder]], dim=0)
-                        else:
-                            cycled_ref = ref.repeat(repeat_times, 1, 1, 1)
+                    cur_f = ref.size(0)
+                    if cur_f < target_max_ref_f:
+                        repeat_times = target_max_ref_f // cur_f
+                        remainder = target_max_ref_f % cur_f
+                        cycled = torch.cat([ref.repeat(repeat_times, 1, 1, 1), ref[:remainder]], dim=0)
+                        aligned_ref_pixel_values.append(cycled)
                     else:
-                        cycled_ref = ref
-                    aligned_ref_pixel_values.append(cycled_ref)
-                
+                        aligned_ref_pixel_values.append(ref[:target_max_ref_f])
                 new_examples["ref_pixel_values"] = torch.stack(aligned_ref_pixel_values)
             else:
                 new_examples["ref_pixel_values"] = torch.stack(new_examples["ref_pixel_values"])
             
-            # Stack bg_mask if they exist
-            if all(example is not None for example in new_examples["bg_mask"]):
-                new_examples["bg_mask"] = torch.stack([example[:batch_video_length] for example in new_examples["bg_mask"]])
-            else:
-                new_examples.pop("bg_mask")
-            
-            # Stack fg if they exist
-            if all(example is not None for example in new_examples["fg"]):
-                new_examples["fg"] = torch.stack([example[:batch_video_length] for example in new_examples["fg"]])
-            else:
-                new_examples.pop("fg")
-            
-            # Stack bg if they exist
-            if all(example is not None for example in new_examples["bg"]):
-                new_examples["bg"] = torch.stack([example[:batch_video_length] for example in new_examples["bg"]])
-            else:
-                new_examples.pop("bg")
-            
-            # Stack ref_coordmap if they exist (handle different frame counts by cycling)
-            if all(example is not None for example in new_examples["ref_coordmap"]):
-                # Find the maximum number of frames in ref_coordmap
-                max_ref_coordmap_frames = max(ref.size(0) for ref in new_examples["ref_coordmap"])
-                
-                # Cycle shorter ref_coordmap sequences to match the longest one
+            # ref_coordmap
+            if any(example is not None for example in new_examples["ref_coordmap"]):
+                ref_e = next(e for e in new_examples["ref_coordmap"] if e is not None)
                 aligned_ref_coordmap = []
                 for ref_coord in new_examples["ref_coordmap"]:
-                    ref_frames = ref_coord.size(0)
-                    if ref_frames < max_ref_coordmap_frames:
-                        # Calculate how many times to repeat + remainder
-                        repeat_times = max_ref_coordmap_frames // ref_frames
-                        remainder = max_ref_coordmap_frames % ref_frames
-                        
-                        # Create cycled sequence: repeat full cycles + partial cycle for remainder
-                        if remainder > 0:
-                            cycled_ref_coord = torch.cat([ref_coord.repeat(repeat_times, 1, 1, 1), ref_coord[:remainder]], dim=0)
-                        else:
-                            cycled_ref_coord = ref_coord.repeat(repeat_times, 1, 1, 1)
+                    if ref_coord is None:
+                        aligned_ref_coordmap.append(torch.zeros((target_max_ref_f, *ref_e.shape[1:])))
                     else:
-                        cycled_ref_coord = ref_coord
-                    aligned_ref_coordmap.append(cycled_ref_coord)
-                
+                        cur_f = ref_coord.size(0)
+                        if cur_f < target_max_ref_f:
+                            repeat_times = target_max_ref_f // cur_f
+                            remainder = target_max_ref_f % cur_f
+                            cycled = torch.cat([ref_coord.repeat(repeat_times, 1, 1, 1), ref_coord[:remainder]], dim=0)
+                            aligned_ref_coordmap.append(cycled)
+                        else:
+                            aligned_ref_coordmap.append(ref_coord[:target_max_ref_f])
                 new_examples["ref_coordmap"] = torch.stack(aligned_ref_coordmap)
             else:
                 new_examples.pop("ref_coordmap")
             
+            # Stack bg_mask if they exist
+            if any(example is not None for example in new_examples["bg_mask"]):
+                ref_e = next(e for e in new_examples["bg_mask"] if e is not None)
+                res = []
+                for e in new_examples["bg_mask"]:
+                    if e is None:
+                        res.append(torch.full((batch_video_length, *ref_e.shape[1:]), -1.0))
+                    else:
+                        cur_f = e.size(0)
+                        if cur_f < batch_video_length:
+                            res.append(torch.cat([e.repeat(batch_video_length // cur_f, 1, 1, 1), e[:batch_video_length % cur_f]], dim=0))
+                        else:
+                            res.append(e[:batch_video_length])
+                new_examples["bg_mask"] = torch.stack(res)
+            else:
+                new_examples.pop("bg_mask")
+            
+            # Stack fg if they exist
+            if any(example is not None for example in new_examples["fg"]):
+                example_template = next(e for e in new_examples["fg"] if e is not None)
+                result = []
+                for e in new_examples["fg"]:
+                    if e is None:
+                        result.append(torch.zeros((batch_video_length, *example_template.shape[1:])))
+                    else:
+                        cur_f = e.size(0)
+                        if cur_f < batch_video_length:
+                            result.append(torch.cat([e.repeat(batch_video_length // cur_f, 1, 1, 1), e[:batch_video_length % cur_f]], dim=0))
+                        else:
+                            result.append(e[:batch_video_length])
+                new_examples["fg"] = torch.stack(result)
+            else:
+                new_examples.pop("fg")
+            
+            # Stack bg if they exist
+            if any(example is not None for example in new_examples["bg"]):
+                example_template = next(e for e in new_examples["bg"] if e is not None)
+                result = []
+                for e in new_examples["bg"]:
+                    if e is None:
+                        result.append(torch.zeros((batch_video_length, *example_template.shape[1:])))
+                    else:
+                        cur_f = e.size(0)
+                        if cur_f < batch_video_length:
+                            result.append(torch.cat([e.repeat(batch_video_length // cur_f, 1, 1, 1), e[:batch_video_length % cur_f]], dim=0))
+                        else:
+                            result.append(e[:batch_video_length])
+                new_examples["bg"] = torch.stack(result)
+            else:
+                new_examples.pop("bg")
+            
             # Stack fg_coordmap if they exist
-            if all(example is not None for example in new_examples["fg_coordmap"]):
-                new_examples["fg_coordmap"] = torch.stack([example[:batch_video_length] for example in new_examples["fg_coordmap"]])
+            if any(example is not None for example in new_examples["fg_coordmap"]):
+                example_template = next(e for e in new_examples["fg_coordmap"] if e is not None)
+                result = []
+                for e in new_examples["fg_coordmap"]:
+                    if e is None:
+                        result.append(torch.zeros((batch_video_length, *example_template.shape[1:])))
+                    else:
+                        cur_f = e.size(0)
+                        if cur_f < batch_video_length:
+                            result.append(torch.cat([e.repeat(batch_video_length // cur_f, 1, 1, 1), e[:batch_video_length % cur_f]], dim=0))
+                        else:
+                            result.append(e[:batch_video_length])
+                new_examples["fg_coordmap"] = torch.stack(result)
             else:
                 new_examples.pop("fg_coordmap")
             
@@ -2244,68 +2277,45 @@ def main():
                 # Sample ref_pixel_values for each sample in batch
                 batch_size = ref_pixel_values.shape[0]
                 sampled_ref_pixel_values = []
-                ref_batch_indices = []  # Store indices for ref_coordmap sampling
+                sampled_ref_coordmap = []
+                
+                has_coord = batch.get("ref_coordmap") is not None
+                ref_coordmap_data = batch["ref_coordmap"].to(weight_dtype) if has_coord else None
+
+                # Unified Sampling and Alignment
+                # This ensures intra-sample alignment and handles varying lengths for Non-Bucket mode
                 for b in range(batch_size):
-                    ref_total_frames = ref_pixel_values.shape[1]  # Number of frames in ref
-                    # Sample frames using segment sampling
-                    ref_batch_index = sample_ref_frames(ref_total_frames, num_ref_frames_to_use, rng=rng)
-                    ref_batch_indices.append(ref_batch_index)
-                    # Convert list of indices to tensor for safe indexing
-                    ref_batch_index_tensor = torch.tensor(ref_batch_index, dtype=torch.long)
-                    sampled_ref_pixel_values.append(ref_pixel_values[b, ref_batch_index_tensor])
+                    # Get current sample data (handles both Tensor from Bucket or List from Non-Bucket)
+                    current_ref = ref_pixel_values[b]
+                    total_f = current_ref.shape[0]
+
+                    # Generate indices for this specific sample
+                    ref_batch_index = sample_ref_frames(total_f, num_ref_frames_to_use, rng=rng)
+                    ref_idx_tensor = torch.tensor(ref_batch_index, dtype=torch.long, device=accelerator.device)
+
+                    def extract_and_enforce_length(source, idxs, target_l):
+                        """Extract frames and ensure the sequence is exactly target_l long."""
+                        extracted = source[idxs]
+                        cur_l = extracted.shape[0]
+                        if cur_l < target_l:
+                            # Cycle to fill if sample_ref_frames returned fewer indices than requested
+                            repeat_times = target_l // cur_l
+                            remainder = target_l % cur_l
+                            return torch.cat([extracted.repeat(repeat_times, 1, 1, 1), extracted[:remainder]], dim=0)
+                        return extracted[:target_l]
+
+                    # Apply same sampling and alignment to both ref and coordmap
+                    sampled_ref_pixel_values.append(extract_and_enforce_length(current_ref, ref_idx_tensor, num_ref_frames_to_use))
+                    
+                    if has_coord:
+                        sampled_ref_coordmap.append(extract_and_enforce_length(ref_coordmap_data[b], ref_idx_tensor, num_ref_frames_to_use))
+
+                # Final Stack
+                ref_pixel_values = torch.stack(sampled_ref_pixel_values) # [B, num_ref_frames_to_use, C, H, W]
                 
-                # Stack sampled refs - handle different frame counts by cycling shorter ones
-                max_ref_frames = max(ref.size(0) for ref in sampled_ref_pixel_values)
-                aligned_ref_pixel_values = []
-                for ref in sampled_ref_pixel_values:
-                    ref_frames = ref.size(0)
-                    if ref_frames < max_ref_frames:
-                        # Calculate how many times to repeat + remainder
-                        repeat_times = max_ref_frames // ref_frames
-                        remainder = max_ref_frames % ref_frames
-                        
-                        # Create cycled sequence: repeat full cycles + partial cycle for remainder
-                        if remainder > 0:
-                            cycled_ref = torch.cat([ref.repeat(repeat_times, 1, 1, 1), ref[:remainder]], dim=0)
-                        else:
-                            cycled_ref = ref.repeat(repeat_times, 1, 1, 1)
-                    else:
-                        cycled_ref = ref
-                    aligned_ref_pixel_values.append(cycled_ref)
-                
-                ref_pixel_values = torch.stack(aligned_ref_pixel_values)  # [B, F_sampled, C, H, W]
-                
-                # Sample ref_coordmap using the SAME indices as ref_pixel_values
                 ref_coordmap = None
-                if batch.get("ref_coordmap") is not None:
-                    ref_coordmap_values = batch["ref_coordmap"].to(weight_dtype)  # [B, F, C, H, W]
-                    
-                    # Use the SAME sampling indices as ref_pixel_values
-                    sampled_ref_coordmap = []
-                    for b in range(batch_size):
-                        # Use the same ref_batch_index that was used for ref_pixel_values
-                        ref_batch_index_tensor = torch.tensor(ref_batch_indices[b], dtype=torch.long)
-                        sampled_ref_coordmap.append(ref_coordmap_values[b, ref_batch_index_tensor])
-                    
-                    # Stack sampled refs - handle different frame counts by cycling shorter ones
-                    aligned_ref_coordmap = []
-                    for ref_coord in sampled_ref_coordmap:
-                        ref_frames = ref_coord.size(0)
-                        if ref_frames < max_ref_frames:
-                            # Calculate how many times to repeat + remainder
-                            repeat_times = max_ref_frames // ref_frames
-                            remainder = max_ref_frames % ref_frames
-                            
-                            # Create cycled sequence: repeat full cycles + partial cycle for remainder
-                            if remainder > 0:
-                                cycled_ref_coord = torch.cat([ref_coord.repeat(repeat_times, 1, 1, 1), ref_coord[:remainder]], dim=0)
-                            else:
-                                cycled_ref_coord = ref_coord.repeat(repeat_times, 1, 1, 1)
-                        else:
-                            cycled_ref_coord = ref_coord
-                        aligned_ref_coordmap.append(cycled_ref_coord)
-                    
-                    ref_coordmap = torch.stack(aligned_ref_coordmap)  # [B, F_sampled, C, H, W]
+                if has_coord:
+                    ref_coordmap = torch.stack(sampled_ref_coordmap) # [B, num_ref_frames_to_use, C, H, W]
                 
                 if args.train_mode == "control_camera_ref":
                     control_camera_values = batch["control_camera_values"].to(weight_dtype)
@@ -2577,32 +2587,9 @@ def main():
                             return torch.cat(new_ref_coordmap_latents, dim = 0)
                         
                         ref_coordmap_latents = _batch_encode_vae_ref_coordmap(ref_coordmap)
-                    if ref_coordmap_latents.size(2) == 1:
-                        ref_coordmap_latents = ref_coordmap_latents.squeeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
+                        if ref_coordmap_latents.size(2) == 1:
+                            ref_coordmap_latents = ref_coordmap_latents.squeeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
                 
-                # 10% dropout
-                if full_ref is not None or ref_coordmap_latents is not None:
-                    batch_size = full_ref.size()[0] if full_ref is not None else ref_coordmap_latents.size()[0]
-                    for bs_index in range(batch_size):
-                        if rng is None:
-                            zero_init_ref = np.random.choice([0, 1], p=[0.90, 0.10])
-                        else:
-                            zero_init_ref = rng.choice([0, 1], p=[0.90, 0.10])
-                        
-                        if zero_init_ref:
-                            # Zero out full_ref for this sample
-                            if full_ref is not None:
-                                if full_ref.dim() == 4:  # [B, C, H, W]
-                                    full_ref[bs_index] = full_ref[bs_index] * 0
-                                else:  # [B, C, F, H, W]
-                                    full_ref[bs_index] = full_ref[bs_index] * 0
-                            
-                            # Zero out ref_coordmap_latents for this sample
-                            if ref_coordmap_latents is not None:
-                                if ref_coordmap_latents.dim() == 4:  # [B, C, H, W]
-                                    ref_coordmap_latents[bs_index] = ref_coordmap_latents[bs_index] * 0
-                                else:  # [B, C, F, H, W]
-                                    ref_coordmap_latents[bs_index] = ref_coordmap_latents[bs_index] * 0
                 
                 # Mode 0: first_frame only; Mode 1: first_frame + bgvideo[1:]; Mode 2: bgvideo; Mode 3: none
                 if rng is None:
@@ -2672,12 +2659,43 @@ def main():
                     # Apply 10% dropout
                     for bs_index in range(fg_coordmap_latent.size()[0]):
                         if rng is None:
-                            zero_init_fg_coordmap = np.random.choice([0, 1], p=[0.90, 0.10])
+                            zero_init_fg_coordmap = np.random.choice([0, 1], p=[0.9, 0.1])
                         else:
-                            zero_init_fg_coordmap = rng.choice([0, 1], p=[0.90, 0.10])
+                            zero_init_fg_coordmap = rng.choice([0, 1], p=[0.9, 0.1])
                         
                         if zero_init_fg_coordmap:
                             fg_coordmap_latent[bs_index] = fg_coordmap_latent[bs_index] * 0
+
+                            # following dropout of fg_coordmap_latent, zero out ref_coordmap_latents
+                            if ref_coordmap_latents is not None:
+                                if ref_coordmap_latents.dim() == 4:  # [B, C, H, W]
+                                    ref_coordmap_latents[bs_index] = ref_coordmap_latents[bs_index] * 0
+                                else:  # [B, C, F, H, W]
+                                    ref_coordmap_latents[bs_index] = ref_coordmap_latents[bs_index] * 0
+
+                # 10% dropout of full_ref and ref_coordmap_latents
+                if full_ref is not None or ref_coordmap_latents is not None:
+                    batch_size = full_ref.size()[0] if full_ref is not None else ref_coordmap_latents.size()[0]
+                    for bs_index in range(batch_size):
+                        if rng is None:
+                            zero_init_ref = np.random.choice([0, 1], p=[0.90, 0.10])
+                        else:
+                            zero_init_ref = rng.choice([0, 1], p=[0.90, 0.10])
+                        
+                        if zero_init_ref:
+                            # Zero out full_ref for this sample
+                            if full_ref is not None:
+                                if full_ref.dim() == 4:  # [B, C, H, W]
+                                    full_ref[bs_index] = full_ref[bs_index] * 0
+                                else:  # [B, C, F, H, W]
+                                    full_ref[bs_index] = full_ref[bs_index] * 0
+                            
+                            # Zero out ref_coordmap_latents for this sample
+                            if ref_coordmap_latents is not None:
+                                if ref_coordmap_latents.dim() == 4:  # [B, C, H, W]
+                                    ref_coordmap_latents[bs_index] = ref_coordmap_latents[bs_index] * 0
+                                else:  # [B, C, F, H, W]
+                                    ref_coordmap_latents[bs_index] = ref_coordmap_latents[bs_index] * 0
                 
                 # Downsample bg_mask to latent space
                 bg_mask_downsampled = None
@@ -2693,9 +2711,9 @@ def main():
                     )  # [B, 1, latent_f, latent_h, latent_w]
                     bg_mask_downsampled = ((bg_mask_downsampled + 1.0) / 2.0 > 0.5).float()  # [B, 1, latent_f, latent_h, latent_w], values in {0, 1}
                 
-                mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
+                latents_zeros = torch.zeros_like(latents).to(latents.device, latents.dtype)
                 if fg_coordmap_latent is None:
-                    control_latents = torch.cat([mask, appearance_latents], dim=1)
+                    control_latents = torch.cat([latents_zeros, appearance_latents], dim=1)
                 else:
                     control_latents = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
                                                 
@@ -2734,6 +2752,7 @@ def main():
                     torch.cuda.empty_cache()
 
                 bsz, channel, num_frames, height, width = latents.size()
+
                 noise = torch.randn(latents.size(), device=latents.device, generator=torch_rng, dtype=weight_dtype)
 
                 if not args.uniform_sampling:
@@ -2782,7 +2801,7 @@ def main():
                 # Encode clip features using dummy black image
                 with torch.no_grad():
                     clip_image_dummy = Image.new("RGB", (512, 512), color=(0, 0, 0))
-                    clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(accelerator.device, weight_dtype)
+                    clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(clip_image_encoder.device, weight_dtype)
                     clip_fea = clip_image_encoder([clip_image_dummy[:, None, :, :]])
                     clip_fea = torch.zeros_like(clip_fea).expand(bsz, -1, -1)
 
@@ -2798,7 +2817,7 @@ def main():
                         full_ref=full_ref,
                         full_ref_crood=ref_coordmap_latents,
                     )
-                
+
                 def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
                     noise_pred = noise_pred.float()
                     target = target.float()
@@ -2875,14 +2894,12 @@ def main():
                     ema_transformer3d.step(transformer3d.parameters())
 
                 if global_step % args.checkpointing_steps == 0 and global_step != 0:
-                    if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                    if accelerator.is_main_process:
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
                             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= args.checkpoints_total_limit:
                                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
                                 removing_checkpoints = checkpoints[0:num_to_remove]
@@ -2894,8 +2911,11 @@ def main():
 
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint, ignore_errors=True)
 
+                    accelerator.wait_for_everyone()
+
+                    if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
@@ -3005,7 +3025,7 @@ def main():
                             
                             # Stack vertically
                             comparison = torch.cat(comparison_list, dim=3)  # stack in height dimension
-                            save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=24)
+                            save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=16)
 
                             # Prepare comparison for logging
                             log_vae_comparison = comparison.clone().detach().clamp(0, 1) * 255
@@ -3014,7 +3034,7 @@ def main():
                             log_dict = {}
 
                             if args.report_to == "wandb":
-                                log_dict["validation/vae_decoded"] = wandb.Video(log_vae_comparison.cpu(), fps=24, format="gif")
+                                log_dict["validation/vae_decoded"] = wandb.Video(log_vae_comparison.cpu(), fps=16, format="gif")
                             else: # Tensorboard
                                 log_dict["validation/vae_decoded"] = log_vae_comparison
                             

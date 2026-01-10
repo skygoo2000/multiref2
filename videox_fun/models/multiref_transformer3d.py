@@ -726,8 +726,8 @@ class MultiRefTransformer3DModel(WanTransformer3DModel):
             x = self.all_gather(x, dim=1)
 
         if self.ref_conv is not None and full_ref is not None:
-            full_ref_length = full_ref.size(1)
-            x = x[:, full_ref_length:]
+            full_ref_token_num = full_ref.size(1)
+            x = x[:, full_ref_token_num:]
 
             if full_ref_frames_num is not None:
                 grid_sizes = torch.stack([torch.tensor([u[0] - full_ref_frames_num, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
@@ -1072,16 +1072,14 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
         
-        full_ref_length = 0
+        full_ref_token_num = 0
         full_ref_frames_num = 0
         if full_ref is not None:
             if full_ref_crood is not None:
                 # full_ref_crood is 16 channels, concat with zeros to make 32
-                full_ref_crood_zero = torch.zeros_like(full_ref_crood)
-                full_ref_crood = torch.cat([full_ref_crood, full_ref_crood_zero], dim=1)
+                full_ref_crood = torch.cat([full_ref_crood, full_ref], dim=1)
             else:
-                full_ref_crood = torch.zeros(full_ref.size(0), 32, *full_ref.shape[2:], 
-                                               device=full_ref.device, dtype=full_ref.dtype)
+                full_ref_crood = torch.cat([torch.zeros_like(full_ref), full_ref], dim=1)
             
             full_ref_combined = torch.cat([full_ref, full_ref_crood], dim=1)  # [B, 48, F, H, W] or [B, 48, H, W]
             
@@ -1092,13 +1090,13 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
             else:
                 full_ref_frames_num = 1
             
-            full_ref_length = full_ref_embedded.size(1)
-            seq_len += full_ref_length
+            full_ref_token_num = full_ref_embedded.size(1)
+            seq_len += full_ref_token_num
         
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
 
         grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]).to(device)
 
         x = [u.flatten(2).transpose(1, 2) for u in x] # [B, seq_len, model_dim]
         
@@ -1112,7 +1110,7 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
                 padding = last_elements.repeat(1, pad_size)
                 t = torch.cat([padding, t], dim=1)
         
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long).to(device)
         if self.sp_world_size > 1:
             seq_len = int(math.ceil(seq_len / self.sp_world_size)) * self.sp_world_size
         assert seq_lens.max() <= seq_len
@@ -1289,9 +1287,9 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         if self.sp_world_size > 1:
             x = self.all_gather(x, dim=1)
 
-        # Remove full_ref tokens from output (use saved full_ref_length and full_ref_frames_num)
-        if full_ref_length > 0:
-            x = x[:, full_ref_length:]
+        # Remove full_ref tokens from output (use saved full_ref_token_num and full_ref_frames_num)
+        if full_ref_token_num > 0:
+            x = x[:, full_ref_token_num:]
             grid_sizes = torch.stack([torch.tensor([u[0] - full_ref_frames_num, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
 
         # unpatchify

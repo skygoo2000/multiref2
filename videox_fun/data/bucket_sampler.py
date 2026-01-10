@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import BatchSampler, Dataset, Sampler
+from decord import VideoReader
 
 ASPECT_RATIO_512 = {
     '0.25': [256.0, 1024.0], '0.26': [256.0, 992.0], '0.27': [256.0, 960.0], '0.28': [256.0, 928.0],
@@ -36,6 +37,44 @@ ASPECT_RATIO_RANDOM_CROP_PROB = [
     2, 1
 ]
 ASPECT_RATIO_RANDOM_CROP_PROB = np.array(ASPECT_RATIO_RANDOM_CROP_PROB) / sum(ASPECT_RATIO_RANDOM_CROP_PROB)
+
+# 480 * 832 像素量约 400,000
+ASPECT_RATIO_480 = {
+    '0.25': [320.0, 1280.0], '0.26': [320.0, 1248.0], '0.28': [352.0, 1248.0], '0.3': [352.0, 1184.0],
+    '0.32': [352.0, 1120.0], '0.35': [384.0, 1088.0], '0.38': [384.0, 1024.0], '0.41': [416.0, 1024.0],
+    '0.43': [416.0, 960.0],  '0.47': [448.0, 960.0],  '0.5': [448.0, 896.0],  '0.54': [480.0, 896.0],
+    '0.58': [480.0, 832.0],  # 16:9 横屏
+    '0.62': [512.0, 832.0],  '0.67': [512.0, 768.0],  '0.71': [544.0, 768.0],
+    '0.74': [544.0, 736.0],  # 4:3 横屏
+    '0.78': [576.0, 736.0],  '0.83': [576.0, 672.0],  '0.89': [608.0, 672.0], '0.95': [608.0, 640.0],
+    '1.0':  [640.0, 640.0],   # 1:1 正方形
+    '1.05': [640.0, 608.0],  '1.12': [672.0, 608.0],  '1.17': [672.0, 576.0], '1.25': [704.0, 576.0],
+    '1.31': [704.0, 544.0],
+    '1.35': [736.0, 544.0],  # 3:4 竖屏
+    '1.41': [736.0, 512.0],  '1.5': [768.0, 512.0],   '1.6': [768.0, 480.0],
+    '1.73': [832.0, 480.0],  # 9:16 竖屏
+    '1.85': [832.0, 448.0],  '2.0': [896.0, 448.0],   '2.14': [896.0, 416.0], '2.31': [960.0, 416.0],
+    '2.5':  [960.0, 384.0],  '2.67': [1024.0, 384.0], '3.0': [1088.0, 352.0], '3.38': [1184.0, 352.0],
+    '3.75': [1248.0, 320.0], '4.0': [1280.0, 320.0]
+}
+
+ASPECT_RATIO_RANDOM_CROP_480 = {
+    '0.43': [416.0, 960.0], '0.5': [448.0, 896.0], '0.58': [480.0, 832.0],
+    '0.67': [512.0, 768.0], '0.74': [544.0, 736.0], '0.83': [576.0, 672.0],
+    '0.95': [608.0, 640.0], '1.0': [640.0, 640.0],  '1.05': [640.0, 608.0],
+    '1.17': [672.0, 576.0], '1.35': [736.0, 544.0], '1.5': [768.0, 512.0],
+    '1.73': [832.0, 480.0], '2.0': [896.0, 448.0], '2.31': [960.0, 416.0]
+}
+
+# 采样概率 (16:9, 4:3, 1:1 权重设为 8)
+ASPECT_RATIO_RANDOM_CROP_PROB_480 = [
+    1, 2, 8, 
+    4, 8, 4, 
+    4, 8, 4, 
+    4, 8, 4, 
+    8, 2, 1
+]
+ASPECT_RATIO_RANDOM_CROP_PROB_480 = np.array(ASPECT_RATIO_RANDOM_CROP_PROB_480) / sum(ASPECT_RATIO_RANDOM_CROP_PROB_480)
 
 def get_closest_ratio(height: float, width: float, ratios: dict = ASPECT_RATIO_512):
     aspect_ratio = height / width
@@ -230,7 +269,7 @@ class AspectRatioBatchSampler(BatchSampler):
         for idx in self.sampler:
             try:
                 video_dict = self.dataset[idx]
-                width, more = video_dict.get("width", None), video_dict.get("height", None)
+                width, height = video_dict.get("width", None), video_dict.get("height", None)
 
                 if width is None or height is None:
                     if self.train_data_format == "normal":
@@ -242,11 +281,15 @@ class AspectRatioBatchSampler(BatchSampler):
                     else:
                         videoid, name, page_dir = video_dict['videoid'], video_dict['name'], video_dict['page_dir']
                         video_dir = os.path.join(self.video_folder, f"{videoid}.mp4")
-                    cap = cv2.VideoCapture(video_dir)
+                    
+                    try:
+                        vr = VideoReader(video_dir)
+                        frame = vr[0].asnumpy()
+                        height, width = frame.shape[0], frame.shape[1]
+                    except Exception as e:
+                        print(f"ERROR in bucket_sampler: Failed to read video with decord")
+                        continue
 
-                    # 获取视频尺寸
-                    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))   # 浮点数转换为整数
-                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))  # 浮点数转换为整数
                     
                     ratio = height / width # self.dataset[idx]
                 else:
@@ -254,7 +297,7 @@ class AspectRatioBatchSampler(BatchSampler):
                     width = int(width)
                     ratio = height / width # self.dataset[idx]
             except Exception as e:
-                print(e, self.dataset[idx], "This item is error, please check it.")
+                print(f"ERROR in bucket_sampler: {type(e).__name__}: {e}")
                 continue
             # find the closest aspect ratio
             closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))
@@ -330,7 +373,7 @@ class AspectRatioBatchImageVideoSampler(BatchSampler):
                         width = int(width)
                         ratio = height / width # self.dataset[idx]
                 except Exception as e:
-                    print(e, self.dataset[idx], "This item is error, please check it.")
+                    print(f"ERROR in bucket_sampler (image): {type(e).__name__}: {e}")
                     continue
                 # find the closest aspect ratio
                 closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))
@@ -353,11 +396,15 @@ class AspectRatioBatchImageVideoSampler(BatchSampler):
                             video_dir = video_id
                         else:
                             video_dir = os.path.join(self.train_folder, video_id)
-                        cap = cv2.VideoCapture(video_dir)
+                        
+                        try:
+                            vr = VideoReader(video_dir)
+                            frame = vr[0].asnumpy()
+                            height, width = frame.shape[0], frame.shape[1]
+                        except Exception as e:
+                            print(f"ERROR in bucket_sampler (video): Failed to read video with decord")
+                            continue
 
-                        # 获取视频尺寸
-                        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))   # 浮点数转换为整数
-                        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))  # 浮点数转换为整数
                         
                         ratio = height / width # self.dataset[idx]
                     else:
@@ -365,7 +412,7 @@ class AspectRatioBatchImageVideoSampler(BatchSampler):
                         width = int(width)
                         ratio = height / width # self.dataset[idx]
                 except Exception as e:
-                    print(e, self.dataset[idx], "This item is error, please check it.")
+                    print(f"ERROR in bucket_sampler (video): {type(e).__name__}: {e}")
                     continue
                 # find the closest aspect ratio
                 closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))

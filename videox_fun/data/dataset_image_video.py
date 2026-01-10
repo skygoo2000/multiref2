@@ -1400,13 +1400,43 @@ class ImageVideoRefDataset(Dataset):
                 else:
                     fg = np.expand_dims(np.array(fg_image), 0)
 
+            # Load ref_coordmap if available
+            ref_coordmap = None
+            if 'ref_coordmap' in data_info and data_info['ref_coordmap']:
+                ref_coordmap_file_path = data_info['ref_coordmap']
+                
+                try:
+                    # Use _ref_preprocess to load ALL frames (same as ref_pixel_values)
+                    # Get target size from pixel_values
+                    if not self.enable_bucket:
+                        target_size = (pixel_values.shape[2], pixel_values.shape[3])  # (H, W) from (F, C, H, W)
+                    else:
+                        target_size = (pixel_values.shape[1], pixel_values.shape[2])  # (H, W) from (F, H, W, C)
+                    # Pass relative path directly to _ref_preprocess (it will handle data_root joining)
+                    ref_coordmap = self._ref_preprocess(ref_coordmap_file_path, idx, data_type='video', target_size=target_size)
+                except Exception as e:
+                    print(f"Warning: Failed to load ref_coordmap from {ref_coordmap_file_path}: {e}")
+                    ref_coordmap = None
+
+            # Load fg_coordmap if available
+            fg_coordmap = None
+            if 'fg_coordmap' in data_info and data_info['fg_coordmap']:
+
+                fg_coordmap_file_path = data_info['fg_coordmap']
+                if self.data_root is not None:
+                    fg_coordmap_file_path = os.path.join(self.data_root, fg_coordmap_file_path)
+
+                fg_coordmap_image = Image.open(fg_coordmap_file_path).convert('RGB')
+
+                if not self.enable_bucket:
+                    fg_coordmap = self.image_transforms(fg_coordmap_image).unsqueeze(0)
+                else:
+                    fg_coordmap = np.expand_dims(np.array(fg_coordmap_image), 0)
+
+            
             # For images, pose is not applicable
             ref_pose = None
             video_pose = None
-
-            # For images, coordmap is not applicable
-            ref_coordmap = None
-            fg_coordmap = None
 
             return pixel_values, ref_pixel_values, text, 'image', image_path, bg_mask, bg, fg, ref_pose, video_pose, ref_coordmap, fg_coordmap
             
@@ -1426,11 +1456,13 @@ class ImageVideoRefDataset(Dataset):
 
                 pixel_values, ref_pixel_values, name, data_type, file_path, bg_mask, bg, fg, ref_pose, video_pose, ref_coordmap, fg_coordmap = self.get_batch(idx)
 
-                # # Randomly shuffle frames of ref_pixel_values
+                # # Randomly shuffle frames of ref
                 # if ref_pixel_values.shape[0] > 1:
                 #     perm = torch.randperm(ref_pixel_values.shape[0])
                 #     ref_pixel_values = ref_pixel_values[perm]
-                #     # Also shuffle ref_pose if it exists
+
+                #     if ref_coordmap is not None:
+                #         ref_coordmap = ref_coordmap[perm]
                 #     if ref_pose is not None:
                 #         ref_pose = ref_pose[perm.numpy()]
 

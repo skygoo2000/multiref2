@@ -136,8 +136,8 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
         text_encoder: WanT5EncoderModel,
         vae: AutoencoderKLWan,
         transformer: CroodRefTransformer3DModel,
-        clip_image_encoder: CLIPModel,
         scheduler: FlowMatchEulerDiscreteScheduler,
+        clip_image_encoder: Optional[CLIPModel] = None,
     ):
         super().__init__()
 
@@ -447,7 +447,8 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
         num_frames: int = 49,
         num_inference_steps: int = 50,
         timesteps: Optional[List[int]] = None,
-        guidance_scale: float = 6,
+        guidance_scale: float = 7.5,
+        guide_scale_ref: float = 5.0,
         num_videos_per_prompt: int = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -493,8 +494,10 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                 The number of video frames to generate.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps.
-            guidance_scale (`float`, *optional*, defaults to 6):
-                Guidance scale as defined in Classifier-Free Diffusion Guidance.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Text guidance scale as defined in Classifier-Free Diffusion Guidance.
+            guide_scale_ref (`float`, *optional*, defaults to 5.0):
+                Reference image guidance scale.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
                 One or a list of torch generator(s) to make generation deterministic.
         
@@ -663,6 +666,23 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
         # bg_video if provided
         if bg_video is not None:
             video_length = bg_video.shape[1]  # [B, F, C, H, W]
+            
+            # Adjust bg_video length to match num_frames if needed
+            if video_length != num_frames:
+                print(f"Warning: bg_video frame count ({video_length}) != num_frames ({num_frames}), adjusting...")
+                if video_length > num_frames:
+                    # Crop to num_frames
+                    bg_video = bg_video[:, :num_frames, :, :, :]
+                    video_length = num_frames
+                else:
+                    # Pad with zeros to num_frames
+                    padding_frames = num_frames - video_length
+                    padding = torch.zeros(bg_video.shape[0], padding_frames, bg_video.shape[2], 
+                                        bg_video.shape[3], bg_video.shape[4], 
+                                        device=bg_video.device, dtype=bg_video.dtype)
+                    bg_video = torch.cat([bg_video, padding], dim=1)
+                    video_length = num_frames
+            
             bg_video = self.image_processor.preprocess(
                 rearrange(bg_video, "b f c h w -> (b f) c h w"),
                 height=height, width=width
@@ -708,8 +728,35 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
         if fg_coordmap is not None:
             video_length = fg_coordmap.shape[1]  # [B, F, C, H, W]
             
+            # Adjust fg_coordmap length to match num_frames if needed
+            if video_length != num_frames:
+                print(f"Warning: fg_coordmap frame count ({video_length}) != num_frames ({num_frames}), resampling...")
+                fg_coordmap = rearrange(fg_coordmap, "b f c h w -> b c f h w")
+                fg_coordmap = torch.nn.functional.interpolate(
+                    fg_coordmap, 
+                    size=(num_frames, fg_coordmap.shape[3], fg_coordmap.shape[4]),
+                    mode='trilinear',
+                    align_corners=False
+                )
+                # Rearrange back to [B, F, C, H, W]
+                fg_coordmap = rearrange(fg_coordmap, "b c f h w -> b f c h w")
+                video_length = num_frames
+            
             # Apply bg_mask before preprocessing if provided
             if bg_mask is not None:
+                bg_mask_length = bg_mask.shape[1]
+                
+                if bg_mask_length != num_frames:
+                    print(f"Warning: bg_mask frame count ({bg_mask_length}) != num_frames ({num_frames}), resampling...")
+                    bg_mask = rearrange(bg_mask, "b f c h w -> b c f h w")
+                    bg_mask = torch.nn.functional.interpolate(
+                        bg_mask,
+                        size=(num_frames, bg_mask.shape[3], bg_mask.shape[4]),
+                        mode='trilinear',
+                        align_corners=False
+                    )
+                    bg_mask = rearrange(bg_mask, "b c f h w -> b f c h w")
+                
                 # bg_mask is in [0, 1] range
                 mask_binary = 1.0 - (bg_mask > 0.5).float()  # mask=1 keep fg_coordmap, mask=0 use black
                 # Apply mask: where mask=1 keep fg_coordmap, where mask=0 set to 0 (will become -1 after normalization)
@@ -764,38 +811,92 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                 if self.interrupt:
                     continue
 
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = latents
                 if hasattr(self.scheduler, "scale_model_input"):
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # Prepare inputs for CFG
+                # Prepare inputs for CFG using batch dimension
                 if do_classifier_free_guidance:
                     if fg_coordmap_latent is not None:
                         fg_coordmap_zeros = torch.zeros_like(fg_coordmap_latent)
-                        fg_coordmap_input = torch.cat([fg_coordmap_latent, fg_coordmap_latent], dim=0)
                     else:
-                        mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
-                        fg_coordmap_input = torch.cat([mask] * 2, dim=0)
+                        fg_coordmap_zeros = torch.zeros_like(latents).to(latents.device, latents.dtype)
                     
-                    appearance_zeros = torch.zeros_like(appearance_latents)
-                    appearance_input = torch.cat([appearance_latents, appearance_latents], dim=0)
-                    
-                    # Combine them AFTER CFG processing
-                    control_latents_input = torch.cat([fg_coordmap_input, appearance_input], dim=1)
-                    
-                    clip_context_input = torch.cat([clip_context] * 2, dim=0)
-                    
+                    # Prepare reference inputs
+                    full_ref_input = full_ref
                     if full_ref is not None:
                         full_ref_zeros = torch.zeros_like(full_ref)
-                        full_ref_input = torch.cat([full_ref, full_ref], dim=0)
                     else:
-                        full_ref_input = None
+                        full_ref_zeros = None
                     
                     if ref_coordmap_latents is not None:
                         ref_coordmap_zeros = torch.zeros_like(ref_coordmap_latents)
-                        ref_coordmap_input = torch.cat([ref_coordmap_latents, ref_coordmap_latents], dim=0)
                     else:
-                        ref_coordmap_input = None
+                        ref_coordmap_zeros = None
+                    
+                    # Prepare batched inputs for single forward pass
+                    # Order: [neg, pos_i, pos_it]
+                    # neg: negative text + negative reference
+                    # pos_i: negative text + positive reference  
+                    # pos_it: positive text + positive reference
+                    
+                    # Batch latents: [neg, pos_i, pos_it]
+                    latent_model_input_batched = torch.cat([latent_model_input] * 3, dim=0)
+                    
+                    # Batch control latents
+                    control_latents_pos = torch.cat([
+                        fg_coordmap_latent if fg_coordmap_latent is not None else fg_coordmap_zeros,
+                        appearance_latents], dim=1)
+                    control_latents_neg = torch.cat([fg_coordmap_zeros, appearance_latents], dim=1)
+                    control_latents_batched = torch.cat([control_latents_neg, control_latents_pos, control_latents_pos], dim=0)
+                    
+                    # Batch context: [neg, neg, pos]
+                    context_batched = negative_prompt_embeds + negative_prompt_embeds + prompt_embeds
+                    
+                    # Batch clip_fea
+                    clip_fea_batched = torch.cat([clip_context] * 3, dim=0)
+                    
+                    # Batch full_ref: [zeros, pos, pos]
+                    if full_ref_input is not None:
+                        if full_ref_input.dim() == 4:  # [B, C, H, W]
+                            full_ref_batched = torch.cat([full_ref_zeros, full_ref_input, full_ref_input], dim=0)
+                        else:  # [B, C, F, H, W]
+                            full_ref_batched = torch.cat([full_ref_zeros, full_ref_input, full_ref_input], dim=0)
+                    else:
+                        full_ref_batched = None
+                    
+                    # Batch ref_coordmap: [zeros, pos, pos]
+                    if ref_coordmap_latents is not None:
+                        if ref_coordmap_latents.dim() == 4:  # [B, C, H, W]
+                            ref_coordmap_batched = torch.cat([ref_coordmap_zeros, ref_coordmap_latents, ref_coordmap_latents], dim=0)
+                        else:  # [B, C, F, H, W]
+                            ref_coordmap_batched = torch.cat([ref_coordmap_zeros, ref_coordmap_latents, ref_coordmap_latents], dim=0)
+                    else:
+                        ref_coordmap_batched = None
+                    
+                    # Broadcast timestep to batched dimension
+                    timestep = t.expand(latent_model_input_batched.shape[0])
+                    
+                    # Single forward pass with batched inputs
+                    with torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=device):
+                        noise_pred_batched = self.transformer(
+                            x=latent_model_input_batched,
+                            context=context_batched,
+                            t=timestep,
+                            seq_len=seq_len,
+                            y=control_latents_batched,
+                            clip_fea=clip_fea_batched,
+                            full_ref=full_ref_batched,
+                            full_ref_crood=ref_coordmap_batched,
+                        )
+                    
+                    # Split the batched predictions
+                    noise_pred_neg, noise_pred_pos_i, noise_pred_pos_it = noise_pred_batched.chunk(3, dim=0)
+                    
+                    # Dual CFG: neg + guide_scale_ref * (pos_i - neg) + guidance_scale * (pos_it - pos_i)
+                    noise_pred = noise_pred_neg + guide_scale_ref * (noise_pred_pos_i - noise_pred_neg) + self.guidance_scale * (noise_pred_pos_it - noise_pred_pos_i)
+                    
+                    # Note: Transformer automatically removes ref frames from output, no need to slice here
                 else:
                     # Non-CFG
                     if fg_coordmap_latent is None:
@@ -804,30 +905,23 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                         control_latents_input = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
                     
                     clip_context_input = clip_context
-                    full_ref_input = full_ref
-                    ref_coordmap_input = ref_coordmap_latents
-    
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latent_model_input.shape[0])
-                
-                # predict noise model_output
-                with torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=device):
-                    noise_pred = self.transformer(
-                        x=latent_model_input,
-                        context=in_prompt_embeds,
-                        t=timestep,
-                        seq_len=seq_len,
-                        y=control_latents_input,
-                        clip_fea=clip_context_input,
-                        full_ref=full_ref_input,
-                        full_ref_crood=ref_coordmap_input,
-                    )
-
-                # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-
+                    
+                    # broadcast to batch dimension
+                    timestep = t.expand(latent_model_input.shape[0])
+                    
+                    # predict noise model_output
+                    with torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=device):
+                        noise_pred = self.transformer(
+                            x=latent_model_input,
+                            context=in_prompt_embeds,
+                            t=timestep,
+                            seq_len=seq_len,
+                            y=control_latents_input,
+                            clip_fea=clip_context_input,
+                            full_ref=full_ref,
+                            full_ref_crood=ref_coordmap_latents,
+                        )
+                    
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 

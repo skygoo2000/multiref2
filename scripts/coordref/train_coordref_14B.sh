@@ -1,22 +1,20 @@
-export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-Fun-V1.1-1.3B-Control"
+export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-Fun-V1.1-14B-Control"
 export DATASET_NAME="datasets/Google"
-export DATASET_META_NAME="$DATASET_NAME/mix94k.json"
-# # NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
+export DATASET_META_NAME="$DATASET_NAME/video41k.json"
+## NCCL_IB_DISABLE=1 and NCCL_P2P_DISABLE=1 are used in multi nodes without RDMA. 
 # export NCCL_IB_DISABLE=1
 # export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
 export PYTHONWARNINGS="ignore::FutureWarning"
-# export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 LEARNING_RATE=2e-05
-BATCH_SIZE=12
+BATCH_SIZE=1
 MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=1000
+RESUME_FROM_CHECKPOINT="latest"
 
-TRANSFORMER_PATH="ckpts/0106_croodref1B3_mix36k_lr2e-05_fullattn_fgdrop/checkpoint-9000/transformer/diffusion_pytorch_model.safetensors"
-RESUME_FROM_CHECKPOINT="" # higher priority than TRANSFORMER_PATH
-
-OUTPUT_DIR="ckpts/0109_croodref1B3_mix94k_lr${LEARNING_RATE}_fullattn_2fullref"
+OUTPUT_DIR="ckpts/0106_croodref14B_vid41k_lr${LEARNING_RATE}_fullattn_2fullref"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="a small, chibi-style figurine is placed on a wooden table in a room with a window."
@@ -31,7 +29,7 @@ VALIDATION_SIZE="192 336 49"  # height width frames
 ## deepspeed zero2
 # accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/coordref/train_coordref.py \
 
-accelerate launch scripts/coordref/train_coordref.py \
+accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/coordref/train_coordref.py \
   --config_path="config/wan2.1/wan_civitai.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
@@ -69,11 +67,9 @@ accelerate launch scripts/coordref/train_coordref.py \
   --trainable_modules "." \
   --report_model_info \
   --report_to="wandb" \
-  --tracker_project_name="fun_1B3-256p" \
-  --transformer_path=$TRANSFORMER_PATH \
+  --tracker_project_name="coordref_14B-384p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
-  # --noisy_ref \
   # --low_vram \
   # --gradient_accumulation_steps=4 \
   # --random_hw_adapt \

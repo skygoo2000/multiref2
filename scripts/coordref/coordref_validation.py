@@ -232,7 +232,6 @@ def main():
     transformer = CroodRefTransformer3DModel.from_pretrained(
         os.path.join(args.model_name, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
         transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
-        low_cpu_mem_usage=True,
         torch_dtype=weight_dtype,
     )
     
@@ -296,7 +295,6 @@ def main():
     text_encoder = WanT5EncoderModel.from_pretrained(
         os.path.join(args.model_name, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder')),
         additional_kwargs=OmegaConf.to_container(config['text_encoder_kwargs']),
-        low_cpu_mem_usage=True,
         torch_dtype=weight_dtype,
     )
     text_encoder = text_encoder.eval()
@@ -324,8 +322,8 @@ def main():
         vae=vae,
         tokenizer=tokenizer,
         text_encoder=text_encoder,
-        clip_image_encoder=clip_image_encoder,
         scheduler=scheduler,
+        clip_image_encoder=clip_image_encoder,
     )
     
     if args.gpu_memory_mode == "sequential_cpu_offload":
@@ -551,14 +549,32 @@ def main():
                 # Use fg_coordmap for visualization if available, otherwise use zeros
                 if fg_coordmap_input is not None:
                     viz_fg_coordmap = fg_coordmap_input.permute(0, 2, 1, 3, 4).cpu()
+                    # Resample fg_coordmap to match sample_video frames if needed
+                    if viz_fg_coordmap.shape[2] != sample_video.shape[2]:
+                        print(f"Resampling fg_coordmap from {viz_fg_coordmap.shape[2]} to {sample_video.shape[2]} frames for comparison")
+                        viz_fg_coordmap = torch.nn.functional.interpolate(
+                            viz_fg_coordmap,
+                            size=(sample_video.shape[2], viz_fg_coordmap.shape[3], viz_fg_coordmap.shape[4]),
+                            mode='trilinear',
+                            align_corners=False
+                        )
                 else:
-                    viz_fg_coordmap = torch.zeros((1, 3, video_length, args.height, args.width))
+                    viz_fg_coordmap = torch.zeros((1, 3, sample_video.shape[2], sample_video.shape[3], sample_video.shape[4]))
                 
                 comparison_list = [validation_ref.cpu(), sample_video.cpu(), viz_fg_coordmap]
                 
                 # Add gt_video if available
                 if gt_video is not None:
                     gt_video_reformat = gt_video.permute(0, 2, 1, 3, 4).cpu()
+                    # Resample gt_video to match sample_video frames if needed
+                    if gt_video_reformat.shape[2] != sample_video.shape[2]:
+                        print(f"Resampling gt_video from {gt_video_reformat.shape[2]} to {sample_video.shape[2]} frames for comparison")
+                        gt_video_reformat = torch.nn.functional.interpolate(
+                            gt_video_reformat,
+                            size=(sample_video.shape[2], gt_video_reformat.shape[3], gt_video_reformat.shape[4]),
+                            mode='trilinear',
+                            align_corners=False
+                        )
                     comparison_list.append(gt_video_reformat)
                 
                 comparison_video = torch.cat(comparison_list, dim=0)
