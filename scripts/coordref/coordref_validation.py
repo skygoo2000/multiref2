@@ -375,7 +375,6 @@ def main():
                 continue
             
             # Optional fields
-            bg_mask_relative_path = sample.get('bg_mask', None)
             bgvideo_relative_path = sample.get('bgvideo', sample.get('bg', None))
             gt_relative_path = sample.get('gt', sample.get('video_path', None))
             firstframe_relative_path = sample.get('firstframe', None)
@@ -391,7 +390,6 @@ def main():
             ref_path = resolve_path(ref_relative_path)
             ref_coordmap_path = resolve_path(ref_coordmap_relative_path)
             fg_coordmap_path = resolve_path(fg_coordmap_relative_path)
-            bg_mask_path = resolve_path(bg_mask_relative_path)
             bgvideo_path = resolve_path(bgvideo_relative_path)
             gt_path = resolve_path(gt_relative_path)
             firstframe_path = resolve_path(firstframe_relative_path)
@@ -429,10 +427,6 @@ def main():
                 continue
             
             # Load optional data
-            bg_mask = None
-            if bg_mask_path and os.path.exists(bg_mask_path):
-                bg_mask = load_validation_video_full(bg_mask_path, args.height, args.width)
-            
             bg_video = None
             if bgvideo_path and os.path.exists(bgvideo_path):
                 bg_video = load_validation_video_full(bgvideo_path, args.height, args.width)
@@ -461,7 +455,6 @@ def main():
             fg_coordmap_input = fg_coordmap.to(device=device, dtype=weight_dtype)
             
             # Prepare optional inputs
-            bg_mask_input = bg_mask.to(device=device, dtype=weight_dtype) if bg_mask is not None else None
             bg_video_input = bg_video.to(device=device, dtype=weight_dtype) if bg_video is not None else None
             
             # Prepare start_image from first frame of GT video if provided
@@ -496,7 +489,6 @@ def main():
                     ref_image=ref_image_input,
                     ref_coordmap=ref_coordmap_input,
                     fg_coordmap=fg_coordmap_input,
-                    bg_mask=bg_mask_input,
                     bg_video=bg_video_input,
                     start_image=start_image_input,
                     shift=args.shift,
@@ -593,8 +585,6 @@ def main():
                 f.write(f"Reference: {ref_path}\n")
                 f.write(f"Ref Coordmap: {ref_coordmap_path}\n")
                 f.write(f"FG Coordmap: {fg_coordmap_path}\n")
-                if bg_mask_path:
-                    f.write(f"BG Mask: {bg_mask_path}\n")
                 if bgvideo_path:
                     f.write(f"BG Video: {bgvideo_path}\n")
                 if firstframe_path:

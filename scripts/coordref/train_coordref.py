@@ -367,7 +367,6 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
             
             # Load validation fg (control_video) if provided
             validation_fg = None
-            validation_bg_mask = None
             if args.validation_fg_path is not None:
                 fg_path = args.validation_fg_path
                 logger.info(f"Loading validation fg from: {fg_path}")
@@ -397,37 +396,6 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                 except Exception as e:
                     logger.warning(f"Failed to load validation fg: {e}")
                     validation_fg = None
-            
-            # Load validation bg_mask if provided
-            if args.validation_bg_mask_path is not None:
-                bg_mask_path = args.validation_bg_mask_path
-                logger.info(f"Loading validation bg_mask from: {bg_mask_path}")
-                try:
-                    vr = VideoReader(bg_mask_path)
-                    total_frames = len(vr)
-                    # Sample frames to match val_frames
-                    if total_frames <= val_frames:
-                        frame_indices = list(range(total_frames))
-                    else:
-                        frame_indices = np.linspace(0, total_frames - 1, val_frames, dtype=int).tolist()
-                    
-                    bg_mask_frames = []
-                    for idx in frame_indices:
-                        frame = vr[idx].asnumpy()
-                        frame_pil = Image.fromarray(frame)
-                        # Resize to validation size
-                        frame_pil = frame_pil.resize((val_width, val_height))
-                        bg_mask_frames.append(np.array(frame_pil))
-                    
-                    # Stack to [F, H, W, C]
-                    validation_bg_mask = np.stack(bg_mask_frames, axis=0)
-                    # Convert to torch and normalize to [0, 1]
-                    validation_bg_mask = torch.from_numpy(validation_bg_mask).permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
-                    validation_bg_mask = validation_bg_mask.unsqueeze(0)  # [1, F, C, H, W]
-                    logger.info(f"Loaded validation bg_mask with shape: {validation_bg_mask.shape}")
-                except Exception as e:
-                    logger.warning(f"Failed to load validation bg_mask: {e}")
-                    validation_bg_mask = None
             
             # Load validation bgvideo if provided
             validation_bgvideo = None
@@ -545,13 +513,6 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     fg_coordmap_input = validation_fg_coordmap.to(device=accelerator.device, dtype=weight_dtype)
                     logger.info(f"FG coordmap input shape: {fg_coordmap_input.shape}")
                 
-                # Prepare bg_mask if provided (for masking fg_coordmap in pipeline)
-                bg_mask_input = None
-                if validation_bg_mask is not None:
-                    # validation_bg_mask is [1, F, C, H, W]
-                    bg_mask_input = validation_bg_mask.to(device=accelerator.device, dtype=weight_dtype)
-                    logger.info(f"BG mask input shape: {bg_mask_input.shape}")
-                
                 # Prepare bg_video if provided
                 bg_video_input = None
                 if validation_bgvideo is not None:
@@ -580,7 +541,6 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     ref_image   = ref_image_input,      # validation_ref as ref_image
                     ref_coordmap = ref_coordmap_input,  # validation_ref_coordmap
                     fg_coordmap = fg_coordmap_input,    # validation_fg_coordmap
-                    bg_mask     = bg_mask_input,        # validation_bg_mask (for masking fg_coordmap)
                     bg_video    = bg_video_input,       # validation_bgvideo
                     start_image = start_image_input,    # first frame of GT
                 ).videos
@@ -737,12 +697,6 @@ def parse_args():
         type=str,
         default=None,
         help=("Path to foreground video used for validation."),
-    )
-    parser.add_argument(
-        "--validation_bg_mask_path",
-        type=str,
-        default=None,
-        help=("Path to background mask video used for validation."),
     )
     parser.add_argument(
         "--validation_bgvideo_path",
@@ -2657,12 +2611,7 @@ def main():
                     if apply_coordmap_aug:
                         fg_coordmap = augment_coordmap(fg_coordmap, coordmap_do_expand, coordmap_border_size)
                     
-                    if batch.get("bg_mask") is not None:
-                        bg_mask = batch["bg_mask"].to(weight_dtype)  # [B, F, C, H, W]
-                        mask_binary = (bg_mask + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-                        fg_coordmap = fg_coordmap * mask_binary + (-1.0) * (1.0 - mask_binary)
-                    
-                    # Encode fg_coordmap (with mask applied)
+                    # Encode fg_coordmap
                     fg_coordmap_latent = _batch_encode_vae(fg_coordmap)
                     
                     # Apply 10% dropout
@@ -2720,12 +2669,6 @@ def main():
                     )  # [B, 1, latent_f, latent_h, latent_w]
                     bg_mask_downsampled = ((bg_mask_downsampled + 1.0) / 2.0 > 0.5).float()  # [B, 1, latent_f, latent_h, latent_w], values in {0, 1}
                 
-                latents_zeros = torch.zeros_like(latents).to(latents.device, latents.dtype)
-                if fg_coordmap_latent is None:
-                    control_latents = torch.cat([latents_zeros, appearance_latents], dim=1)
-                else:
-                    control_latents = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
-                                                
                 # wait for latents = vae.encode(pixel_values) to complete
                 if vae_stream_1 is not None:
                     torch.cuda.current_stream().wait_stream(vae_stream_1)
@@ -2826,10 +2769,11 @@ def main():
                         context=prompt_embeds,
                         t=timesteps,
                         seq_len=seq_len,
-                        y=control_latents,
                         clip_fea=clip_fea,  # clip features from dummy black image
                         full_ref=full_ref,
                         full_ref_crood=ref_coordmap_latents,
+                        fg_coordmap=fg_coordmap_latent,
+                        appearance=appearance_latents,
                     )
 
                 def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
@@ -2955,13 +2899,10 @@ def main():
                                 full_ref_decoded_frames.append(decoded_frame)
                             full_ref_decoded = torch.cat(full_ref_decoded_frames, dim=2)
                             
-                            # Decode control_latents (fg) if it exists
+                            # Decode fg_coordmap_latent if it exists
                             fg_decoded = None
-                            if control_latents is not None:
-                                if control_latents.size(1) == 16:
-                                    fg_decoded = vae_decoder.decode(control_latents.to(vae_decoder.dtype)).sample
-                                else:
-                                    fg_decoded = vae_decoder.decode(control_latents[:, :16].to(vae_decoder.dtype)).sample
+                            if fg_coordmap_latent is not None:
+                                fg_decoded = vae_decoder.decode(fg_coordmap_latent.to(vae_decoder.dtype)).sample
                             
                             # Move VAE back to CPU if low_vram mode is enabled
                             if args.low_vram:
@@ -3020,7 +2961,7 @@ def main():
                                         ref_coordmap_decoded = ref_coordmap_decoded[:, :, :gt.shape[2], :, :]
                                     comparison_list.append(ref_coordmap_decoded)
                             
-                            # Add fg_decoded if exists (decoded from control_latents[:, :16])
+                            # Add fg_decoded if exists (decoded from fg_coordmap_latent)
                             if fg_decoded is not None:
                                 fg_decoded = (fg_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
                                 comparison_list.append(fg_decoded)

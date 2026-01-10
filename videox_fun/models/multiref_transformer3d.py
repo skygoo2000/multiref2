@@ -1032,9 +1032,10 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         context,
         seq_len,
         clip_fea=None,
-        y=None,
         full_ref=None,
         full_ref_crood=None,
+        fg_coordmap=None,
+        appearance=None,
         cond_flag=True,
     ):
         r"""
@@ -1051,12 +1052,14 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
                 Maximum sequence length for positional encoding
             clip_fea (Tensor, *optional*):
                 CLIP image features for image-to-video mode
-            y (List[Tensor], *optional*):
-                Conditional video inputs, 32 channels
             full_ref (Tensor, *optional*):
-                Full reference frames, 16 channels
+                Full reference frames, 16 channels, shape [B, 16, F, H, W] or [B, 16, H, W]
             full_ref_crood (Tensor, *optional*):
-                Coordinate map for full reference frames, 16 channels
+                Coordinate map for full reference frames, 16 channels, shape [B, 16, F, H, W] or [B, 16, H, W]
+            fg_coordmap (Tensor, *optional*):
+                Foreground coordinate map, 16 channels, shape [B, 16, F, H, W]
+            appearance (Tensor, *optional*):
+                Appearance latents (background/start_image), 16 channels, shape [B, 16, F, H, W]
             cond_flag (`bool`, *optional*, defaults to True):
                 Flag to indicate whether to forward the condition input
 
@@ -1069,8 +1072,21 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         if self.freqs.device != device and torch.device(type="meta") != device:
             self.freqs = self.freqs.to(device)
 
-        if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+        # Concatenate fg_coordmap and appearance to form the control input (32 channels)
+        if fg_coordmap is not None and appearance is not None:
+            control_input = torch.cat([fg_coordmap, appearance], dim=1)  # [B, 32, F, H, W]
+        elif fg_coordmap is not None:
+            # If only fg_coordmap, pad with zeros for appearance
+            control_input = torch.cat([fg_coordmap, torch.zeros_like(fg_coordmap)], dim=1)
+        elif appearance is not None:
+            # If only appearance, pad with zeros for fg_coordmap
+            control_input = torch.cat([torch.zeros_like(appearance), appearance], dim=1)
+        else:
+            control_input = None
+        
+        # Concatenate control_input with x to form the input
+        if control_input is not None:
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, control_input)]
         
         full_ref_token_num = 0
         full_ref_frames_num = 0

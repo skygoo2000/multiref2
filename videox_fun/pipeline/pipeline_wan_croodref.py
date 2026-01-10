@@ -440,7 +440,6 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
         ref_image: Union[torch.FloatTensor] = None,
         ref_coordmap: Optional[torch.FloatTensor] = None,
         fg_coordmap: Optional[torch.FloatTensor] = None,
-        bg_mask: Optional[torch.FloatTensor] = None,
         bg_video: Optional[torch.FloatTensor] = None,
         start_image: Optional[torch.FloatTensor] = None,
         clip_image: Image = None,
@@ -484,8 +483,6 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                 Reference coordinate map. Shape: [B, F, C, H, W].
             fg_coordmap (`torch.FloatTensor`, *optional*):
                 Foreground coordinate map. Shape: [B, F, C, H, W].
-            bg_mask (`torch.FloatTensor`, *optional*):
-                Background mask for masking fg_coordmap. Shape: [B, F, C, H, W].
             bg_video (`torch.FloatTensor`, *optional*):
                 Background video for compositing. Shape: [B, F, C, H, W].
             start_image (`torch.FloatTensor`, *optional*):
@@ -723,7 +720,7 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
             if latents.size()[2] != 1:
                 appearance_latents[:, :, :1] = start_image_latents
 
-        # 9. Process fg_coordmap with optional bg_mask
+        # 9. Process fg_coordmap
         fg_coordmap_latent = None
         if fg_coordmap is not None:
             video_length = fg_coordmap.shape[1]  # [B, F, C, H, W]
@@ -741,26 +738,6 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                 # Rearrange back to [B, F, C, H, W]
                 fg_coordmap = rearrange(fg_coordmap, "b c f h w -> b f c h w")
                 video_length = num_frames
-            
-            # Apply bg_mask before preprocessing if provided
-            if bg_mask is not None:
-                bg_mask_length = bg_mask.shape[1]
-                
-                if bg_mask_length != num_frames:
-                    print(f"Warning: bg_mask frame count ({bg_mask_length}) != num_frames ({num_frames}), resampling...")
-                    bg_mask = rearrange(bg_mask, "b f c h w -> b c f h w")
-                    bg_mask = torch.nn.functional.interpolate(
-                        bg_mask,
-                        size=(num_frames, bg_mask.shape[3], bg_mask.shape[4]),
-                        mode='trilinear',
-                        align_corners=False
-                    )
-                    bg_mask = rearrange(bg_mask, "b c f h w -> b f c h w")
-                
-                # bg_mask is in [0, 1] range
-                mask_binary = 1.0 - (bg_mask > 0.5).float()  # mask=1 keep fg_coordmap, mask=0 use black
-                # Apply mask: where mask=1 keep fg_coordmap, where mask=0 set to 0 (will become -1 after normalization)
-                fg_coordmap = fg_coordmap * mask_binary
             
             fg_coordmap = self.image_processor.preprocess(
                 rearrange(fg_coordmap, "b f c h w -> (b f) c h w"),
@@ -846,12 +823,14 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                     # Batch latents: [neg, pos_i, pos_it]
                     latent_model_input_batched = torch.cat([latent_model_input] * 3, dim=0)
                     
-                    # Batch control latents
-                    control_latents_pos = torch.cat([
-                        fg_coordmap_latent if fg_coordmap_latent is not None else fg_coordmap_zeros,
-                        appearance_latents], dim=1)
-                    control_latents_neg = torch.cat([fg_coordmap_zeros, appearance_latents], dim=1)
-                    control_latents_batched = torch.cat([control_latents_neg, control_latents_pos, control_latents_pos], dim=0)
+                    # Batch fg_coordmap: [zeros, pos, pos]
+                    if fg_coordmap_latent is not None:
+                        fg_coordmap_batched = torch.cat([fg_coordmap_zeros, fg_coordmap_latent, fg_coordmap_latent], dim=0)
+                    else:
+                        fg_coordmap_batched = None
+                    
+                    # Batch appearance: [appearance, appearance, appearance]
+                    appearance_batched = torch.cat([appearance_latents] * 3, dim=0)
                     
                     # Batch context: [neg, neg, pos]
                     context_batched = negative_prompt_embeds + negative_prompt_embeds + prompt_embeds
@@ -890,10 +869,11 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                             context=context_batched,
                             t=timestep,
                             seq_len=seq_len,
-                            y=control_latents_batched,
                             clip_fea=clip_fea_batched,
                             full_ref=full_ref_batched,
                             full_ref_crood=ref_coordmap_batched,
+                            fg_coordmap=fg_coordmap_batched,
+                            appearance=appearance_batched,
                         )
                     
                     # Split the batched predictions
@@ -905,11 +885,6 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                     # Note: Transformer automatically removes ref frames from output, no need to slice here
                 else:
                     # Non-CFG
-                    if fg_coordmap_latent is None:
-                        control_latents_input = torch.cat([torch.zeros_like(latents), appearance_latents], dim=1)
-                    else:
-                        control_latents_input = torch.cat([fg_coordmap_latent, appearance_latents], dim=1)
-                    
                     if clip_context is not None:
                         clip_context_input = clip_context
                     else:
@@ -925,10 +900,11 @@ class WanFunCroodRefPipeline(DiffusionPipeline):
                             context=in_prompt_embeds,
                             t=timestep,
                             seq_len=seq_len,
-                            y=control_latents_input,
                             clip_fea=clip_context_input,
                             full_ref=full_ref,
                             full_ref_crood=ref_coordmap_latents,
+                            fg_coordmap=fg_coordmap_latent,
+                            appearance=appearance_latents,
                         )
                     
                 # compute the previous noisy sample x_t -> x_t-1
