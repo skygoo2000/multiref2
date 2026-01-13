@@ -547,20 +547,6 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
 
                 save_videos_grid(sample_with_ref, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}.mp4"), fps=16)
 
-                # frame mismatch
-                ref_frames = validation_ref.shape[2]
-                sample_frames = sample_with_ref.shape[2]
-                
-                if ref_frames != sample_frames:
-                    B, C, F_ref, H, W = validation_ref.shape
-                    validation_ref_reshaped = validation_ref.view(B * C, 1, F_ref, H * W)
-                    validation_ref_interpolated = torch.nn.functional.interpolate(
-                        validation_ref_reshaped,
-                        size=(sample_frames, H * W),
-                        mode='nearest'
-                    )
-                    validation_ref = validation_ref_interpolated.view(B, C, sample_frames, H, W)
-                
                 # spatial mismatch
                 ref_h, ref_w = validation_ref.shape[3], validation_ref.shape[4]
                 sample_h, sample_w = sample_with_ref.shape[3], sample_with_ref.shape[4]
@@ -593,14 +579,48 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                 else:
                     viz_fg_coordmap = torch.zeros((1, 3, val_frames, val_height, val_width), device=accelerator.device, dtype=weight_dtype)
                 
-                comparison_list = [validation_ref, sample_with_ref, viz_fg_coordmap.cpu()]
+                # Resample all videos to match val_frames before concatenation
+                # Reference: pipeline_wan_croodref.py uses trilinear interpolation for fg_coordmap
+                def resample_to_val_frames(video, target_frames, is_ref=False):
+                    """
+                    Resample video to target_frames using interpolation.
+                    video: [B, C, F, H, W] or [B, C, H, W] (single frame)
+                    """
+                    if video is None:
+                        return None
+                    
+                    # Handle single frame case
+                    if video.dim() == 4:
+                        # [B, C, H, W] -> [B, C, 1, H, W]
+                        video = video.unsqueeze(2)
+                    
+                    current_frames = video.shape[2]
+                    if current_frames == target_frames:
+                        return video
+
+                    video_resampled = torch.nn.functional.interpolate(
+                        video,
+                        size=(target_frames, video.shape[3], video.shape[4]),
+                        mode='nearest' if is_ref else 'trilinear',
+                        align_corners=False
+                    )
+                    
+                    return video_resampled
+                
+                # Resample all videos to val_frames
+                validation_ref_resampled = resample_to_val_frames(validation_ref, val_frames, is_ref=True)
+                sample_with_ref_resampled = resample_to_val_frames(sample_with_ref, val_frames, is_ref=False)
+                viz_fg_coordmap_resampled = resample_to_val_frames(viz_fg_coordmap, val_frames, is_ref=False)
+                
+                comparison_list = [validation_ref_resampled.cpu(), sample_with_ref_resampled.cpu(), viz_fg_coordmap_resampled.cpu()]
                 
                 # Add validation_gt if available
                 if validation_gt is not None:
                     # validation_gt is [1, F, C, H, W], convert to [1, C, F, H, W]
                     # Already in [0, 1] range, no conversion needed
                     validation_gt_reformat = validation_gt.permute(0, 2, 1, 3, 4)
-                    comparison_list.append(validation_gt_reformat.cpu())
+                    validation_gt_resampled = resample_to_val_frames(validation_gt_reformat, val_frames, is_ref=False)
+                    comparison_list.append(validation_gt_resampled.cpu())
                 
                 comparison_video = torch.cat(comparison_list, dim=0)  # [3 or 4, C, F, H, W]
                 save_videos_grid(comparison_video, os.path.join(args.output_dir, f"validation/step-{global_step}/{i}_comparison.mp4"), fps=16)
@@ -1265,7 +1285,7 @@ def main():
         text_encoder = WanT5EncoderModel.from_pretrained(
             os.path.join(args.pretrained_model_name_or_path, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder')),
             additional_kwargs=OmegaConf.to_container(config['text_encoder_kwargs']),
-            low_cpu_mem_usage=True,
+            low_cpu_mem_usage=False,
             torch_dtype=weight_dtype,
         )
         text_encoder = text_encoder.eval()
@@ -2878,7 +2898,7 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                if args.validation_prompts is not None and (global_step % args.validation_steps == 0 or args.max_train_steps - global_step == 1) and not args.use_fsdp:
+                if args.validation_prompts is not None and (global_step % args.validation_steps == 0 or args.max_train_steps - global_step == 1) and not args.use_fsdp and zero_stage != 3:
 
                     if accelerator.is_main_process:
                         logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")

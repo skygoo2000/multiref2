@@ -604,7 +604,17 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            # cusolver fail, fallback to CPU solve
+            try:
+                rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            except RuntimeError as e:
+                if "cusolver" in str(e).lower():
+                    # Fallback: solve on CPU and move result back to GPU
+                    R_cpu = R.cpu()
+                    b_cpu = b.cpu()
+                    rhos_c = torch.linalg.solve(R_cpu, b_cpu).to(device).to(x.dtype)
+                else:
+                    raise
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
