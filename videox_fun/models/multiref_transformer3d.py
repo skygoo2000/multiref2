@@ -1550,3 +1550,106 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
             if self.teacache.cnt == self.teacache.num_steps:
                 self.teacache.reset()
         return x
+
+
+class CroodRefTransformer3DModel2_2(CroodRefTransformer3DModel):
+    r"""
+    CroodRef Transformer3D model for Wan 2.2, inherited from CroodRefTransformer3DModel.
+    Main difference: uses 'cross_attn' instead of 'i2v_cross_attn' to remove img_emb dependency.
+    """
+
+    _supports_gradient_checkpointing = True
+    
+    def __init__(
+        self,
+        model_type='i2v',
+        patch_size=(1, 2, 2),
+        text_len=512,
+        in_dim=48,
+        dim=2048,
+        ffn_dim=8192,
+        freq_dim=256,
+        text_dim=4096,
+        out_dim=16,
+        num_heads=16,
+        num_layers=32,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=True,
+        eps=1e-6,
+        in_channels=48,
+        hidden_size=2048,
+        add_control_adapter=False,
+        in_dim_control_adapter=24,
+        downscale_factor_control_adapter=8,
+        add_ref_conv=False,
+        in_dim_ref_conv=16,
+        rope_gap=5,
+    ):
+        r"""
+        Initialize the CroodRef 2.2 diffusion model backbone.
+        
+        Args:
+            model_type (`str`, *optional*, defaults to 'i2v'):
+                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video)
+            patch_size (`tuple`, *optional*, defaults to (1, 2, 2)):
+                3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
+            text_len (`int`, *optional*, defaults to 512):
+                Fixed length for text embeddings
+            in_dim (`int`, *optional*, defaults to 48):
+                Input video channels (C_in) - 48 for CroodRef (16 ref + 32 coordmap)
+            dim (`int`, *optional*, defaults to 2048):
+                Hidden dimension of the transformer
+            ffn_dim (`int`, *optional*, defaults to 8192):
+                Intermediate dimension in feed-forward network
+            freq_dim (`int`, *optional*, defaults to 256):
+                Dimension for sinusoidal time embeddings
+            text_dim (`int`, *optional*, defaults to 4096):
+                Input dimension for text embeddings
+            out_dim (`int`, *optional*, defaults to 16):
+                Output video channels (C_out)
+            num_heads (`int`, *optional*, defaults to 16):
+                Number of attention heads
+            num_layers (`int`, *optional*, defaults to 32):
+                Number of transformer blocks
+            window_size (`tuple`, *optional*, defaults to (-1, -1)):
+                Window size for local attention (-1 indicates global attention)
+            qk_norm (`bool`, *optional*, defaults to True):
+                Enable query/key normalization
+            cross_attn_norm (`bool`, *optional*, defaults to True):
+                Enable cross-attention normalization
+            eps (`float`, *optional*, defaults to 1e-6):
+                Epsilon value for normalization layers
+            rope_gap (`int`, *optional*, defaults to 5):
+                Gap multiplier for reference frame RoPE positions (e.g., -5, -10, -15...)
+        """
+        super().__init__(
+            model_type=model_type,
+            patch_size=patch_size,
+            text_len=text_len,
+            in_dim=in_dim,
+            dim=dim,
+            ffn_dim=ffn_dim,
+            freq_dim=freq_dim,
+            text_dim=text_dim,
+            out_dim=out_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            window_size=window_size,
+            qk_norm=qk_norm,
+            cross_attn_norm=cross_attn_norm,
+            eps=eps,
+            in_channels=in_channels,
+            hidden_size=hidden_size,
+            add_control_adapter=add_control_adapter,
+            in_dim_control_adapter=in_dim_control_adapter,
+            downscale_factor_control_adapter=downscale_factor_control_adapter,
+            add_ref_conv=add_ref_conv,
+            in_dim_ref_conv=in_dim_ref_conv,
+            cross_attn_type="cross_attn",
+            rope_gap=rope_gap,
+        )
+        
+        # Remove img_emb if it exists
+        if hasattr(self, "img_emb"):
+            del self.img_emb

@@ -64,9 +64,9 @@ project_roots = [os.path.dirname(current_file_path), os.path.dirname(os.path.dir
 for project_root in project_roots:
     sys.path.insert(0, project_root) if project_root not in sys.path else None
 
-from videox_fun.data.bucket_sampler import (ASPECT_RATIO_512,
-                                            ASPECT_RATIO_RANDOM_CROP_512,
-                                            ASPECT_RATIO_RANDOM_CROP_PROB,
+from videox_fun.data.bucket_sampler import (ASPECT_RATIO_480,
+                                            ASPECT_RATIO_RANDOM_CROP_480,
+                                            ASPECT_RATIO_RANDOM_CROP_PROB_480,
                                             AspectRatioBatchImageVideoSampler,
                                             RandomSampler, get_closest_ratio)
 from videox_fun.data.dataset_image_video import (ImageVideoControlDataset,
@@ -581,7 +581,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                 
                 # Resample all videos to match val_frames before concatenation
                 # Reference: pipeline_wan_croodref.py uses trilinear interpolation for fg_coordmap
-                def resample_to_val_frames(video, target_frames, is_ref=False):
+                def resample_to_val_frames(video, target_frames):
                     """
                     Resample video to target_frames using interpolation.
                     video: [B, C, F, H, W] or [B, C, H, W] (single frame)
@@ -601,18 +601,17 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     video_resampled = torch.nn.functional.interpolate(
                         video,
                         size=(target_frames, video.shape[3], video.shape[4]),
-                        mode='nearest' if is_ref else 'trilinear',
-                        align_corners=False
+                        mode='nearest'
                     )
                     
                     return video_resampled
                 
                 # Resample all videos to val_frames
-                validation_ref_resampled = resample_to_val_frames(validation_ref, val_frames, is_ref=True)
-                sample_with_ref_resampled = resample_to_val_frames(sample_with_ref, val_frames, is_ref=False)
-                viz_fg_coordmap_resampled = resample_to_val_frames(viz_fg_coordmap, val_frames, is_ref=False)
+                validation_ref_resampled = resample_to_val_frames(validation_ref, val_frames)
+                sample_with_ref_resampled = resample_to_val_frames(sample_with_ref, val_frames)
+                viz_fg_coordmap_resampled = resample_to_val_frames(viz_fg_coordmap, val_frames)
                 
-                comparison_list = [validation_ref_resampled.cpu(), sample_with_ref_resampled.cpu(), viz_fg_coordmap_resampled.cpu()]
+                comparison_list = [validation_ref_resampled, sample_with_ref_resampled.cpu(), viz_fg_coordmap_resampled.cpu()]
                 
                 # Add validation_gt if available
                 if validation_gt is not None:
@@ -1507,8 +1506,8 @@ def main():
                 in_already.append(name)
                 high_lr_flag = True
                 trainable_params_optim[0]['params'].append(param)
-                if accelerator.is_main_process:
-                    print(f"Set {name} to lr : {args.learning_rate}")
+                # if accelerator.is_main_process:
+                #     print(f"Set {name} to lr : {args.learning_rate}")
                 break
         if high_lr_flag:
             continue
@@ -1516,8 +1515,8 @@ def main():
             if trainable_module_name in name:
                 in_already.append(name)
                 trainable_params_optim[1]['params'].append(param)
-                if accelerator.is_main_process:
-                    print(f"Set {name} to lr : {args.learning_rate / 2}")
+                # if accelerator.is_main_process:
+                #     print(f"Set {name} to lr : {args.learning_rate / 2}")
                 break
 
     if args.use_came:
@@ -1565,7 +1564,7 @@ def main():
         return _worker_init_fn
     
     if args.enable_bucket:
-        aspect_ratio_sample_size = {key : [x / 512 * args.video_sample_size for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
+        aspect_ratio_sample_size = {key : [x / 480 * args.video_sample_size for x in ASPECT_RATIO_480[key]] for key in ASPECT_RATIO_480.keys()}
         batch_sampler_generator = torch.Generator().manual_seed(args.seed)
         batch_sampler = AspectRatioBatchImageVideoSampler(
             sampler=RandomSampler(train_dataset, generator=batch_sampler_generator), dataset=train_dataset.dataset, 
@@ -1645,8 +1644,8 @@ def main():
             if data_type == 'image':
                 random_downsample_ratio = 1 if not args.random_hw_adapt else get_random_downsample_ratio(args.image_sample_size, image_ratio=[args.image_sample_size / args.video_sample_size])
 
-                aspect_ratio_sample_size = {key : [x / 512 * args.image_sample_size / random_downsample_ratio for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
-                aspect_ratio_random_crop_sample_size = {key : [x / 512 * args.image_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_512[key]] for key in ASPECT_RATIO_RANDOM_CROP_512.keys()}
+                aspect_ratio_sample_size = {key : [x / 480 * args.image_sample_size / random_downsample_ratio for x in ASPECT_RATIO_480[key]] for key in ASPECT_RATIO_480.keys()}
+                aspect_ratio_random_crop_sample_size = {key : [x / 480 * args.image_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_480[key]] for key in ASPECT_RATIO_RANDOM_CROP_480.keys()}
                 
                 batch_video_length = args.video_sample_n_frames + sample_n_frames_bucket_interval
             else:
@@ -1690,19 +1689,19 @@ def main():
                     random_downsample_ratio = 1
                     batch_video_length = args.video_sample_n_frames + sample_n_frames_bucket_interval
 
-                aspect_ratio_sample_size = {key : [x / 512 * args.video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
-                aspect_ratio_random_crop_sample_size = {key : [x / 512 * args.video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_512[key]] for key in ASPECT_RATIO_RANDOM_CROP_512.keys()}
+                aspect_ratio_sample_size = {key : [x / 480 * args.video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_480[key]] for key in ASPECT_RATIO_480.keys()}
+                aspect_ratio_random_crop_sample_size = {key : [x / 480 * args.video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_480[key]] for key in ASPECT_RATIO_RANDOM_CROP_480.keys()}
 
             if args.fix_sample_size is not None:
                 fix_sample_size = [int(x / 16) * 16 for x in args.fix_sample_size]
             elif args.random_ratio_crop:
                 if rng is None:
                     random_sample_size = aspect_ratio_random_crop_sample_size[
-                        np.random.choice(list(aspect_ratio_random_crop_sample_size.keys()), p = ASPECT_RATIO_RANDOM_CROP_PROB)
+                        np.random.choice(list(aspect_ratio_random_crop_sample_size.keys()), p = ASPECT_RATIO_RANDOM_CROP_PROB_480)
                     ]
                 else:
                     random_sample_size = aspect_ratio_random_crop_sample_size[
-                        rng.choice(list(aspect_ratio_random_crop_sample_size.keys()), p = ASPECT_RATIO_RANDOM_CROP_PROB)
+                        rng.choice(list(aspect_ratio_random_crop_sample_size.keys()), p = ASPECT_RATIO_RANDOM_CROP_PROB_480)
                     ]
                 random_sample_size = [int(x / 16) * 16 for x in random_sample_size]
             else:
@@ -2099,7 +2098,7 @@ def main():
             
             wandb_run_id_file = os.path.join(args.output_dir, "wandb_run_id.txt")
 
-            if args.resume_from_checkpoint:
+            if args.resume_from_checkpoint or args.transformer_path is not None or args.transformer_path != "":
                 if os.path.exists(wandb_run_id_file):
                     with open(wandb_run_id_file, "r") as f:
                         wandb_run_id = f.read().strip()
@@ -2203,6 +2202,23 @@ def main():
         vae_stream_2 = None
 
     idx_sampling = DiscreteSampling(args.train_sampling_steps, uniform_sampling=args.uniform_sampling)
+
+    # Pre-compute clip_fea template from dummy black image (only once before training)
+    clip_fea_template = None
+    if clip_image_encoder is not None:
+        logger.info("Pre-computing clip_fea template from dummy black image...")
+        with torch.no_grad():
+            if args.low_vram:
+                clip_image_encoder.to(accelerator.device, dtype=weight_dtype)
+            
+            clip_image_dummy = Image.new("RGB", (512, 512), color=(0, 0, 0))
+            clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(clip_image_encoder.device, weight_dtype)
+            clip_fea_template = clip_image_encoder([clip_image_dummy[:, None, :, :]])  # [1, 1, dim]
+            
+            if args.low_vram:
+                clip_image_encoder.to('cpu')
+                torch.cuda.empty_cache()
+        logger.info(f"Pre-computed clip_fea template with shape: {clip_fea_template.shape}")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
@@ -2771,16 +2787,11 @@ def main():
                     target_shape[1]
                 )
 
-                # Encode clip features using dummy black image
-                with torch.no_grad():
-                    if clip_image_encoder is not None:
-                        clip_image_dummy = Image.new("RGB", (512, 512), color=(0, 0, 0))
-                        clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(clip_image_encoder.device, weight_dtype)
-                        clip_fea = clip_image_encoder([clip_image_dummy[:, None, :, :]])
-                        clip_fea = torch.zeros_like(clip_fea).expand(bsz, -1, -1)
-                    else:
-                        # Create dummy clip features with expected shape [B, 1, dim]
-                        clip_fea = None
+                # Use pre-computed clip_fea template and expand to batch size
+                if clip_fea_template is not None:
+                    clip_fea = torch.zeros_like(clip_fea_template).expand(bsz, -1, -1)
+                else:
+                    clip_fea = None
 
                 # Predict the noise residual
                 with torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
@@ -2875,7 +2886,8 @@ def main():
                     if accelerator.is_main_process:
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            # Only consider regular checkpoints, exclude validation checkpoints
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint") and not d.startswith("checkpoint-validation")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
                             if len(checkpoints) >= args.checkpoints_total_limit:
@@ -2898,147 +2910,169 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                if args.validation_prompts is not None and (global_step % args.validation_steps == 0 or args.max_train_steps - global_step == 1) and not args.use_fsdp and zero_stage != 3:
-
-                    if accelerator.is_main_process:
-                        logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")
-
-                        # test vae encode and decode
-                        if global_step == 0:
-                            vae_decoder = vae.eval()
-                            # Ensure VAE is on the same device as latents for decoding
-                            if args.low_vram:
-                                vae_decoder.to(accelerator.device)
+                if args.validation_prompts is not None and (global_step % args.validation_steps == 0 or args.max_train_steps - global_step == 1):
+                    # For FSDP or Zero3, save a special validation checkpoint instead of running validation
+                    if args.use_fsdp or zero_stage == 3:
+                        if accelerator.is_main_process:
+                            logger.info(f"FSDP or Zero3 detected, saving validation checkpoint instead of running validation...")
                             
-                            gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
-                            # Decode full_ref frame by frame
-                            full_ref_decoded_frames = []
-                            for frame_idx in range(full_ref.shape[2]):
-                                frame = full_ref[:, :, frame_idx:frame_idx+1, :, :]
-                                decoded_frame = vae_decoder.decode(frame.to(vae_decoder.dtype)).sample
-                                full_ref_decoded_frames.append(decoded_frame)
-                            full_ref_decoded = torch.cat(full_ref_decoded_frames, dim=2)
-                            
-                            # Decode fg_coordmap_latent if it exists
-                            fg_decoded = None
-                            if fg_coordmap_latent is not None:
-                                fg_decoded = vae_decoder.decode(fg_coordmap_latent.to(vae_decoder.dtype)).sample
-                            
-                            # Move VAE back to CPU if low_vram mode is enabled
-                            if args.low_vram:
-                                vae_decoder.to('cpu')
-                                torch.cuda.empty_cache()
-                            
-                            # Normalize to [0, 1]
-                            gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
-                            gt = (pixel_values / 2 + 0.5).clamp(0, 1).cpu().float().permute(0,2,1,3,4)
-                            full_ref_decoded = (full_ref_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
-                            
-                            # Align frame counts for full_ref_decoded
-                            if full_ref_decoded.shape[2] < gt.shape[2]:
-                                last_frame = full_ref_decoded[:, :, -1:, :, :]
-                                repeat_times = gt.shape[2] - full_ref_decoded.shape[2]
-                                repeated_frames = last_frame.repeat(1, 1, repeat_times, 1, 1)
-                                full_ref_decoded = torch.cat([full_ref_decoded, repeated_frames], dim=2)
-                            else:
-                                full_ref_decoded = full_ref_decoded[:, :, :gt.shape[2], :, :]
-                            
-                            # Build comparison list: [gt, gt_decoded, full_ref_decoded, ref_coordmap_decoded, fg_decoded, fg_coordmap_decoded, bg_decoded]
-                            comparison_list = [gt.cpu().float(), gt_decoded, full_ref_decoded]
-                            
-                            # Add ref_coordmap_decoded if exists
-                            if ref_coordmap_latents is not None:
-                                # Decode ref_coordmap_latents
-                                ref_coordmap_decoded_frames = []
-                                if ref_coordmap_latents.dim() == 4:
-                                    # Single frame: [B, C, H, W]
-                                    ref_coordmap_decoded = vae_decoder.decode(ref_coordmap_latents.to(vae_decoder.dtype)).sample
-                                    ref_coordmap_decoded = (ref_coordmap_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
-                                    # Align frame count with gt
-                                    if ref_coordmap_decoded.shape[2] < gt.shape[2]:
-                                        last_frame = ref_coordmap_decoded[:, :, -1:, :, :]
-                                        repeat_times = gt.shape[2] - ref_coordmap_decoded.shape[2]
-                                        repeated_frames = last_frame.repeat(1, 1, repeat_times, 1, 1)
-                                        ref_coordmap_decoded = torch.cat([ref_coordmap_decoded, repeated_frames], dim=2)
-                                    else:
-                                        ref_coordmap_decoded = ref_coordmap_decoded[:, :, :gt.shape[2], :, :]
-                                    comparison_list.append(ref_coordmap_decoded)
-                                else:
-                                    # Multiple frames: [B, C, F, H, W]
-                                    for frame_idx in range(ref_coordmap_latents.shape[2]):
-                                        frame = ref_coordmap_latents[:, :, frame_idx:frame_idx+1, :, :]
-                                        decoded_frame = vae_decoder.decode(frame.to(vae_decoder.dtype)).sample
-                                        ref_coordmap_decoded_frames.append(decoded_frame)
-                                    ref_coordmap_decoded = torch.cat(ref_coordmap_decoded_frames, dim=2)
-                                    ref_coordmap_decoded = (ref_coordmap_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
-                                    # Align frame count with gt
-                                    if ref_coordmap_decoded.shape[2] < gt.shape[2]:
-                                        last_frame = ref_coordmap_decoded[:, :, -1:, :, :]
-                                        repeat_times = gt.shape[2] - ref_coordmap_decoded.shape[2]
-                                        repeated_frames = last_frame.repeat(1, 1, repeat_times, 1, 1)
-                                        ref_coordmap_decoded = torch.cat([ref_coordmap_decoded, repeated_frames], dim=2)
-                                    else:
-                                        ref_coordmap_decoded = ref_coordmap_decoded[:, :, :gt.shape[2], :, :]
-                                    comparison_list.append(ref_coordmap_decoded)
-                            
-                            # Add fg_decoded if exists (decoded from fg_coordmap_latent)
-                            if fg_decoded is not None:
-                                fg_decoded = (fg_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
-                                comparison_list.append(fg_decoded)
-                            
-                            # Add fg_coordmap_decoded if exists
-                            if fg_coordmap_latent is not None:
-                                fg_coordmap_decoded = vae_decoder.decode(fg_coordmap_latent.to(vae_decoder.dtype)).sample
-                                fg_coordmap_decoded = (fg_coordmap_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
-                                comparison_list.append(fg_coordmap_decoded)
-                            
-                            # Add bg_decoded (appearance_latents decoded) if exists
-                            if batch.get("bg") is not None:
-                                bg_decoded = vae_decoder.decode(appearance_latents.to(vae_decoder.dtype)).sample
-                                bg_decoded = (bg_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
-                                comparison_list.append(bg_decoded)
-                            
-                            # Stack vertically
-                            comparison = torch.cat(comparison_list, dim=3)  # stack in height dimension
-                            save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=16)
-
-                            # Prepare comparison for logging
-                            log_vae_comparison = comparison.clone().detach().clamp(0, 1) * 255
-                            log_vae_comparison = log_vae_comparison.permute(0, 2, 1, 3, 4).to(torch.uint8)  # [2, F, C, H, W]
-
-                            log_dict = {}
-
-                            if args.report_to == "wandb":
-                                log_dict["validation/vae_decoded"] = wandb.Video(log_vae_comparison.cpu(), fps=16, format="gif")
-                            else: # Tensorboard
-                                log_dict["validation/vae_decoded"] = log_vae_comparison
-                            
-                            accelerator.log(log_dict, step=global_step)
-
-                        if args.use_ema:
-                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                            ema_transformer3d.store(transformer3d.parameters())
-                            ema_transformer3d.copy_to(transformer3d.parameters())
+                            # Remove old validation checkpoints before saving new one
+                            existing_checkpoints = os.listdir(args.output_dir)
+                            validation_checkpoints = [d for d in existing_checkpoints if d.startswith("checkpoint-validation-")]
+                            for old_validation_checkpoint in validation_checkpoints:
+                                old_validation_checkpoint_path = os.path.join(args.output_dir, old_validation_checkpoint)
+                                logger.info(f"Removing old validation checkpoint: {old_validation_checkpoint}")
+                                shutil.rmtree(old_validation_checkpoint_path, ignore_errors=True)
                         
-                        log_validation(
-                            vae,
-                            text_encoder,
-                            tokenizer,
-                            transformer3d,
-                            args,
-                            config,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
-                        )
-                        transformer3d.train()
+                        accelerator.wait_for_everyone()
+                        
+                        if args.use_deepspeed or args.use_fsdp or accelerator.is_main_process:
+                            validation_save_path = os.path.join(args.output_dir, f"checkpoint-validation-{global_step}")
+                            accelerator.save_state(validation_save_path)
+                            logger.info(f"Saved validation checkpoint to {validation_save_path}")
+                        
+                        accelerator.wait_for_everyone()
+                    else:
+                        # Run validation normally for non-FSDP and non-Zero3
+                        if accelerator.is_main_process:
+                            logger.info(f"Main process [Rank {accelerator.process_index}] is running validation...")
 
-                        if args.use_ema:
-                            # Switch back to the original transformer3d parameters.
-                            ema_transformer3d.restore(transformer3d.parameters())
-                    
-                    logger.info(f"[Rank {accelerator.process_index}] Syncing after validation step...")
-                    accelerator.wait_for_everyone()
+                            # test vae encode and decode
+                            if global_step == 0:
+                                vae_decoder = vae.eval()
+                                # Ensure VAE is on the same device as latents for decoding
+                                if args.low_vram:
+                                    vae_decoder.to(accelerator.device)
+                                
+                                gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
+                                # Decode full_ref frame by frame
+                                full_ref_decoded_frames = []
+                                for frame_idx in range(full_ref.shape[2]):
+                                    frame = full_ref[:, :, frame_idx:frame_idx+1, :, :]
+                                    decoded_frame = vae_decoder.decode(frame.to(vae_decoder.dtype)).sample
+                                    full_ref_decoded_frames.append(decoded_frame)
+                                full_ref_decoded = torch.cat(full_ref_decoded_frames, dim=2)
+                                
+                                # Decode fg_coordmap_latent if it exists
+                                fg_decoded = None
+                                if fg_coordmap_latent is not None:
+                                    fg_decoded = vae_decoder.decode(fg_coordmap_latent.to(vae_decoder.dtype)).sample
+                                
+                                # Move VAE back to CPU if low_vram mode is enabled
+                                if args.low_vram:
+                                    vae_decoder.to('cpu')
+                                    torch.cuda.empty_cache()
+                                
+                                # Normalize to [0, 1]
+                                gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
+                                gt = (pixel_values / 2 + 0.5).clamp(0, 1).cpu().float().permute(0,2,1,3,4)
+                                full_ref_decoded = (full_ref_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                
+                                # Align frame counts for full_ref_decoded
+                                if full_ref_decoded.shape[2] < gt.shape[2]:
+                                    last_frame = full_ref_decoded[:, :, -1:, :, :]
+                                    repeat_times = gt.shape[2] - full_ref_decoded.shape[2]
+                                    repeated_frames = last_frame.repeat(1, 1, repeat_times, 1, 1)
+                                    full_ref_decoded = torch.cat([full_ref_decoded, repeated_frames], dim=2)
+                                else:
+                                    full_ref_decoded = full_ref_decoded[:, :, :gt.shape[2], :, :]
+                                
+                                # Build comparison list: [gt, gt_decoded, full_ref_decoded, ref_coordmap_decoded, fg_decoded, fg_coordmap_decoded, bg_decoded]
+                                comparison_list = [gt.cpu().float(), gt_decoded, full_ref_decoded]
+                                
+                                # Add ref_coordmap_decoded if exists
+                                if ref_coordmap_latents is not None:
+                                    # Decode ref_coordmap_latents
+                                    ref_coordmap_decoded_frames = []
+                                    if ref_coordmap_latents.dim() == 4:
+                                        # Single frame: [B, C, H, W]
+                                        ref_coordmap_decoded = vae_decoder.decode(ref_coordmap_latents.to(vae_decoder.dtype)).sample
+                                        ref_coordmap_decoded = (ref_coordmap_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                        # Align frame count with gt
+                                        if ref_coordmap_decoded.shape[2] < gt.shape[2]:
+                                            last_frame = ref_coordmap_decoded[:, :, -1:, :, :]
+                                            repeat_times = gt.shape[2] - ref_coordmap_decoded.shape[2]
+                                            repeated_frames = last_frame.repeat(1, 1, repeat_times, 1, 1)
+                                            ref_coordmap_decoded = torch.cat([ref_coordmap_decoded, repeated_frames], dim=2)
+                                        else:
+                                            ref_coordmap_decoded = ref_coordmap_decoded[:, :, :gt.shape[2], :, :]
+                                        comparison_list.append(ref_coordmap_decoded)
+                                    else:
+                                        # Multiple frames: [B, C, F, H, W]
+                                        for frame_idx in range(ref_coordmap_latents.shape[2]):
+                                            frame = ref_coordmap_latents[:, :, frame_idx:frame_idx+1, :, :]
+                                            decoded_frame = vae_decoder.decode(frame.to(vae_decoder.dtype)).sample
+                                            ref_coordmap_decoded_frames.append(decoded_frame)
+                                        ref_coordmap_decoded = torch.cat(ref_coordmap_decoded_frames, dim=2)
+                                        ref_coordmap_decoded = (ref_coordmap_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                        # Align frame count with gt
+                                        if ref_coordmap_decoded.shape[2] < gt.shape[2]:
+                                            last_frame = ref_coordmap_decoded[:, :, -1:, :, :]
+                                            repeat_times = gt.shape[2] - ref_coordmap_decoded.shape[2]
+                                            repeated_frames = last_frame.repeat(1, 1, repeat_times, 1, 1)
+                                            ref_coordmap_decoded = torch.cat([ref_coordmap_decoded, repeated_frames], dim=2)
+                                        else:
+                                            ref_coordmap_decoded = ref_coordmap_decoded[:, :, :gt.shape[2], :, :]
+                                        comparison_list.append(ref_coordmap_decoded)
+                                
+                                # Add fg_decoded if exists (decoded from fg_coordmap_latent)
+                                if fg_decoded is not None:
+                                    fg_decoded = (fg_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                    comparison_list.append(fg_decoded)
+                                
+                                # Add fg_coordmap_decoded if exists
+                                if fg_coordmap_latent is not None:
+                                    fg_coordmap_decoded = vae_decoder.decode(fg_coordmap_latent.to(vae_decoder.dtype)).sample
+                                    fg_coordmap_decoded = (fg_coordmap_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                    comparison_list.append(fg_coordmap_decoded)
+                                
+                                # Add bg_decoded (appearance_latents decoded) if exists
+                                if batch.get("bg") is not None:
+                                    bg_decoded = vae_decoder.decode(appearance_latents.to(vae_decoder.dtype)).sample
+                                    bg_decoded = (bg_decoded / 2 + 0.5).clamp(0, 1).cpu().float()
+                                    comparison_list.append(bg_decoded)
+                                
+                                # Stack vertically
+                                comparison = torch.cat(comparison_list, dim=3)  # stack in height dimension
+                                save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=16)
+
+                                # Prepare comparison for logging
+                                log_vae_comparison = comparison.clone().detach().clamp(0, 1) * 255
+                                log_vae_comparison = log_vae_comparison.permute(0, 2, 1, 3, 4).to(torch.uint8)  # [2, F, C, H, W]
+
+                                log_dict = {}
+
+                                if args.report_to == "wandb":
+                                    log_dict["validation/vae_decoded"] = wandb.Video(log_vae_comparison.cpu(), fps=16, format="gif")
+                                else: # Tensorboard
+                                    log_dict["validation/vae_decoded"] = log_vae_comparison
+                                
+                                accelerator.log(log_dict, step=global_step)
+
+                            if args.use_ema:
+                                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                                ema_transformer3d.store(transformer3d.parameters())
+                                ema_transformer3d.copy_to(transformer3d.parameters())
+                            
+                            log_validation(
+                                vae,
+                                text_encoder,
+                                tokenizer,
+                                transformer3d,
+                                args,
+                                config,
+                                accelerator,
+                                weight_dtype,
+                                global_step,
+                            )
+                            transformer3d.train()
+
+                            if args.use_ema:
+                                # Switch back to the original transformer3d parameters.
+                                ema_transformer3d.restore(transformer3d.parameters())
+                        
+                        logger.info(f"[Rank {accelerator.process_index}] Syncing after validation step...")
+                        accelerator.wait_for_everyone()
 
                 progress_bar.update(1)
                 global_step += 1

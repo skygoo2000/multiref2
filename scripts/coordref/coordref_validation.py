@@ -3,6 +3,8 @@ import glob
 import json
 import os
 import sys
+import time
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +71,11 @@ def parse_args():
     parser.add_argument("--gpu_memory_mode", type=str, default="model_full_load", 
                         choices=["model_full_load", "model_cpu_offload", "sequential_cpu_offload"],
                         help="GPU memory mode")
+    
+    parser.add_argument("--validation_mode", action="store_true", 
+                        help="Enable validation mode: keep models in GPU and auto-detect new checkpoint-validation checkpoints")
+    parser.add_argument("--check_interval", type=int, default=60,
+                        help="Interval in seconds to check for new validation checkpoints")
     
     return parser.parse_args()
 
@@ -214,8 +221,466 @@ def load_first_frame_image(image_path, val_height, val_width):
         return None
 
 
+def find_validation_checkpoint(training_output_dir):
+    """
+    Find checkpoint-validation-{steps} folder in training output directory
+    Returns: (checkpoint_path, step_number) or (None, None)
+    """
+    if not os.path.exists(training_output_dir):
+        return None, None
+    
+    checkpoints = [d for d in os.listdir(training_output_dir) if d.startswith("checkpoint-validation-")]
+    if not checkpoints:
+        return None, None
+    
+    # Should only be one, but take the newest if multiple exist
+    checkpoints.sort(key=lambda x: int(x.split("-")[-1]), reverse=True)
+    checkpoint_name = checkpoints[0]
+    step_number = int(checkpoint_name.split("-")[-1])
+    checkpoint_path = os.path.join(training_output_dir, checkpoint_name)
+    
+    return checkpoint_path, step_number
+
+
+def load_transformer_from_checkpoint(checkpoint_path, base_transformer, config, device, weight_dtype):
+    """
+    Load transformer weights from a checkpoint directory (handles DeepSpeed Zero3 and regular formats)
+    """
+    print(f"Loading transformer from checkpoint: {checkpoint_path}")
+    
+    from safetensors.torch import load_file
+    import subprocess
+    
+    # Check if this is a DeepSpeed Zero3 checkpoint (has pytorch_model dir with zero_pp_rank files)
+    pytorch_model_dir = os.path.join(checkpoint_path, "pytorch_model")
+    
+    if os.path.exists(pytorch_model_dir):
+        # Check for Zero3 checkpoint format
+        zero_files = [f for f in os.listdir(pytorch_model_dir) if f.startswith("zero_pp_rank_") and f.endswith("_model_states.pt")]
+        
+        if zero_files:
+            print(f"Detected DeepSpeed Zero3 checkpoint format with {len(zero_files)} shards")
+            
+            # Check if already converted to transformer folder
+            transformer_output_dir = os.path.join(checkpoint_path, "transformer")
+            converted_model_path = os.path.join(transformer_output_dir, "pytorch_model.bin")
+            converted_index_path = os.path.join(transformer_output_dir, "pytorch_model.bin.index.json")
+            
+            # Check if conversion already exists
+            if os.path.isfile(converted_model_path) or os.path.isfile(converted_index_path):
+                print(f"Found existing converted model in transformer folder, loading directly...")
+                
+                if os.path.isfile(converted_model_path):
+                    # Single file
+                    print(f"Loading from: {converted_model_path}")
+                    state_dict = torch.load(converted_model_path, map_location="cpu")
+                else:
+                    # Sharded files
+                    print(f"Loading sharded checkpoint from: {converted_index_path}")
+                    with open(converted_index_path, 'r') as f:
+                        index = json.load(f)
+                    
+                    state_dict = {}
+                    weight_map = index["weight_map"]
+                    shard_files = set(weight_map.values())
+                    
+                    for shard_file in tqdm(shard_files, desc="Loading shards"):
+                        shard_path = os.path.join(transformer_output_dir, shard_file)
+                        shard_state_dict = torch.load(shard_path, map_location="cpu")
+                        state_dict.update(shard_state_dict)
+            else:
+                # Need to convert
+                print(f"No existing conversion found, converting Zero3 checkpoint...")
+                
+                # Check if zero_to_fp32.py exists
+                zero_to_fp32_script = os.path.join(checkpoint_path, "zero_to_fp32.py")
+                if not os.path.exists(zero_to_fp32_script):
+                    raise FileNotFoundError(f"zero_to_fp32.py not found in checkpoint: {checkpoint_path}")
+                
+                # Create transformer directory for output
+                os.makedirs(transformer_output_dir, exist_ok=True)
+                
+                try:
+                    print(f"Converting Zero3 checkpoint using zero_to_fp32.py...")
+                    print(f"This may take a few minutes...")
+                    print(f"Output will be saved to: {transformer_output_dir}")
+                    
+                    # Run zero_to_fp32.py script to merge sharded weights
+                    # The script signature: zero_to_fp32.py checkpoint_dir output_dir [--tag TAG]
+                    cmd = [
+                        "python",
+                        zero_to_fp32_script,
+                        checkpoint_path,
+                        transformer_output_dir,
+                        "--tag", "pytorch_model"
+                    ]
+                    
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    
+                    if result.returncode != 0:
+                        print(f"Error running zero_to_fp32.py:")
+                        print(result.stderr)
+                        raise RuntimeError(f"Failed to convert Zero3 checkpoint: {result.stderr}")
+                    
+                    print(f"Successfully converted Zero3 checkpoint to: {transformer_output_dir}")
+                    
+                    # Load the converted model
+                    if os.path.isfile(converted_model_path):
+                        # Single file
+                        print(f"Loading converted model from: {converted_model_path}")
+                        state_dict = torch.load(converted_model_path, map_location="cpu")
+                    elif os.path.isfile(converted_index_path):
+                        # Sharded files
+                        print(f"Loading sharded converted model...")
+                        with open(converted_index_path, 'r') as f:
+                            index = json.load(f)
+                        
+                        state_dict = {}
+                        weight_map = index["weight_map"]
+                        shard_files = set(weight_map.values())
+                        
+                        for shard_file in tqdm(shard_files, desc="Loading shards"):
+                            shard_path = os.path.join(transformer_output_dir, shard_file)
+                            shard_state_dict = torch.load(shard_path, map_location="cpu")
+                            state_dict.update(shard_state_dict)
+                    else:
+                        raise FileNotFoundError(f"Conversion completed but no model file found in {transformer_output_dir}")
+                    
+                except Exception as e:
+                    # Clean up transformer folder on error to allow retry
+                    if os.path.exists(transformer_output_dir):
+                        print(f"Cleaning up failed conversion in {transformer_output_dir}")
+                        shutil.rmtree(transformer_output_dir, ignore_errors=True)
+                    raise RuntimeError(f"Failed to load Zero3 checkpoint: {e}")
+        else:
+            # Regular checkpoint in pytorch_model dir
+            print(f"Regular checkpoint format in pytorch_model directory")
+            pt_file = os.path.join(pytorch_model_dir, "pytorch_model.bin")
+            if os.path.exists(pt_file):
+                state_dict = torch.load(pt_file, map_location="cpu")
+            else:
+                raise FileNotFoundError(f"No model file found in {pytorch_model_dir}")
+    else:
+        # Try loading from transformer subdirectory (non-Zero3 format)
+        transformer_dir = os.path.join(checkpoint_path, "transformer")
+        
+        if not os.path.exists(transformer_dir):
+            raise FileNotFoundError(f"Neither pytorch_model nor transformer directory found in checkpoint: {checkpoint_path}")
+        
+        # Check for sharded safetensors (FSDP format)
+        index_files = [f for f in os.listdir(transformer_dir) if f.endswith('.safetensors.index.json')]
+        
+        if index_files:
+            # Load from sharded format
+            index_file = os.path.join(transformer_dir, index_files[0])
+            print(f"Loading sharded checkpoint from index: {index_file}")
+            
+            with open(index_file, 'r') as f:
+                index = json.load(f)
+            
+            state_dict = {}
+            weight_map = index["weight_map"]
+            shard_files = set(weight_map.values())
+            
+            for shard_file in tqdm(shard_files, desc="Loading shards"):
+                shard_path = os.path.join(transformer_dir, shard_file)
+                if os.path.exists(shard_path):
+                    shard_state_dict = load_file(shard_path)
+                    state_dict.update(shard_state_dict)
+        else:
+            # Try to load from regular safetensors or pytorch files
+            safetensors_files = [f for f in os.listdir(transformer_dir) if f.endswith('.safetensors') and not f.endswith('.index.json')]
+            
+            if safetensors_files:
+                print(f"Loading from safetensors files: {safetensors_files}")
+                state_dict = {}
+                for safetensors_file in safetensors_files:
+                    safetensors_path = os.path.join(transformer_dir, safetensors_file)
+                    shard_state_dict = load_file(safetensors_path)
+                    state_dict.update(shard_state_dict)
+            else:
+                # Try pytorch_model.bin
+                pt_file = os.path.join(transformer_dir, "pytorch_model.bin")
+                if os.path.exists(pt_file):
+                    print(f"Loading from pytorch file: {pt_file}")
+                    state_dict = torch.load(pt_file, map_location="cpu")
+                else:
+                    raise FileNotFoundError(f"No model files found in {transformer_dir}")
+    
+    state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+    
+    # Load state dict
+    m, u = base_transformer.load_state_dict(state_dict, strict=False)
+    print(f"Loaded transformer - missing keys: {len(m)}, unexpected keys: {len(u)}")
+    
+    return base_transformer
+
+
+def run_validation_on_checkpoint(checkpoint_path, step_number, args, pipeline, device, weight_dtype, config, training_output_dir=None):
+    """
+    Run validation on a specific checkpoint
+    Args:
+        training_output_dir: If provided (validation_mode), output to training_output_dir/validation/step-{step_number}
+                            If None (normal mode), output to args.output_dir
+    """
+    print(f"\n{'='*80}")
+    print(f"Running validation for checkpoint at step {step_number}")
+    print(f"Checkpoint path: {checkpoint_path}")
+    print(f"{'='*80}\n")
+    
+    # Load transformer from checkpoint
+    pipeline.transformer = load_transformer_from_checkpoint(
+        checkpoint_path, 
+        pipeline.transformer, 
+        config, 
+        device, 
+        weight_dtype
+    )
+    pipeline.transformer = pipeline.transformer.to(device, dtype=weight_dtype).eval()
+    
+    # Create output directory for this step
+    if training_output_dir is not None:
+        # Validation mode: output to training_output_dir/validation/step-{step_number}
+        step_output_dir = os.path.join(training_output_dir, "validation", f"step-{step_number}")
+    else:
+        # Normal mode: output to args.output_dir
+        step_output_dir = os.path.join(args.output_dir, f"sample_{step_number:04d}")
+    os.makedirs(step_output_dir, exist_ok=True)
+    
+    print(f"Loading validation data from: {args.validation_json}")
+    with open(args.validation_json, 'r') as f:
+        validation_data = json.load(f)
+    
+    validation_data = validation_data[:args.validation_samples]
+    json_base_dir = os.path.dirname(args.validation_json)
+    
+    negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+    
+    print(f"Running validation on {len(validation_data)} samples...")
+    
+    for idx, sample in enumerate(tqdm(validation_data, desc=f"Validating step-{step_number}")):
+        try:
+            # Required fields
+            prompt = sample.get('text')
+            if not prompt:
+                print(f"Warning: 'text' field is required but missing in sample {idx}, skipping...")
+                continue
+            
+            ref_relative_path = sample.get('ref')
+            if not ref_relative_path:
+                print(f"Warning: 'ref' field is required but missing in sample {idx}, skipping...")
+                continue
+            
+            ref_coordmap_relative_path = sample.get('ref_coordmap')
+            if not ref_coordmap_relative_path:
+                print(f"Warning: 'ref_coordmap' field is required but missing in sample {idx}, skipping...")
+                continue
+            
+            fg_coordmap_relative_path = sample.get('fg_coordmap')
+            if not fg_coordmap_relative_path:
+                print(f"Warning: 'fg_coordmap' field is required but missing in sample {idx}, skipping...")
+                continue
+            
+            # Optional fields
+            bgvideo_relative_path = sample.get('bgvideo', sample.get('bg', None))
+            gt_relative_path = sample.get('gt', sample.get('video_path', None))
+            firstframe_relative_path = sample.get('firstframe', None)
+            
+            # Resolve paths
+            def resolve_path(relative_path):
+                if relative_path is None:
+                    return None
+                if os.path.isabs(relative_path):
+                    return relative_path
+                return os.path.join(json_base_dir, relative_path)
+            
+            ref_path = resolve_path(ref_relative_path)
+            ref_coordmap_path = resolve_path(ref_coordmap_relative_path)
+            fg_coordmap_path = resolve_path(fg_coordmap_relative_path)
+            bgvideo_path = resolve_path(bgvideo_relative_path)
+            gt_path = resolve_path(gt_relative_path)
+            firstframe_path = resolve_path(firstframe_relative_path)
+            
+            # Check required files exist
+            if not os.path.exists(ref_path):
+                print(f"Warning: Required ref file not found: {ref_path}, skipping...")
+                continue
+            
+            if not os.path.exists(ref_coordmap_path):
+                print(f"Warning: Required ref_coordmap file not found: {ref_coordmap_path}, skipping...")
+                continue
+            
+            if not os.path.exists(fg_coordmap_path):
+                print(f"Warning: Required fg_coordmap file not found: {fg_coordmap_path}, skipping...")
+                continue
+            
+            # Load required data
+            ref_full = load_reference_video_full(ref_path, args.height, args.width)
+            if ref_full is None:
+                print(f"Warning: Failed to load required ref, skipping...")
+                continue
+            
+            ref_coordmap_full = load_validation_video_full(ref_coordmap_path, args.height, args.width)
+            if ref_coordmap_full is None:
+                print(f"Warning: Failed to load required ref_coordmap, skipping...")
+                continue
+            
+            fg_coordmap = load_validation_video_full(fg_coordmap_path, args.height, args.width)
+            if fg_coordmap is None:
+                print(f"Warning: Failed to load required fg_coordmap, skipping...")
+                continue
+            
+            # Load optional data
+            bg_video = None
+            if bgvideo_path and os.path.exists(bgvideo_path):
+                bg_video = load_validation_video_full(bgvideo_path, args.height, args.width)
+            
+            gt_video = None
+            if gt_path and os.path.exists(gt_path):
+                gt_video = load_validation_video_full(gt_path, args.height, args.width)
+            
+            # Sample ref and ref_coordmap
+            validation_ref, ref_batch_index = sample_reference_frames(ref_full, args.num_ref_frames)
+            
+            ref_coordmap_full_reformat = ref_coordmap_full.permute(0, 2, 1, 3, 4)
+            validation_ref_coordmap = ref_coordmap_full_reformat[:, :, ref_batch_index, :, :]
+            validation_ref_coordmap = validation_ref_coordmap.permute(0, 2, 1, 3, 4)
+            
+            generator = torch.Generator(device=device).manual_seed(args.seed + idx)
+            
+            video_length = int((args.num_frames - 1) // pipeline.vae.config.temporal_compression_ratio * pipeline.vae.config.temporal_compression_ratio) + 1 if args.num_frames != 1 else 1
+            
+            # Prepare inputs
+            ref_image_input = validation_ref.to(device=device, dtype=weight_dtype)
+            ref_coordmap_input = validation_ref_coordmap.to(device=device, dtype=weight_dtype)
+            fg_coordmap_input = fg_coordmap.to(device=device, dtype=weight_dtype)
+            bg_video_input = bg_video.to(device=device, dtype=weight_dtype) if bg_video is not None else None
+            
+            # Prepare start_image
+            start_image_input = None
+            if firstframe_path and os.path.exists(firstframe_path):
+                firstframe_image = load_first_frame_image(firstframe_path, args.height, args.width)
+                if firstframe_image is not None:
+                    start_image_input = firstframe_image.to(device=device, dtype=weight_dtype)
+            elif gt_video is not None:
+                gt_input = gt_video.to(device=device, dtype=weight_dtype)
+                gt_input = gt_input.permute(0, 2, 1, 3, 4)
+                start_image_input = gt_input[:, :, 0:1, :, :]
+            
+            with torch.no_grad():
+                sample_video = pipeline(
+                    prompt,
+                    num_frames=video_length,
+                    negative_prompt=negative_prompt,
+                    height=args.height,
+                    width=args.width,
+                    generator=generator,
+                    guidance_scale=args.guidance_scale,
+                    num_inference_steps=args.num_inference_steps,
+                    ref_image=ref_image_input,
+                    ref_coordmap=ref_coordmap_input,
+                    fg_coordmap=fg_coordmap_input,
+                    bg_video=bg_video_input,
+                    start_image=start_image_input,
+                    shift=args.shift,
+                ).videos
+            
+            # Save outputs (same format as training script)
+            if sample_video.shape[2] == 1:
+                save_videos_grid(sample_video, os.path.join(step_output_dir, f"{idx}.gif"), fps=args.fps)
+            else:
+                save_videos_grid(sample_video, os.path.join(step_output_dir, f"{idx}.mp4"), fps=args.fps)
+            
+            # Save comparison (same as training script)
+            ref_frames = validation_ref.shape[2]
+            sample_frames = sample_video.shape[2]
+            
+            if ref_frames != sample_frames:
+                B, C, F_ref, H, W = validation_ref.shape
+                validation_ref_reshaped = validation_ref.view(B * C, 1, F_ref, H * W)
+                validation_ref_interpolated = torch.nn.functional.interpolate(
+                    validation_ref_reshaped,
+                    size=(sample_frames, H * W),
+                    mode='nearest'
+                )
+                validation_ref = validation_ref_interpolated.view(B, C, sample_frames, H, W)
+            
+            ref_h, ref_w = validation_ref.shape[3], validation_ref.shape[4]
+            sample_h, sample_w = sample_video.shape[3], sample_video.shape[4]
+            
+            if ref_h != sample_h or ref_w != sample_w:
+                scale = max(ref_h / sample_h, ref_w / sample_w)
+                new_h, new_w = int(sample_h * scale), int(sample_w * scale)
+                
+                sample_resized = F.interpolate(
+                    sample_video.view(-1, sample_video.shape[1], sample_h, sample_w),
+                    size=(new_h, new_w), mode='nearest'
+                )
+                sample_resized = sample_resized.view(sample_video.shape[0], sample_video.shape[1], sample_video.shape[2], new_h, new_w)
+                
+                start_h = max(0, (new_h - ref_h) // 2)
+                start_w = max(0, (new_w - ref_w) // 2)
+                end_h = start_h + ref_h
+                end_w = start_w + ref_w
+                sample_video = sample_resized[:, :, :, start_h:end_h, start_w:end_w]
+            
+            if fg_coordmap_input is not None:
+                viz_fg_coordmap = fg_coordmap_input.permute(0, 2, 1, 3, 4).cpu()
+                if viz_fg_coordmap.shape[2] != sample_video.shape[2]:
+                    viz_fg_coordmap = torch.nn.functional.interpolate(
+                        viz_fg_coordmap,
+                        size=(sample_video.shape[2], viz_fg_coordmap.shape[3], viz_fg_coordmap.shape[4]),
+                        mode='nearest'
+                    )
+            else:
+                viz_fg_coordmap = torch.zeros((1, 3, sample_video.shape[2], sample_video.shape[3], sample_video.shape[4]))
+            
+            comparison_list = [validation_ref.cpu(), sample_video.cpu(), viz_fg_coordmap]
+            
+            if gt_video is not None:
+                gt_video_reformat = gt_video.permute(0, 2, 1, 3, 4).cpu()
+                if gt_video_reformat.shape[2] != sample_video.shape[2]:
+                    gt_video_reformat = torch.nn.functional.interpolate(
+                        gt_video_reformat,
+                        size=(sample_video.shape[2], gt_video_reformat.shape[3], gt_video_reformat.shape[4]),
+                        mode='trilinear'
+                    )
+                comparison_list.append(gt_video_reformat)
+            
+            comparison_video = torch.cat(comparison_list, dim=0)
+            if comparison_video.shape[2] == 1:
+                comparison_frame = comparison_video[0, :, 0, :, :].permute(1, 2, 0).clamp(0, 1) * 255
+                comparison_frame = comparison_frame.cpu().numpy().astype('uint8')
+                Image.fromarray(comparison_frame).save(os.path.join(step_output_dir, f"{idx}_comparison.png"))
+            else:
+                save_videos_grid(comparison_video, os.path.join(step_output_dir, f"{idx}_comparison.mp4"), fps=args.fps)
+            
+        except Exception as e:
+            print(f"Error processing sample {idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    print(f"\nValidation complete for step {step_number}! Results saved to: {step_output_dir}")
+
+
 def main():
     args = parse_args()
+    
+    # Validate arguments for validation_mode
+    if args.validation_mode:
+        if args.custom_transformer_path is None:
+            raise ValueError("--custom_transformer_path is required when --validation_mode is enabled")
+        
+        # Use custom_transformer_path directly as training_output_dir
+        training_output_dir = os.path.abspath(args.custom_transformer_path)
+        
+        # Check if logs directory exists (validation that this is a training output dir)
+        logs_dir = os.path.join(training_output_dir, "logs")
+        if not os.path.exists(logs_dir):
+            raise ValueError(f"logs directory not found in {training_output_dir}. Make sure --custom_transformer_path points to the training output directory (e.g., ckpts/your_experiment).")
+        
+        print(f"Validation mode enabled. Monitoring: {training_output_dir}")
     
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device)
@@ -235,7 +700,8 @@ def main():
         torch_dtype=weight_dtype,
     )
     
-    if args.custom_transformer_path is not None:
+    # In validation_mode
+    if args.custom_transformer_path is not None and not args.validation_mode:
         print(f"Loading custom transformer from: {args.custom_transformer_path}")
         from safetensors.torch import load_file
         
@@ -339,6 +805,57 @@ def main():
     else:
         pipeline = pipeline.to(device)
     
+    # If validation_mode is enabled, enter monitoring loop
+    if args.validation_mode:
+        print("\n" + "="*80)
+        print("VALIDATION MODE ACTIVATED")
+        print("="*80)
+        print(f"Models loaded and kept in GPU memory")
+        print(f"Monitoring directory: {training_output_dir}")
+        print(f"Check interval: {args.check_interval} seconds")
+        print(f"Press Ctrl+C to stop")
+        print("="*80 + "\n")
+        
+        processed_steps = set()
+        
+        try:
+            while True:
+                # Check for new validation checkpoint
+                checkpoint_path, step_number = find_validation_checkpoint(training_output_dir)
+                
+                if checkpoint_path and step_number not in processed_steps:
+                    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] New validation checkpoint detected!")
+                    
+                    # Run validation with training_output_dir
+                    run_validation_on_checkpoint(
+                        checkpoint_path, 
+                        step_number, 
+                        args, 
+                        pipeline, 
+                        device, 
+                        weight_dtype,
+                        config,
+                        training_output_dir=training_output_dir
+                    )
+                    
+                    processed_steps.add(step_number)
+                    
+                    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Validation complete. Resuming monitoring...")
+                else:
+                    # No new checkpoint, wait
+                    if checkpoint_path:
+                        print(f"\r[{time.strftime('%Y-%m-%d %H:%M:%S')}] Monitoring... (Last processed: step-{step_number})", end="", flush=True)
+                    else:
+                        print(f"\r[{time.strftime('%Y-%m-%d %H:%M:%S')}] Monitoring... (No checkpoints found yet)", end="", flush=True)
+                
+                time.sleep(args.check_interval)
+                
+        except KeyboardInterrupt:
+            print("\n\nValidation mode stopped by user.")
+            print(f"Processed steps: {sorted(processed_steps)}")
+            return
+    
+    # Normal mode: run validation once
     print(f"Loading validation data from: {args.validation_json}")
     with open(args.validation_json, 'r') as f:
         validation_data = json.load(f)
@@ -531,7 +1048,7 @@ def main():
                     
                     sample_resized = F.interpolate(
                         sample_video.view(-1, sample_video.shape[1], sample_h, sample_w),
-                        size=(new_h, new_w), mode='bilinear', align_corners=False
+                        size=(new_h, new_w), mode='nearest'
                     )
                     sample_resized = sample_resized.view(sample_video.shape[0], sample_video.shape[1], sample_video.shape[2], new_h, new_w)
                     
@@ -550,8 +1067,7 @@ def main():
                         viz_fg_coordmap = torch.nn.functional.interpolate(
                             viz_fg_coordmap,
                             size=(sample_video.shape[2], viz_fg_coordmap.shape[3], viz_fg_coordmap.shape[4]),
-                            mode='trilinear',
-                            align_corners=False
+                            mode='nearest'
                         )
                 else:
                     viz_fg_coordmap = torch.zeros((1, 3, sample_video.shape[2], sample_video.shape[3], sample_video.shape[4]))
@@ -567,8 +1083,7 @@ def main():
                         gt_video_reformat = torch.nn.functional.interpolate(
                             gt_video_reformat,
                             size=(sample_video.shape[2], gt_video_reformat.shape[3], gt_video_reformat.shape[4]),
-                            mode='trilinear',
-                            align_corners=False
+                            mode='trilinear'
                         )
                     comparison_list.append(gt_video_reformat)
                 

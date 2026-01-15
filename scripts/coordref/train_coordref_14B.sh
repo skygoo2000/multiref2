@@ -6,7 +6,7 @@ export DATASET_META_NAME="$DATASET_NAME/video41k.json"
 # export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=WARN
 export PYTHONWARNINGS="ignore::FutureWarning"
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 LEARNING_RATE=2e-05
 BATCH_SIZE=1
@@ -14,14 +14,14 @@ MAX_TRAIN_STEPS=10000
 CHECKPOINTING_STEPS=1000
 RESUME_FROM_CHECKPOINT="latest"
 
-OUTPUT_DIR="ckpts/0106_croodref14B_vid41k_lr${LEARNING_RATE}_fullattn_2fullref"
+OUTPUT_DIR="ckpts/0114_croodref14B_vid41k_lr${LEARNING_RATE}_fullattn_2fullref_negrope"
 
 VALIDATION_STEPS=200
 VALIDATION_PROMPTS="a small, chibi-style figurine is placed on a wooden table in a room with a window."
 VALIDATION_REF_PATH="datasets/coordref_vali/furiren/ref.mp4"
 VALIDATION_REF_COORDMAP_PATH="datasets/coordref_vali/furiren/ref_coordmap.mp4"
 VALIDATION_FG_COORDMAP_PATH="datasets/coordref_vali/furiren/fg_coordmap.mp4"
-VALIDATION_SIZE="192 336 49"  # height width frames
+VALIDATION_SIZE="384 672 49"  # height width frames
 
 ## fsdp stage3
 # accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "FULL_SHARD" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False scripts/coordref/train_coordref.py \
@@ -29,19 +29,19 @@ VALIDATION_SIZE="192 336 49"  # height width frames
 ## deepspeed zero2
 # accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/coordref/train_coordref.py \
 
-accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_config.json scripts/coordref/train_coordref.py \
+accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage3_config_cpu_offload.json scripts/coordref/train_coordref.py \
   --config_path="config/wan2.1/wan_civitai.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
   --train_data_meta=$DATASET_META_NAME \
   --image_sample_size=512 \
-  --video_sample_size=256 \
+  --video_sample_size=512 \
   --video_sample_stride=1 \
-  --video_sample_n_frames=49 \
+  --video_sample_n_frames=81 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=0 \
   --gradient_accumulation_steps=1 \
-  --dataloader_num_workers=8 \
+  --dataloader_num_workers=1 \
   --max_train_steps=$MAX_TRAIN_STEPS \
   --checkpointing_steps=$CHECKPOINTING_STEPS \
   --checkpoints_total_limit=5 \
@@ -66,7 +66,7 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --train_mode="control_ref" \
   --trainable_modules "." \
   --report_model_info \
-  --report_to="wandb" \
+  --report_to="tensorboard" \
   --tracker_project_name="coordref_14B-384p" \
   --resume_from_checkpoint=$RESUME_FROM_CHECKPOINT \
   --gradient_checkpointing \
