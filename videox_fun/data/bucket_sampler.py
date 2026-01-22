@@ -353,6 +353,8 @@ class AspectRatioBatchImageVideoSampler(BatchSampler):
     def __iter__(self):
         for idx in self.sampler:
             content_type = self.dataset[idx].get('type', 'image')
+            if content_type not in self.bucket:
+                continue
             if content_type == 'image':
                 try:
                     image_dict = self.dataset[idx]

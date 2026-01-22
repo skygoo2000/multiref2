@@ -39,7 +39,7 @@ accelerate launch scripts/coordref/train_coordref.py \
   --image_sample_size=480 \
   --video_sample_size=480 \
   --video_sample_stride=1 \
-  --video_sample_n_frames=1 \
+  --video_sample_n_frames=121 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=0 \
   --dataloader_num_workers=4 \

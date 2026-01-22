@@ -1632,6 +1632,7 @@ def main():
             # Get downsample ratio in image and videos
             pixel_value     = examples[0]["pixel_values"]
             data_type       = examples[0]["data_type"]
+            is_video_batch  = data_type == 'video'
             f, h, w, c      = np.shape(pixel_value)
             if data_type == 'image':
                 random_downsample_ratio = 1 if not args.random_hw_adapt else get_random_downsample_ratio(args.image_sample_size, image_ratio=[args.image_sample_size / args.video_sample_size])
@@ -1639,7 +1640,7 @@ def main():
                 aspect_ratio_sample_size = {key : [x / 480 * args.image_sample_size / random_downsample_ratio for x in ASPECT_RATIO_480[key]] for key in ASPECT_RATIO_480.keys()}
                 aspect_ratio_random_crop_sample_size = {key : [x / 480 * args.image_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_480[key]] for key in ASPECT_RATIO_RANDOM_CROP_480.keys()}
                 
-                batch_video_length = args.video_sample_n_frames + sample_n_frames_bucket_interval
+                batch_video_length = 1
             else:
                 if args.random_hw_adapt:
                     if args.training_with_video_token_length:
@@ -1843,13 +1844,16 @@ def main():
                 
                 new_examples["text"].append(example["text"])
                 # Magvae needs the number of frames to be 4n + 1.
-                batch_video_length = int(
-                    min(
-                        batch_video_length,
-                        (len(pixel_values) - 1) // sample_n_frames_bucket_interval * sample_n_frames_bucket_interval + 1, 
+                if is_video_batch:
+                    batch_video_length = int(
+                        min(
+                            batch_video_length,
+                            (len(pixel_values) - 1) // sample_n_frames_bucket_interval * sample_n_frames_bucket_interval + 1, 
+                        )
                     )
-                )
-                if batch_video_length == 0:
+                    if batch_video_length == 0:
+                        batch_video_length = 1
+                else:
                     batch_video_length = 1
 
                 # if args.train_mode != "control":
@@ -2351,7 +2355,7 @@ def main():
                         temp_n_frames = 1
 
                     # Magvae needs the number of frames to be 4n + 1.
-                    temp_n_frames = (temp_n_frames - 1) // sample_n_frames_bucket_interval + 1
+                    temp_n_frames = ((temp_n_frames - 1) // sample_n_frames_bucket_interval) * sample_n_frames_bucket_interval + 1
 
                     pixel_values = pixel_values[:, :temp_n_frames, :, :]
                     # Note: ref_pixel_values may have different frame count, don't crop it here

@@ -16,6 +16,9 @@ scripts_demo*
 *.out
 wandb/
 .vscode/
+AGENTS.md
+*.json
+CLAUDE.md
 
 # C extensions
 *.so
