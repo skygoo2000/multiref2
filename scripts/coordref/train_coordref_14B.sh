@@ -21,7 +21,7 @@ VALIDATION_PROMPTS="a small, chibi-style figurine is placed on a wooden table in
 VALIDATION_REF_PATH="datasets/coordref_vali/furiren/ref.mp4"
 VALIDATION_REF_COORDMAP_PATH="datasets/coordref_vali/furiren/ref_coordmap.mp4"
 VALIDATION_FG_COORDMAP_PATH="datasets/coordref_vali/furiren/fg_coordmap.mp4"
-VALIDATION_SIZE="384 672 49"  # height width frames
+VALIDATION_SIZE="192 336 49"  # height width frames
 
 ## fsdp stage3
 # accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_transformer_layer_cls_to_wrap=WanAttentionBlock --fsdp_sharding_strategy "FULL_SHARD" --fsdp_state_dict_type=SHARDED_STATE_DICT --fsdp_backward_prefetch "BACKWARD_PRE" --fsdp_cpu_ram_efficient_loading False scripts/coordref/train_coordref.py \
@@ -34,10 +34,10 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage3_con
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
   --train_data_meta=$DATASET_META_NAME \
-  --image_sample_size=512 \
-  --video_sample_size=512 \
+  --image_sample_size=256 \
+  --video_sample_size=256 \
   --video_sample_stride=1 \
-  --video_sample_n_frames=81 \
+  --video_sample_n_frames=49 \
   --train_batch_size=$BATCH_SIZE \
   --video_repeat=0 \
   --gradient_accumulation_steps=1 \

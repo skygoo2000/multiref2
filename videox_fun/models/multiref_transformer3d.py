@@ -6,6 +6,7 @@ import math
 import os
 from typing import Any, Dict, Optional, Union
 
+import numpy as np
 import torch
 import torch.amp as amp
 import torch.nn as nn
@@ -14,6 +15,7 @@ from diffusers.utils import is_torch_version
 
 from .wan_transformer3d import (
     WanTransformer3DModel,
+    Wan2_2Transformer3DModel,
     WanRMSNorm,
     WanLayerNorm,
     WanSelfAttention,
@@ -1552,42 +1554,39 @@ class CroodRefTransformer3DModel(WanTransformer3DModel):
         return x
 
 
-class CroodRefTransformer3DModel2_2(CroodRefTransformer3DModel):
-    r"""
-    CroodRef Transformer3D model for Wan 2.2, inherited from CroodRefTransformer3DModel.
-    Main difference: uses 'cross_attn' instead of 'i2v_cross_attn' to remove img_emb dependency.
-    """
-
+class CroodRefTransformer3DModel2_2(Wan2_2Transformer3DModel):
     _supports_gradient_checkpointing = True
     
+    @register_to_config
     def __init__(
         self,
         model_type='i2v',
         patch_size=(1, 2, 2),
         text_len=512,
-        in_dim=48,
-        dim=2048,
-        ffn_dim=8192,
+        in_dim=148,      # 48 noisy + 48 fg_coordmap + 4 mask + 48 appearance
+        dim=3072,        # 5B model hidden dimension
+        ffn_dim=14336,   # 5B model FFN dimension
         freq_dim=256,
         text_dim=4096,
-        out_dim=16,
-        num_heads=16,
-        num_layers=32,
+        out_dim=48,      # 5B VAE latent channels
+        num_heads=24,    # 5B model attention heads
+        num_layers=30,   # 5B model transformer layers
         window_size=(-1, -1),
         qk_norm=True,
         cross_attn_norm=True,
         eps=1e-6,
-        in_channels=48,
-        hidden_size=2048,
+        in_channels=148,
+        hidden_size=3072,
         add_control_adapter=False,
         in_dim_control_adapter=24,
         downscale_factor_control_adapter=8,
-        add_ref_conv=False,
-        in_dim_ref_conv=16,
+        add_ref_conv=False,  # Not using ref_conv, use patch_embedding instead
+        in_dim_ref_conv=48,
         rope_gap=5,
     ):
         r"""
-        Initialize the CroodRef 2.2 diffusion model backbone.
+        Initialize the CroodRef 2.2 5B diffusion model backbone.
+        
         
         Args:
             model_type (`str`, *optional*, defaults to 'i2v'):
@@ -1596,22 +1595,22 @@ class CroodRefTransformer3DModel2_2(CroodRefTransformer3DModel):
                 3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
             text_len (`int`, *optional*, defaults to 512):
                 Fixed length for text embeddings
-            in_dim (`int`, *optional*, defaults to 48):
-                Input video channels (C_in) - 48 for CroodRef (16 ref + 32 coordmap)
-            dim (`int`, *optional*, defaults to 2048):
-                Hidden dimension of the transformer
-            ffn_dim (`int`, *optional*, defaults to 8192):
-                Intermediate dimension in feed-forward network
+            in_dim (`int`, *optional*, defaults to 148):
+                Input channels: 48 (noisy) + 48 (fg_coordmap) + 4 (mask) + 48 (appearance)
+            dim (`int`, *optional*, defaults to 3072):
+                Hidden dimension of the transformer (5B model)
+            ffn_dim (`int`, *optional*, defaults to 14336):
+                Intermediate dimension in feed-forward network (5B model)
             freq_dim (`int`, *optional*, defaults to 256):
                 Dimension for sinusoidal time embeddings
             text_dim (`int`, *optional*, defaults to 4096):
                 Input dimension for text embeddings
-            out_dim (`int`, *optional*, defaults to 16):
-                Output video channels (C_out)
-            num_heads (`int`, *optional*, defaults to 16):
-                Number of attention heads
-            num_layers (`int`, *optional*, defaults to 32):
-                Number of transformer blocks
+            out_dim (`int`, *optional*, defaults to 48):
+                Output video channels (5B VAE latent channels)
+            num_heads (`int`, *optional*, defaults to 24):
+                Number of attention heads (5B model)
+            num_layers (`int`, *optional*, defaults to 30):
+                Number of transformer blocks (5B model)
             window_size (`tuple`, *optional*, defaults to (-1, -1)):
                 Window size for local attention (-1 indicates global attention)
             qk_norm (`bool`, *optional*, defaults to True):
@@ -1641,15 +1640,396 @@ class CroodRefTransformer3DModel2_2(CroodRefTransformer3DModel):
             eps=eps,
             in_channels=in_channels,
             hidden_size=hidden_size,
-            add_control_adapter=add_control_adapter,
+            add_control_adapter=False,
             in_dim_control_adapter=in_dim_control_adapter,
             downscale_factor_control_adapter=downscale_factor_control_adapter,
-            add_ref_conv=add_ref_conv,
+            add_ref_conv=False,
             in_dim_ref_conv=in_dim_ref_conv,
-            cross_attn_type="cross_attn",
-            rope_gap=rope_gap,
         )
         
-        # Remove img_emb if it exists
-        if hasattr(self, "img_emb"):
-            del self.img_emb
+        if hasattr(self, "control_adapter"):
+            del self.control_adapter
+        if hasattr(self, "ref_conv"):
+            del self.ref_conv
+        
+        self.latent_channels = 48
+        self.rope_gap = rope_gap
+        cross_attn_type = 'cross_attn'
+        self.blocks = nn.ModuleList([
+            WanAttentionBlockWithRef(cross_attn_type, dim, ffn_dim, num_heads,
+                              window_size, qk_norm, cross_attn_norm, eps, rope_gap)
+            for _ in range(num_layers)
+        ])
+        for layer_idx, block in enumerate(self.blocks):
+            block.self_attn.layer_idx = layer_idx
+            block.self_attn.num_layers = self.num_layers
+    
+    @classmethod
+    def from_pretrained(
+        cls, pretrained_model_path, subfolder=None, transformer_additional_kwargs={},
+        low_cpu_mem_usage=False, torch_dtype=torch.bfloat16
+    ):
+        original_path = pretrained_model_path
+
+        if subfolder is not None:
+            subfolder_path = os.path.join(pretrained_model_path, subfolder)
+            if os.path.isfile(os.path.join(subfolder_path, 'config.json')):
+                pretrained_model_path = subfolder_path
+        
+        # Check if config.json exists at current path
+        config_file = os.path.join(pretrained_model_path, 'config.json')
+        
+        # If not found, try parent directory (for pretrained models where config is in root)
+        if not os.path.isfile(config_file):
+            parent_path = os.path.dirname(pretrained_model_path)
+            parent_config_file = os.path.join(parent_path, 'config.json')
+            if os.path.isfile(parent_config_file):
+                pretrained_model_path = parent_path
+                config_file = parent_config_file
+        
+        print(f"loaded CroodRefTransformer3DModel2_2 from {pretrained_model_path} ...")
+
+        if not os.path.isfile(config_file):
+            raise RuntimeError(f"{config_file} does not exist. Checked paths: {original_path}, {os.path.dirname(original_path)}")
+        with open(config_file, "r") as f:
+            config = json.load(f)
+
+        from diffusers.utils import WEIGHTS_NAME
+        model_file = os.path.join(pretrained_model_path, WEIGHTS_NAME)
+        model_file_safetensors = model_file.replace(".bin", ".safetensors")
+
+        if "dict_mapping" in transformer_additional_kwargs.keys():
+            for key in transformer_additional_kwargs["dict_mapping"]:
+                transformer_additional_kwargs[transformer_additional_kwargs["dict_mapping"][key]] = config[key]
+        
+        model = cls.from_config(config, **transformer_additional_kwargs)
+        if os.path.exists(model_file):
+            state_dict = torch.load(model_file, map_location="cpu")
+        elif os.path.exists(model_file_safetensors):
+            from safetensors.torch import load_file, safe_open
+            state_dict = load_file(model_file_safetensors)
+        else:
+            from safetensors.torch import load_file, safe_open
+            model_files_safetensors = glob.glob(os.path.join(pretrained_model_path, "*.safetensors"))
+            state_dict = {}
+            for _model_file_safetensors in model_files_safetensors:
+                _state_dict = load_file(_model_file_safetensors)
+                for key in _state_dict:
+                    state_dict[key] = _state_dict[key]
+        
+        # Handle patch_embedding channel expansion (pretrained -> 148 channels)
+        if 'patch_embedding.weight' in state_dict:
+            pretrained_channels = state_dict['patch_embedding.weight'].size(1)
+            model_channels = model.state_dict()['patch_embedding.weight'].size(1)  # 148
+            
+            if pretrained_channels != model_channels:
+                print(f"### Expanding patch_embedding from {pretrained_channels} to {model_channels} channels")
+                new_weight = torch.zeros_like(model.state_dict()['patch_embedding.weight'])
+                new_weight[:, :pretrained_channels, :, :, :] = state_dict['patch_embedding.weight']
+                state_dict['patch_embedding.weight'] = new_weight
+                print(f"### First {pretrained_channels} channels copied from pretrained, remaining {model_channels - pretrained_channels} channels zero-initialized")
+
+        tmp_state_dict = {} 
+        for key in state_dict:
+            # Skip ref_conv and control_adapter (CroodRef 2.2 doesn't use them)
+            if key.startswith('ref_conv.') or key.startswith('control_adapter.'):
+                print(key, "Skipping ref_conv/control_adapter for CroodRef2_2")
+                continue
+            # Skip img_emb (Wan2.2 5B doesn't use CLIP)
+            if key.startswith('img_emb.'):
+                print(key, "Skipping img_emb for CroodRef2_2 (no CLIP)")
+                continue
+            
+            if key in model.state_dict().keys() and model.state_dict()[key].size() == state_dict[key].size():
+                tmp_state_dict[key] = state_dict[key]
+            else:
+                print(key, "Size don't match, skip")
+                
+        state_dict = tmp_state_dict
+
+        m, u = model.load_state_dict(state_dict, strict=False)
+        print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
+        print(m)
+        
+        params = [p.numel() if "." in n else 0 for n, p in model.named_parameters()]
+        print(f"### All Parameters: {sum(params) / 1e6} M")
+
+        params = [p.numel() if "attn1." in n else 0 for n, p in model.named_parameters()]
+        print(f"### attn1 Parameters: {sum(params) / 1e6} M")
+        
+        model = model.to(torch_dtype)
+        return model
+
+    def forward(
+        self,
+        x,
+        t,
+        context,
+        seq_len,
+        clip_fea=None,  # Not used, kept for interface compatibility
+        full_ref=None,
+        full_ref_crood=None,
+        fg_coordmap=None,
+        appearance=None,
+        cond_flag=True,
+    ):
+        r"""
+        Forward pass through the CroodRef 2.2 5B diffusion model.
+        
+        Args:
+            x (List[Tensor]):
+                List of input video tensors, each with shape [C=48, F, H, W]
+            t (Tensor):
+                Diffusion timesteps tensor of shape [B]
+            context (List[Tensor]):
+                List of text embeddings each with shape [L, C]
+            seq_len (`int`):
+                Maximum sequence length for positional encoding
+            clip_fea (Tensor, *optional*):
+                Not used in Wan2.2 5B, kept for interface compatibility
+            full_ref (Tensor, *optional*):
+                Full reference frames, 48 channels, shape [B, 48, F, H, W] or [B, 48, H, W]
+            full_ref_crood (Tensor, *optional*):
+                Coordinate map for full reference frames, 48 channels
+            fg_coordmap (Tensor, *optional*):
+                Foreground coordinate map, 48 channels, shape [B, 48, F, H, W]
+            appearance (Tensor, *optional*):
+                Appearance latents, 48 channels, shape [B, 48, F, H, W]
+            cond_flag (`bool`, *optional*, defaults to True):
+                Flag to indicate whether to forward the condition input
+
+        Returns:
+            Tensor: Denoised video tensor with shape [B, C_out=48, F, H, W]
+        """
+        device = self.patch_embedding.weight.device
+        dtype = x.dtype if not isinstance(x, list) else x[0].dtype
+        if self.freqs.device != device and torch.device(type="meta") != device:
+            self.freqs = self.freqs.to(device)
+        
+        # Get full_ref frame count for mask building
+        full_ref_frames_num = 0
+        if full_ref is not None:
+            if full_ref.dim() > 4:
+                full_ref_frames_num = full_ref.size(2)
+            else:
+                full_ref_frames_num = 1
+        
+        if fg_coordmap is not None:
+            batch_size, _, num_frames, h, w = fg_coordmap.shape
+        else:
+            # If fg_coordmap is None, use x dimensions
+            first_x = x[0] if isinstance(x, list) else x
+            print("first_x.shape:", first_x.shape)
+            num_frames = first_x.shape[-3]  # x shape: [C, F, H, W]
+            h, w = first_x.shape[-2], first_x.shape[-1]
+            batch_size = len(x) if isinstance(x, list) else x.shape[0]
+        
+        mask = torch.zeros(batch_size, 4, num_frames, h, w, device=device, dtype=dtype) # [B, C, F, H, W]
+        # breakpoint()
+        # control_input: fg_coordmap(48) + mask(4) + appearance(48)
+        if fg_coordmap is not None and appearance is not None:
+            control_input = torch.cat([fg_coordmap, mask, appearance], dim=1)
+        elif fg_coordmap is not None:
+            control_input = torch.cat([fg_coordmap, mask, torch.zeros_like(fg_coordmap)], dim=1)
+        elif appearance is not None:
+            print("appearance.shape:", appearance.shape)
+            print("mask.shape:", mask.shape)
+            print("x.shape:", x.shape)
+            control_input = torch.cat([torch.zeros_like(appearance), mask, appearance], dim=1)
+        else:
+            # No control input, create zeros
+            zeros_latent = torch.zeros(batch_size, 48, num_frames, h, w, device=device, dtype=dtype)
+            control_input = torch.cat([zeros_latent, mask, zeros_latent], dim=1)
+        
+        x = [torch.cat([u, v], dim=0) for u, v in zip(x, control_input)]
+        
+        full_ref_token_num = 0
+        if full_ref is not None:
+            full_ref_mask = torch.ones(
+                full_ref.shape[0], 4, *full_ref.shape[2:], 
+                device=device, dtype=dtype
+            )  # ref region mask = 0
+            
+            if full_ref_crood is not None:
+                full_ref_combined = torch.cat([
+                    full_ref, 
+                    full_ref_crood,
+                    full_ref_mask,
+                    full_ref,
+                ], dim=1)
+            else:
+                full_ref_combined = torch.cat([
+                    full_ref,
+                    torch.zeros_like(full_ref),
+                    full_ref_mask,
+                    full_ref,
+                ], dim=1)
+            
+            full_ref_embedded = self.patch_embedding(full_ref_combined).flatten(2).transpose(1, 2)
+            
+            if full_ref_combined.dim() > 4:
+                full_ref_frames_num = full_ref_combined.size(2)
+            else:
+                full_ref_frames_num = 1
+            
+            full_ref_token_num = full_ref_embedded.size(1)
+            seq_len += full_ref_token_num
+        
+        # patch_embedding for x
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+
+        grid_sizes = torch.stack(
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]).to(device)
+        
+        x_grid_sizes = grid_sizes.clone()
+        ref_grid_sizes = None
+
+        x = [u.flatten(2).transpose(1, 2) for u in x]  # [B, seq_len, model_dim]
+        
+        # Prepend full_ref_embedded to x if exists
+        if full_ref is not None and full_ref_token_num > 0:
+            # full_ref_embedded: [B, ref_seq, dim], each x element: [1, seq, dim]
+            x = [torch.cat([full_ref_embedded[i:i+1], u], dim=1) for i, u in enumerate(x)]
+            # Update grid_sizes to include full_ref frames
+            grid_sizes = torch.stack([
+                torch.tensor([u[0] + full_ref_frames_num, u[1], u[2]], dtype=torch.long) 
+                for u in grid_sizes
+            ]).to(device)
+            
+            # Calculate ref_grid_sizes for RoPE (used in WanAttentionBlockWithRef)
+            ref_grid_sizes = torch.stack([
+                torch.tensor([full_ref_frames_num, u[1], u[2]], dtype=torch.long) 
+                for u in x_grid_sizes
+            ]).to(device)
+
+        # sequence length processing
+        # Each x element has shape [1, total_seq, dim], so use size(1) for seq length
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long).to(device)
+        if self.sp_world_size > 1:
+            seq_len = int(math.ceil(seq_len / self.sp_world_size)) * self.sp_world_size
+        assert seq_lens.max() <= seq_len
+        x = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                      dim=1) for u in x
+        ])
+
+        # time embeddings
+        with amp.autocast('cuda', dtype=torch.float32):
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t).float())
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+
+        # context
+        context_lens = None
+        context = self.text_embedding(
+            torch.stack([
+                torch.cat(
+                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]))
+
+        # Context Parallel
+        if self.sp_world_size > 1:
+            x = torch.chunk(x, self.sp_world_size, dim=1)[self.sp_world_rank]
+            e0 = torch.chunk(e0, self.sp_world_size, dim=1)[self.sp_world_rank] if e0.dim() > 2 else e0
+            e = torch.chunk(e, self.sp_world_size, dim=1)[self.sp_world_rank] if e.dim() > 2 else e
+        
+        # TeaCache handling (same as parent)
+        if self.teacache is not None:
+            if cond_flag:
+                modulated_inp = e0
+                if self.teacache.cnt == 0 or self.teacache.cnt == self.teacache.num_steps:
+                    self.teacache.accumulated_rel_l1_distance = 0
+                    self.should_calc = True
+                else:
+                    coefficients = self.teacache.coefficients
+                    rescale_func = np.poly1d(coefficients)
+                    self.teacache.accumulated_rel_l1_distance += rescale_func(((modulated_inp-self.teacache.previous_modulated_input).abs().mean() / self.teacache.previous_modulated_input.abs().mean()).cpu().item())
+                    if self.teacache.accumulated_rel_l1_distance < self.teacache.rel_l1_thresh:
+                        self.should_calc = False
+                    else:
+                        self.should_calc = True
+                        self.teacache.accumulated_rel_l1_distance = 0
+                self.teacache.previous_modulated_input = modulated_inp
+                self.teacache.should_calc = self.should_calc
+            else:
+                self.should_calc = self.teacache.should_calc
+        
+        # TeaCache block processing
+        if self.teacache is not None:
+            if not self.should_calc:
+                previous_residual = self.teacache.previous_residual_cond if cond_flag else self.teacache.previous_residual_uncond
+                x = x + previous_residual.to(x.device)[-x.size()[0]:,]
+            else:
+                ori_x = x.clone().cpu() if self.teacache.offload else x.clone()
+
+                for block in self.blocks:
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+                        def create_custom_forward(module):
+                            def custom_forward(*inputs):
+                                return module(*inputs)
+                            return custom_forward
+                        ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x, e0, seq_lens, x_grid_sizes, self.freqs, context, context_lens, dtype, t, ref_grid_sizes,
+                            **ckpt_kwargs,
+                        )
+                    else:
+                        kwargs = dict(
+                            e=e0, seq_lens=seq_lens, grid_sizes=x_grid_sizes, freqs=self.freqs,
+                            context=context, context_lens=context_lens, dtype=dtype, t=t, ref_grid_sizes=ref_grid_sizes
+                        )
+                        x = block(x, **kwargs)
+                    
+                if cond_flag:
+                    self.teacache.previous_residual_cond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
+                else:
+                    self.teacache.previous_residual_uncond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
+        else:
+            for block in self.blocks:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+                        return custom_forward
+                    ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        x, e0, seq_lens, x_grid_sizes, self.freqs, context, context_lens, dtype, t, ref_grid_sizes,
+                        **ckpt_kwargs,
+                    )
+                else:
+                    kwargs = dict(
+                        e=e0, seq_lens=seq_lens, grid_sizes=x_grid_sizes, freqs=self.freqs,
+                        context=context, context_lens=context_lens, dtype=dtype, t=t, ref_grid_sizes=ref_grid_sizes
+                    )
+                    x = block(x, **kwargs)
+
+        # head
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+            ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+            x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.head), x, e, **ckpt_kwargs)
+        else:
+            x = self.head(x, e)
+
+        if self.sp_world_size > 1:
+            x = self.all_gather(x, dim=1)
+
+        # Remove full_ref tokens from output
+        if full_ref_token_num > 0:
+            x = x[:, full_ref_token_num:]
+            grid_sizes = torch.stack([torch.tensor([u[0] - full_ref_frames_num, u[1], u[2]]) for u in grid_sizes]).to(grid_sizes.device)
+
+        # unpatchify
+        x = self.unpatchify(x, grid_sizes)
+        x = torch.stack(x)
+        if self.teacache is not None and cond_flag:
+            self.teacache.cnt += 1
+            if self.teacache.cnt == self.teacache.num_steps:
+                self.teacache.reset()
+        return x

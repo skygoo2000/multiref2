@@ -76,10 +76,10 @@ from videox_fun.data.dataset_image_video import (ImageVideoControlDataset,
                                                  get_random_mask,
                                                  process_pose_file,
                                                  process_pose_params)
-from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel,
+from videox_fun.models import (AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel,
                                WanTransformer3DModel)
-from videox_fun.models.multiref_transformer3d import CroodRefTransformer3DModel
-from videox_fun.pipeline import WanFunCroodRefPipeline
+from videox_fun.models.multiref_transformer3d import CroodRefTransformer3DModel, CroodRefTransformer3DModel2_2
+from videox_fun.pipeline import WanFunCroodRefPipeline, WanFunCroodRefPipeline2_2
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.lora_utils import (create_network, merge_lora,
                                          unmerge_lora)
@@ -181,23 +181,13 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
     )
     transformer3d_val = accelerator.unwrap_model(transformer3d)
     
-    # Use WanFunCroodRefPipeline
-    # Load clip_image_encoder for validation pipeline
-    from videox_fun.models import CLIPModel
-    clip_image_encoder_path = os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder'))
-    if os.path.exists(clip_image_encoder_path):
-        clip_image_encoder = CLIPModel.from_pretrained(clip_image_encoder_path).to(accelerator.device, dtype=weight_dtype).eval()
-    else:
-        logger.warning(f"CLIPModel not found at {clip_image_encoder_path}, using None")
-        clip_image_encoder = None
-    
-    pipeline = WanFunCroodRefPipeline(
+    # Use WanFunCroodRefPipeline2_2 for Wan2.2 5B (no CLIP)
+    pipeline = WanFunCroodRefPipeline2_2(
         vae=accelerator.unwrap_model(vae).to(weight_dtype), 
         text_encoder=accelerator.unwrap_model(text_encoder),
         tokenizer=tokenizer,
         transformer=transformer3d_val,
         scheduler=scheduler,
-        clip_image_encoder=clip_image_encoder,
     )
 
     pipeline = pipeline.to(accelerator.device)
@@ -612,9 +602,9 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                 validation_ref_resampled = resample_to_val_frames(validation_ref, val_frames)
                 sample_with_ref_resampled = resample_to_val_frames(sample_with_ref, val_frames)
                 viz_fg_coordmap_resampled = resample_to_val_frames(viz_fg_coordmap, val_frames)
-                
+
                 comparison_list = [validation_ref_resampled, sample_with_ref_resampled.cpu(), viz_fg_coordmap_resampled.cpu()]
-                
+
                 # Add validation_gt if available
                 if validation_gt is not None:
                     # validation_gt is [1, F, C, H, W], convert to [1, C, F, H, W]
@@ -635,7 +625,7 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
                     caption = f"{args.validation_prompts[i].split('.')[0]}..."
 
                     if args.report_to == "wandb":
-                        log_dict["validation/comparison"] = wandb.Video(log_comparison.cpu(), fps=16, format="gif", caption=caption)
+                        log_dict["validation/comparison"] = wandb.Video(log_comparison.cpu(), fps=24, format="gif", caption=caption)
                     else: # Tensorboard
                         log_dict["validation/comparison"] = log_comparison
                     
@@ -643,7 +633,6 @@ def log_validation(vae, text_encoder, tokenizer, transformer3d, args, config, ac
 
     del pipeline
     del transformer3d_val
-    del clip_image_encoder
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
@@ -779,7 +768,7 @@ def parse_args():
         help="whether to use cuda multi-stream",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=24, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
         "--vae_mini_batch", type=int, default=32, help="mini batch size for vae."
@@ -1290,23 +1279,24 @@ def main():
             torch_dtype=weight_dtype,
         )
         text_encoder = text_encoder.eval()
-        # Get Vae
-        vae = AutoencoderKLWan.from_pretrained(
+        # Get Vae - select based on config
+        Chosen_AutoencoderKL = {
+            "AutoencoderKLWan": AutoencoderKLWan,
+            "AutoencoderKLWan3_8": AutoencoderKLWan3_8,
+        }.get(config['vae_kwargs'].get('vae_type', 'AutoencoderKLWan'), AutoencoderKLWan)
+        print(f"Using VAE type: {config['vae_kwargs'].get('vae_type', 'AutoencoderKLWan')}")
+        
+        vae = Chosen_AutoencoderKL.from_pretrained(
             os.path.join(args.pretrained_model_name_or_path, config['vae_kwargs'].get('vae_subpath', 'vae')),
             additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
         )
         vae.eval()
-        # Get Clip Image Encoder
-        clip_image_encoder_path = os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder'))
-        if os.path.exists(clip_image_encoder_path):
-            clip_image_encoder = CLIPModel.from_pretrained(clip_image_encoder_path)
-            clip_image_encoder = clip_image_encoder.eval()
-        else:
-            print(f"Warning: CLIPModel not found at {clip_image_encoder_path}, using None")
-            clip_image_encoder = None
+        
+        # Note: Wan2.2 5B does not use CLIP, clip_image_encoder is set to None
+        clip_image_encoder = None
             
-    # Get Transformer (use CroodRefTransformer3DModel for croodref training)
-    transformer3d = CroodRefTransformer3DModel.from_pretrained(
+    # Get Transformer (use CroodRefTransformer3DModel2_2 for 5B croodref training)
+    transformer3d = CroodRefTransformer3DModel2_2.from_pretrained(
         os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
         transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
     ).to(weight_dtype)
@@ -1361,12 +1351,12 @@ def main():
         if zero_stage == 3:
             raise NotImplementedError("FSDP does not support EMA.")
 
-        ema_transformer3d = CroodRefTransformer3DModel.from_pretrained(
+        ema_transformer3d = CroodRefTransformer3DModel2_2.from_pretrained(
             os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
             transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
         ).to(weight_dtype)
 
-        ema_transformer3d = EMAModel(ema_transformer3d.parameters(), model_cls=CroodRefTransformer3DModel, model_config=ema_transformer3d.config)
+        ema_transformer3d = EMAModel(ema_transformer3d.parameters(), model_cls=CroodRefTransformer3DModel2_2, model_config=ema_transformer3d.config)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -2071,8 +2061,6 @@ def main():
     vae.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
     if not args.enable_text_encoder_in_dataloader:
         text_encoder.to(accelerator.device if not args.low_vram else "cpu")
-    if clip_image_encoder is not None:
-        clip_image_encoder.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -2205,22 +2193,6 @@ def main():
 
     idx_sampling = DiscreteSampling(args.train_sampling_steps, uniform_sampling=args.uniform_sampling)
 
-    # Pre-compute clip_fea template from dummy black image (only once before training)
-    clip_fea_template = None
-    if clip_image_encoder is not None:
-        logger.info("Pre-computing clip_fea template from dummy black image...")
-        with torch.no_grad():
-            if args.low_vram:
-                clip_image_encoder.to(accelerator.device, dtype=weight_dtype)
-            
-            clip_image_dummy = Image.new("RGB", (512, 512), color=(0, 0, 0))
-            clip_image_dummy = TF.to_tensor(clip_image_dummy).sub_(0.5).div_(0.5).to(clip_image_encoder.device, weight_dtype)
-            clip_fea_template = clip_image_encoder([clip_image_dummy[:, None, :, :]])  # [1, 1, dim]
-            
-            if args.low_vram:
-                clip_image_encoder.to('cpu')
-                torch.cuda.empty_cache()
-        logger.info(f"Pre-computed clip_fea template with shape: {clip_fea_template.shape}")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
@@ -2418,7 +2390,8 @@ def main():
                     actual_video_length = int(max(actual_video_length, 1))
 
                     # Magvae needs the number of frames to be 4n + 1.
-                    actual_video_length = (actual_video_length - 1) // sample_n_frames_bucket_interval + 1
+                    actual_video_length = ((actual_video_length - 1) // sample_n_frames_bucket_interval) * sample_n_frames_bucket_interval + 1
+
 
                     pixel_values = pixel_values[:, :actual_video_length, :, :]
                     # Note: ref_pixel_values may have different frame count, don't crop it here
@@ -2442,8 +2415,6 @@ def main():
                 if args.low_vram:
                     torch.cuda.empty_cache()
                     vae.to(accelerator.device)
-                    if clip_image_encoder is not None:
-                        clip_image_encoder.to(accelerator.device)
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to("cpu")
 
@@ -2604,11 +2575,13 @@ def main():
                 elif mode == 1 and batch.get("bg") is not None:
                     # Mode 1: first_frame + bgvideo[1:]
                     first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
-                    bg = batch["bg"].to(weight_dtype)
+                    # Ensure bg has same frame count as pixel_values
+                    bg_for_mode1 = batch["bg"].to(weight_dtype)
+                    bg_for_mode1 = bg_for_mode1[:, :pixel_values.shape[1], :, :, :]
                     
                     # Check if bg has more than 1 frame
-                    if bg.shape[1] > 1:
-                        bg_rest = bg[:, 1:, :, :, :]  # [B, F-1, C, H, W]
+                    if bg_for_mode1.shape[1] > 1:
+                        bg_rest = bg_for_mode1[:, 1:, :, :, :]  # [B, F-1, C, H, W]
                         combined = torch.cat([first_frame, bg_rest], dim=1)  # [B, F, C, H, W]
                         appearance_latents = _batch_encode_vae(combined)
                     else:
@@ -2619,8 +2592,10 @@ def main():
                             appearance_latents[:, :, :1] = start_image_latentes
                 elif mode == 2 and batch.get("bg") is not None:
                     # Mode 2: Complete bgvideo
-                    bg = batch["bg"].to(weight_dtype)
-                    appearance_latents = _batch_encode_vae(bg)
+                    # Ensure bg has same frame count as pixel_values
+                    bg_for_mode2 = batch["bg"].to(weight_dtype)
+                    bg_for_mode2 = bg_for_mode2[:, :pixel_values.shape[1], :, :, :]
+                    appearance_latents = _batch_encode_vae(bg_for_mode2)
                 else:
                     # Fallback: if bg doesn't exist, use mode 0
                     if batch.get("bg") is not None:
@@ -2630,14 +2605,14 @@ def main():
                             use_bg_first_frame = rng.choice([0, 1], p=[0.5, 0.5])
                         
                         if use_bg_first_frame:
-                            bg = batch["bg"].to(weight_dtype)
-                            first_frame = bg[:, 0:1, :, :, :]  # [B, 1, C, H, W]
+                            bg_for_fallback = batch["bg"].to(weight_dtype)
+                            first_frame = bg_for_fallback[:, 0:1, :, :, :]  # [B, 1, C, H, W]
                         else:
                             first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
                     else:
                         first_frame = pixel_values[:, 0:1, :, :, :]  # [B, 1, C, H, W]
                     
-                    start_image_latentes = _batch_encode_vae(first_frame)  # [B, 16, 1, H/8, W/8]
+                    start_image_latentes = _batch_encode_vae(first_frame)  # [B, 48, 1, H/8, W/8]
                     appearance_latents = torch.zeros_like(latents)
                     if latents.size()[2] != 1:
                         appearance_latents[:, :, :1] = start_image_latentes
@@ -2645,6 +2620,8 @@ def main():
                 fg_coordmap_latent = None
                 if batch.get("fg_coordmap") is not None:
                     fg_coordmap = batch["fg_coordmap"].to(weight_dtype)  # [B, F, C, H, W]
+                    # Ensure fg_coordmap has same frame count as pixel_values
+                    fg_coordmap = fg_coordmap[:, :pixel_values.shape[1], :, :, :]
                     
                     if apply_coordmap_aug:
                         fg_coordmap = augment_coordmap(fg_coordmap, coordmap_do_expand, coordmap_border_size)
@@ -2713,8 +2690,6 @@ def main():
 
                 if args.low_vram:
                     vae.to('cpu')
-                    if clip_image_encoder is not None:
-                        clip_image_encoder.to('cpu')
                     torch.cuda.empty_cache()
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to(accelerator.device)
@@ -2789,20 +2764,14 @@ def main():
                     target_shape[1]
                 )
 
-                # Use pre-computed clip_fea template and expand to batch size
-                if clip_fea_template is not None:
-                    clip_fea = torch.zeros_like(clip_fea_template).expand(bsz, -1, -1)
-                else:
-                    clip_fea = None
-
-                # Predict the noise residual
+                # Predict the noise residual (Wan2.2 5B does not use CLIP)
                 with torch.amp.autocast("cuda", dtype=weight_dtype), torch.cuda.device(device=accelerator.device):
                     noise_pred = transformer3d(
                         x=noisy_latents,
                         context=prompt_embeds,
                         t=timesteps,
                         seq_len=seq_len,
-                        clip_fea=clip_fea,  # clip features from dummy black image
+                        clip_fea=None,  # Wan2.2 5B does not use CLIP
                         full_ref=full_ref,
                         full_ref_crood=ref_coordmap_latents,
                         fg_coordmap=fg_coordmap_latent,
@@ -2941,10 +2910,12 @@ def main():
 
                             # test vae encode and decode
                             if global_step == 0:
-                                vae_decoder = vae.eval()
-                                # Ensure VAE is on the same device as latents for decoding
+                                # Ensure VAE is on device for validation
                                 if args.low_vram:
-                                    vae_decoder.to(accelerator.device)
+                                    vae.to(accelerator.device)
+                                    if hasattr(vae, 'model'):
+                                        vae.model.to(accelerator.device)
+                                vae_decoder = vae.eval()
                                 
                                 gt_decoded = vae_decoder.decode(latents.to(vae_decoder.dtype)).sample
                                 # Decode full_ref frame by frame
@@ -2959,11 +2930,6 @@ def main():
                                 fg_decoded = None
                                 if fg_coordmap_latent is not None:
                                     fg_decoded = vae_decoder.decode(fg_coordmap_latent.to(vae_decoder.dtype)).sample
-                                
-                                # Move VAE back to CPU if low_vram mode is enabled
-                                if args.low_vram:
-                                    vae_decoder.to('cpu')
-                                    torch.cuda.empty_cache()
                                 
                                 # Normalize to [0, 1]
                                 gt_decoded = (gt_decoded / 2 + 0.5).clamp(0, 1).cpu().float() 
@@ -3035,7 +3001,9 @@ def main():
                                     comparison_list.append(bg_decoded)
                                 
                                 # Stack vertically
-                                comparison = torch.cat(comparison_list, dim=3)  # stack in height dimension
+                                min_frames = min([v.shape[2] for v in comparison_list])
+                                comparison_list = [v[:, :, :min_frames, :, :] for v in comparison_list]
+                                comparison = torch.cat(comparison_list, dim=3)
                                 save_videos_grid(comparison, os.path.join(args.output_dir, f"validation/gt_vae.mp4"), fps=16)
 
                                 # Prepare comparison for logging
@@ -3045,7 +3013,7 @@ def main():
                                 log_dict = {}
 
                                 if args.report_to == "wandb":
-                                    log_dict["validation/vae_decoded"] = wandb.Video(log_vae_comparison.cpu(), fps=16, format="gif")
+                                    log_dict["validation/vae_decoded"] = wandb.Video(log_vae_comparison.cpu(), fps=24, format="gif")
                                 else: # Tensorboard
                                     log_dict["validation/vae_decoded"] = log_vae_comparison
                                 
@@ -3067,6 +3035,13 @@ def main():
                                 weight_dtype,
                                 global_step,
                             )
+                            
+                            if args.low_vram:
+                                vae.to('cpu')
+                                if hasattr(vae, 'model'):
+                                    vae.model.to('cpu')
+                                torch.cuda.empty_cache()
+                            
                             transformer3d.train()
 
                             if args.use_ema:

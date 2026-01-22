@@ -11,7 +11,7 @@ from .pipeline_wan_fun_control import WanFunControlPipeline
 from .pipeline_wan_fun_inpaint import WanFunInpaintPipeline
 from .pipeline_wan_phantom import WanFunPhantomPipeline
 from .pipeline_wan_poseref import WanFunPoseRefPipeline
-from .pipeline_wan_croodref import WanFunCroodRefPipeline
+from .pipeline_wan_croodref import WanFunCroodRefPipeline, WanFunCroodRefPipeline2_2
 from .pipeline_qwenimage import QwenImagePipeline
 from .pipeline_wan2_2_s2v import Wan2_2S2VPipeline
 from .pipeline_flux import FluxPipeline
@@ -42,6 +42,7 @@ if importlib.util.find_spec("pai_fuser") is not None:
     
     # CroodRef
     WanFunCroodRefPipeline.__call__ = sparse_reset(WanFunCroodRefPipeline.__call__)
+    WanFunCroodRefPipeline2_2.__call__ = sparse_reset(WanFunCroodRefPipeline2_2.__call__)
 
     # Wan2.2
     Wan2_2FunInpaintPipeline.__call__ = sparse_reset(Wan2_2FunInpaintPipeline.__call__)
